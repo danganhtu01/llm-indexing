@@ -32,6 +32,8 @@ def _method_group(m: str) -> str:
         return "pdf"
     if m == "ocr":
         return "ocr"
+    if m == "email":
+        return "email"
     if m == "text":
         return "text"
     return "name-only"
