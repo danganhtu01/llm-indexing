@@ -108,7 +108,10 @@ class Dictionaries:
                         return stem.lower()
             except Exception:
                 pass
-        return self._snow.stemWord(w)
+        try:
+            return self._snow.stemWord(w)
+        except Exception:
+            return w  # snowballstemmer can IndexError on rare inputs; keep raw word
 
     def segment_vi(self, syllables):
         """Forward maximum-matching of syllables into known compounds.

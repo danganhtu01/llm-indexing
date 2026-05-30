@@ -38,15 +38,20 @@ def _sha1(path: str) -> str:
 
 
 def _process(rec, cfg, ocr, dicts, normalizer, do_hash):
-    ex = extract(rec.path, rec.ext, rec.size, cfg, ocr)
-    text = ex["text"]
-    name_blob = rec.name + " " + rec.dir
-    content = text if text.strip() else name_blob
-    token_src = " ".join((text, rec.name, rec.path.replace("\\", " ").replace("/", " ")))
-    lang = detect_lang(text if text.strip() else rec.name, dicts)
-    tokens = normalizer.enrich(token_src, lang)
-    sha1 = _sha1(rec.path) if do_hash else None
-    return (rec, content, tokens, lang, ex["method"], ex["ocr_used"], ex["pages"], sha1)
+    try:
+        ex = extract(rec.path, rec.ext, rec.size, cfg, ocr)
+        text = ex["text"]
+        name_blob = rec.name + " " + rec.dir
+        content = text if text.strip() else name_blob
+        token_src = " ".join((text, rec.name, rec.path.replace("\\", " ").replace("/", " ")))
+        lang = detect_lang(text if text.strip() else rec.name, dicts)
+        tokens = normalizer.enrich(token_src, lang)
+        sha1 = _sha1(rec.path) if do_hash else None
+        return (rec, content, tokens, lang, ex["method"], ex["ocr_used"], ex["pages"], sha1)
+    except Exception as e:
+        # a single file must NEVER kill the run: record it name-only with an error tag
+        return (rec, rec.name + " " + rec.dir, [], "und",
+                f"error:{type(e).__name__}", False, 0, None)
 
 
 # ----------------------------- commands -----------------------------
