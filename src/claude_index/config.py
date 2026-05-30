@@ -24,6 +24,8 @@ DEFAULTS = {
     "skip_dirs": [
         "$RECYCLE.BIN", "System Volume Information", ".git",
         "$WinREAgent", "Windows", "node_modules",
+        # never index our own output or Python virtualenvs / caches
+        "index_out", ".venv", "venv", "site-packages", "__pycache__",
     ],
     "skip_exts": [".sys", ".dll", ".exe", ".iso", ".vmdk", ".lock"],
     "follow_symlinks": False,

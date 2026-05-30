@@ -75,7 +75,10 @@ class IndexStore:
         }, ensure_ascii=False) + "\n")
         self._csv.writerow([rec.path, rec.name, rec.ext, rec.size, f"{rec.mtime:.0f}",
                             lang, method, int(ocr_used), chars])
-        if self.sidecar_mode != "none" and text.strip() and method != "text":
+        # sidecars only for real extracted content (not plaintext, name-only, or errors)
+        if (self.sidecar_mode != "none" and text.strip()
+                and method not in ("text", "name-only")
+                and not method.startswith("error")):
             self._write_sidecar(rec, text)
         self._n += 1
         if self._n % 500 == 0:

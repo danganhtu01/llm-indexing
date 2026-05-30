@@ -29,6 +29,11 @@ skip_dirs:
   - "$WinREAgent"
   - "Windows"
   - "node_modules"
+  - "index_out"        # never index our own output
+  - ".venv"
+  - "venv"
+  - "site-packages"
+  - "__pycache__"
 skip_exts:                   # never open for content (still indexed by name)
   - ".sys"
   - ".dll"

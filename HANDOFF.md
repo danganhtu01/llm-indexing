@@ -48,7 +48,10 @@ contention). Inflight futures bounded to `workers*8` for steady memory.
 - **Sidecar `.txt`** is how Windows Explorer becomes searchable over scanned/
   binary content. **Default `mirror`** (parallel `.txt` tree under the output
   dir; source drives stay clean); `inplace` writes next to each source file;
-  `none` skips (fewer inodes on huge mail trees).
+  `none` skips (fewer inodes on huge mail trees). Written **only for extracted
+  content** — name-only/error files get no sidecar. `index_out`, `.venv`,
+  `venv`, `site-packages`, `__pycache__` are skipped by default so a run never
+  ingests its own output or Python internals.
 
 ## Data dependencies (fetched, NOT committed — see `.gitignore`)
 `scripts/fetch_data.py` (idempotent) downloads into `data/`:
