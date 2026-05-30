@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Downloaded data (fetched by scripts/fetch_data.py; not committed)
+data/dict/
+data/tessdata/
+
+# Index outputs (generated; never commit indexed data)
+index_out/
+*.sqlite
+*.sqlite-*
+manifest.jsonl
+catalog.csv
+sidecar/
+reports/
+
+# Secrets / local
+.env
+*.local
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store

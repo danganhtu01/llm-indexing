@@ -1,0 +1,22 @@
+# claude-indexing core dependencies (pure-python or wheel-only; fast, low-cost)
+# Extraction
+pymupdf>=1.24          # PDF text layer + page rasterization for OCR
+python-docx>=1.1       # .docx
+openpyxl>=3.1          # .xlsx (read-only streaming)
+python-pptx>=0.6.23    # .pptx
+pillow>=10.0           # image handling for OCR
+pytesseract>=0.3.10    # Tesseract bindings (requires tesseract.exe on system)
+charset-normalizer>=3.3  # robust text decoding for unknown encodings
+
+# Language / dictionaries (pure-python, no heavy ML)
+spylls>=0.1.7          # Hunspell engine in pure Python -> word forms / stems
+snowballstemmer>=2.2   # English stemming
+rapidfuzz>=3.5         # fuzzy matching for search fallback
+
+# Plumbing
+pyyaml>=6.0
+tqdm>=4.66
+
+# --- Optional enhancements (not required; see docs/ARCHITECTURE.md) ---
+# tantivy>=0.22        # Rust-backed Lucene-like index (alternative search backend)
+# pyvi>=0.1.1          # ML Vietnamese word segmentation (heavier: pulls scikit-learn)
