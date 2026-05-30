@@ -113,8 +113,12 @@ def cmd_index(args):
         print("Densest folders (overall):")
         for folder, c in busiest[:5]:
             print(f"  {c:>6,}  {folder}")
-    print(f"\nArtifacts in {out}:  index.sqlite · manifest.jsonl · catalog.csv"
-          f"{' · sidecar/' if cfg['sidecar'] != 'none' else ''}")
+    abs_out = out.resolve()
+    print(f"\n📁 Index databases live in: {abs_out}")
+    contents = "index.sqlite · manifest.jsonl · catalog.csv · reports/"
+    if cfg["sidecar"] != "none":
+        contents += f" · sidecar/ (Explorer-searchable .txt, {cfg['sidecar']} mode)"
+    print(f"   {contents}")
     return 0
 
 
@@ -187,7 +191,8 @@ def build_parser():
     pi.add_argument("paths", nargs="+", help="drives/folders to index, e.g. E:\\")
     pi.add_argument("--out", default=default_out, help="output dir (default: ./index_out)")
     pi.add_argument("--ocr", choices=["auto", "on", "off"], default=None)
-    pi.add_argument("--sidecar", choices=["mirror", "inplace", "none"], default=None)
+    pi.add_argument("--sidecar", choices=["mirror", "inplace", "none"], default=None,
+                    help="Windows Explorer .txt sidecars (default: mirror)")
     pi.add_argument("--workers", type=int, default=None)
     pi.add_argument("--max-bytes", type=int, default=None, dest="max_bytes")
     pi.add_argument("--config", default=None)

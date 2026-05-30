@@ -46,8 +46,9 @@ contention). Inflight futures bounded to `workers*8` for steady memory.
   underthesea pull scikit-learn) — keeps install light and uses the "richest
   dictionary" directly.
 - **Sidecar `.txt`** is how Windows Explorer becomes searchable over scanned/
-  binary content. Default `none` on big runs (80K tiny files is heavy); opt into
-  `mirror` (under output) or `inplace` (next to source).
+  binary content. **Default `mirror`** (parallel `.txt` tree under the output
+  dir; source drives stay clean); `inplace` writes next to each source file;
+  `none` skips (fewer inodes on huge mail trees).
 
 ## Data dependencies (fetched, NOT committed — see `.gitignore`)
 `scripts/fetch_data.py` (idempotent) downloads into `data/`:
@@ -73,6 +74,6 @@ contention). Inflight futures bounded to `workers*8` for steady memory.
 
 ## Re-index this machine's test drive
 ```powershell
-.\.venv\Scripts\claude-index index E:\ --out index_out\E --ocr auto --sidecar none
+.\.venv\Scripts\claude-index index E:\ --out index_out\E --ocr auto
 .\.venv\Scripts\claude-index search "ngan hang" --index index_out\E
 ```
