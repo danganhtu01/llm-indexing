@@ -81,13 +81,13 @@ def cmd_index(args):
     with IndexStore(out, cfg, resume=args.resume) as store, \
             ThreadPoolExecutor(max_workers=cfg["workers"]) as pool, \
             tqdm(unit="file", desc="indexing") as pbar:
-        done = store.existing_keys() if args.resume else {}
+        seen = store.existing_keys() if args.resume else {}
         if args.resume:
-            print(f"  resume: {len(done):,} files already indexed — skipping unchanged")
+            print(f"  resume: {len(seen):,} files already indexed — skipping unchanged")
         inflight = set()
         for rec in walk(args.paths, cfg):
-            if done:
-                prev = done.get(rec.path)
+            if seen:
+                prev = seen.get(rec.path)
                 if prev is not None and prev[0] == rec.size and prev[1] == int(rec.mtime):
                     counts["skipped"] += 1
                     pbar.update(1)
