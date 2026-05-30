@@ -64,8 +64,9 @@ contention). Inflight futures bounded to `workers*8` for steady memory.
   Add via `olefile`/`textract`/`extract-msg`.
 - Email **attachment images aren't OCR'd** yet (text parts only). Hook into
   `_email()` to rasterize/OCR `image/*` parts.
-- No **incremental re-index**: `add()` uses `INSERT OR REPLACE` on path, but the
-  walker re-extracts everything. Add an mtime/size skip check against `files`.
+- **Resume / incremental** (`--resume`): re-walks, skips files already indexed
+  with the same size+mtime, and appends to manifest/catalog; re-adds delete the
+  stale FTS row first (no orphans). Detecting *deleted* files (pruning) is still TODO.
 - VI lemma normalization is segmentation-only (VI is largely non-inflecting) —
   fine, but synonym expansion (WordNet/Vietnamese WordNet) is a future lever.
 - Optional **Tantivy** backend + a tiny query web UI are unimplemented.

@@ -49,6 +49,9 @@ winget install --id UB-Mannheim.TesseractOCR -e  # OCR engine
 # Index a drive (auto-OCR scans; sidecar defaults to mirror = Explorer-searchable)
 claude-index index E:\ --out index_out --ocr auto
 
+# Resume an interrupted run — re-walks, skips files already indexed (same size+mtime)
+claude-index index E:\ --out index_out --ocr auto --resume
+
 # Full-text search; prints ranked hits + the folder with the most matches
 claude-index search "ngan hang giao dich" --index index_out
 

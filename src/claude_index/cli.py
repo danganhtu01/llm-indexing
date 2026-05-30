@@ -65,7 +65,7 @@ def cmd_index(args):
     print(f"  OCR: {'enabled (' + ocr.langs + ')' if ocr.available else 'unavailable'}"
           f"  ·  workers: {cfg['workers']}  ·  sidecar: {cfg['sidecar']}")
 
-    counts = {"files": 0, "bytes": 0, "ocr": 0, "errors": 0}
+    counts = {"files": 0, "bytes": 0, "ocr": 0, "errors": 0, "skipped": 0}
     started = time.time()
     maxq = max(8, cfg["workers"] * 8)
 
@@ -78,11 +78,20 @@ def cmd_index(args):
         counts["errors"] += 1 if method.startswith("error") else 0
         pbar.update(1)
 
-    with IndexStore(out, cfg) as store, \
+    with IndexStore(out, cfg, resume=args.resume) as store, \
             ThreadPoolExecutor(max_workers=cfg["workers"]) as pool, \
             tqdm(unit="file", desc="indexing") as pbar:
+        done = store.existing_keys() if args.resume else {}
+        if args.resume:
+            print(f"  resume: {len(done):,} files already indexed — skipping unchanged")
         inflight = set()
         for rec in walk(args.paths, cfg):
+            if done:
+                prev = done.get(rec.path)
+                if prev is not None and prev[0] == rec.size and prev[1] == int(rec.mtime):
+                    counts["skipped"] += 1
+                    pbar.update(1)
+                    continue
             inflight.add(pool.submit(_process, rec, cfg, ocr, dicts, normalizer, cfg["hash"]))
             if len(inflight) >= maxq:
                 done, inflight = wait(inflight, return_when=FIRST_COMPLETED)
@@ -96,6 +105,8 @@ def cmd_index(args):
     print(f"\nIndexed {counts['files']:,} files ({counts['bytes'] / 1e9:.2f} GB) in "
           f"{elapsed:.1f}s ({rate:.0f} files/s).  OCR used on {counts['ocr']:,}; "
           f"errors {counts['errors']:,}.")
+    if counts["skipped"]:
+        print(f"Resume: skipped {counts['skipped']:,} files already indexed.")
 
     # analysis report
     db = connect(out)
@@ -196,6 +207,8 @@ def build_parser():
     pi.add_argument("--workers", type=int, default=None)
     pi.add_argument("--max-bytes", type=int, default=None, dest="max_bytes")
     pi.add_argument("--config", default=None)
+    pi.add_argument("--resume", action="store_true",
+                    help="continue a prior run: skip files already indexed (same size+mtime)")
     pi.set_defaults(func=cmd_index)
 
     ps = sub.add_parser("search", help="full-text search the index")

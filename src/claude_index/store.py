@@ -40,22 +40,40 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
 class IndexStore:
     """Writer. Use as a context manager or call close() when done."""
 
-    def __init__(self, out_dir, cfg):
+    def __init__(self, out_dir, cfg, resume=False):
         self.cfg = cfg
         self.out = Path(out_dir)
         self.out.mkdir(parents=True, exist_ok=True)
+        self.resume = resume
         self.sidecar_mode = cfg.get("sidecar", "mirror")
         self.db = sqlite3.connect(str(self.out / "index.sqlite"))
         self.db.executescript(SCHEMA)
-        self._jsonl = open(self.out / "manifest.jsonl", "w", encoding="utf-8")
-        self._csv_f = open(self.out / "catalog.csv", "w", newline="", encoding="utf-8-sig")
+        # resume: append to existing manifest/catalog instead of truncating them
+        jsonl_path = self.out / "manifest.jsonl"
+        csv_path = self.out / "catalog.csv"
+        csv_append = resume and csv_path.exists() and csv_path.stat().st_size > 0
+        self._jsonl = open(jsonl_path, "a" if (resume and jsonl_path.exists()) else "w",
+                           encoding="utf-8")
+        self._csv_f = open(csv_path, "a" if csv_append else "w",
+                           newline="", encoding="utf-8-sig")
         self._csv = csv.writer(self._csv_f)
-        self._csv.writerow(["path", "name", "ext", "size", "mtime", "lang",
-                            "method", "ocr_used", "chars"])
+        if not csv_append:
+            self._csv.writerow(["path", "name", "ext", "size", "mtime", "lang",
+                                "method", "ocr_used", "chars"])
         self._n = 0
+
+    def existing_keys(self):
+        """path -> (size, int(mtime)) for already-indexed files (resume skip-set)."""
+        return {p: (s, int(m))
+                for p, s, m in self.db.execute("SELECT path, size, mtime FROM files")}
 
     def add(self, rec, text, tokens, lang, method, ocr_used, pages, sha1, indexed_at):
         chars = len(text)
+        if self.resume:
+            # drop any prior FTS row for this path so a re-add doesn't orphan it
+            old = self.db.execute("SELECT id FROM files WHERE path=?", (rec.path,)).fetchone()
+            if old is not None:
+                self.db.execute("DELETE FROM fts WHERE rowid=?", (old[0],))
         cur = self.db.execute(
             "INSERT OR REPLACE INTO files(path,drive,dir,name,ext,size,mtime,lang,"
             "method,ocr_used,pages,chars,sha1,indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
