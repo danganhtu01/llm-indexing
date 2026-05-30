@@ -74,6 +74,6 @@ contention). Inflight futures bounded to `workers*8` for steady memory.
 
 ## Re-index this machine's test drive
 ```powershell
-.\.venv\Scripts\claude-index index E:\ --out index_out\E --ocr auto
-.\.venv\Scripts\claude-index search "ngan hang" --index index_out\E
+.\.venv\Scripts\claude-index index E:\ --out index_out --ocr auto
+.\.venv\Scripts\claude-index search "ngan hang" --index index_out
 ```

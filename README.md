@@ -47,21 +47,23 @@ winget install --id UB-Mannheim.TesseractOCR -e  # OCR engine
 ## Usage
 ```powershell
 # Index a drive (auto-OCR scans; sidecar defaults to mirror = Explorer-searchable)
-claude-index index E:\ --out index_out\E --ocr auto
+claude-index index E:\ --out index_out --ocr auto
 
 # Full-text search; prints ranked hits + the folder with the most matches
-claude-index search "ngan hang giao dich" --index index_out\E
+claude-index search "ngan hang giao dich" --index index_out
 
 # Just the densest-match folders
-claude-index top-folder "hoa don" --index index_out\E --n 10
+claude-index top-folder "hoa don" --index index_out --n 10
 
 # Structure / naming / type report
-claude-index analyze --index index_out\E --md report.md
+claude-index analyze --index index_out --md report.md
 ```
 Sidecars default to **`mirror`** — a parallel `.txt` tree under the output dir
 that Windows Explorer can content-search (source drives stay untouched). Use
 `--sidecar inplace` to write text next to each source file, or `--sidecar none`
-to skip (faster on huge mail trees).
+to skip (faster on huge mail trees). The mirror tree lives at
+`index_out\sidecar\<drive>\` (one subfolder per drive); add the `index_out\sidecar`
+folder to Windows *Indexing Options* to content-search it from Explorer.
 
 ## Configuration
 Copy `config.example.yaml` → `config.yaml` (auto-loaded) or pass `--config`.

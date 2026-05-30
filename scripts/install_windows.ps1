@@ -32,5 +32,5 @@ if (-not (Test-Path $py)) {
 
 Write-Host ''
 Write-Host 'Done. Try:' -ForegroundColor Green
-Write-Host '  .\.venv\Scripts\claude-index index E:\ --out index_out\E'
-Write-Host '  .\.venv\Scripts\claude-index search "ngan hang" --index index_out\E'
+Write-Host '  .\.venv\Scripts\claude-index index E:\ --out index_out'
+Write-Host '  .\.venv\Scripts\claude-index search "ngan hang" --index index_out'
