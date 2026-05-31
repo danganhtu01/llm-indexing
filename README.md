@@ -84,6 +84,6 @@ tests/test_smoke.py    end-to-end EN/VI/abbrev/top-folder check
 
 ## Status
 v0.1 — validated on a real 80K-file drive (Thunderbird email backup) and on
-EN+VI OCR. See `HANDOFF.md` for architecture, decisions, and the TODO list.
+EN+VI OCR. See `docs/ARCHITECTURE.md` for architecture and design decisions.
 
 MIT licensed.
