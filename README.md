@@ -60,6 +60,9 @@ claude-index top-folder "hoa don" --index index_out --n 10
 
 # Structure / naming / type report
 claude-index analyze --index index_out --md report.md
+
+# Index ALL plugged-in drives at once (overnight; auto-resumes on crash/interruption)
+.\index-all-drives.ps1            # -> %SystemDrive%\index_out  (override: -Out 'D:\idx')
 ```
 Sidecars default to **`mirror`** — a parallel `.txt` tree under the output dir
 that Windows Explorer can content-search (source drives stay untouched). Use
@@ -78,6 +81,7 @@ dictionary/abbreviation paths. See comments in that file.
 src/claude_index/   walker · extract · ocr · lang · normalize · dictionaries · store · analyze · cli
 data/               abbreviations_*.txt (committed); dict/ + tessdata/ (fetched, gitignored)
 scripts/            install_windows.ps1 · fetch_data.py
+index-all-drives.ps1   overnight all-drives runner (path-independent; auto-resume)
 docs/ARCHITECTURE.md   pipeline + schema + extension points
 tests/test_smoke.py    end-to-end EN/VI/abbrev/top-folder check
 ```
