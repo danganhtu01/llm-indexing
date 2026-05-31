@@ -20,6 +20,7 @@ manifest.jsonl
 catalog.csv
 sidecar/
 reports/
+logs/
 
 # Secrets / local
 .env
