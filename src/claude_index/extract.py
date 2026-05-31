@@ -81,10 +81,16 @@ def _pix_to_pil(pix):
     return Image.open(io.BytesIO(pix.tobytes("png")))
 
 
+# PyMuPDF (fitz) is NOT thread-safe; concurrent use from worker threads causes
+# native crashes (ACCESS_VIOLATION / "Bad file descriptor"). Serialize all of it.
+import threading
+_FITZ_LOCK = threading.Lock()
+
+
 def _pdf(path, cfg, ocr, ocr_mode, max_chars):
     import fitz
     out = {"text": "", "method": "pdf-text", "ocr_used": False, "pages": 0}
-    with fitz.open(path) as doc:
+    with _FITZ_LOCK, fitz.open(path) as doc:
         out["pages"] = doc.page_count
         parts = []
         for page in doc:
