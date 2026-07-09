@@ -1,0 +1,13 @@
+[package]
+name = "lc-core"
+version = "0.1.0"
+description = "Shared stage contract for the L&C document pipeline: paths, run manifests, exit semantics."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

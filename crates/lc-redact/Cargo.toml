@@ -1,0 +1,36 @@
+[package]
+name = "lc-redact"
+version = "0.1.0"
+description = "Pipeline stage 2: strip PII from extracted text, with a per-span audit trail."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lc-core.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+walkdir.workspace = true
+
+# NOTE on claudeops' `redact` crate.
+#
+# claudeops has a `redact` library crate (283 LOC, regex + serde_json). We deliberately do
+# not depend on it yet, for four reasons documented in rules.rs:
+#   * no person-name detection at all;
+#   * MST tax codes are matched only as a JSON *key name*, never in free text;
+#   * CCCD/CMND and bank accounts are context-gated, so a bare ID with no adjacent
+#     keyword survives -- unacceptable for a document corpus, where the keyword is often
+#     in a table header three rows up rather than beside the number;
+#   * it emits no audit trail of what it changed, and a compliance pipeline must be able
+#     to prove what was removed and from where.
+#
+# Its rule set is nonetheless good and battle-tested. Once claudeops grows the real CLI
+# entrypoint its own compose.governance.yml says it needs ("do NOT fake one"), the right
+# move is to depend on it for the secret/PII families it does cover and keep rules.rs for
+# the four gaps above.

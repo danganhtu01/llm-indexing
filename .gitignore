@@ -22,6 +22,10 @@ sidecar/
 reports/
 logs/
 
+# Rust (the lc-* pipeline crates)
+/target/
+**/*.rs.bk
+
 # Secrets / local
 .env
 *.local
