@@ -14,10 +14,14 @@
 # raw.githubusercontent.com) so the runtime container needs no egress.
 
 FROM python:3.10-slim AS cli
+# /mirror and /index are pre-created OWNED BY the indexer user: Docker copies
+# the image directory's ownership onto a named volume on first use, so the
+# non-root indexer can write /index whichever container mounts it first.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr tesseract-ocr-vie tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --uid 10001 --user-group --no-create-home indexer
+    && useradd --uid 10001 --user-group --no-create-home indexer \
+    && mkdir -p /mirror /index && chown indexer:indexer /mirror /index
 
 WORKDIR /app
 COPY pyproject.toml requirements.txt ./
