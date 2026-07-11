@@ -1,0 +1,86 @@
+name: docker
+
+# Build the container image on every PR (with a real index+search smoke test)
+# and publish it to GHCR on pushes to main and on version tags.
+#
+# Only the `cli` target is published — the `supervised` target needs an
+# external SUPERVISOR_IMAGE build-arg and is built by whatever orchestrator
+# consumes this image.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (cli target)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: cli
+          load: true
+          tags: llm-indexing:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test — index and search a bilingual sample
+        run: |
+          set -eux
+          mkdir -p sample
+          printf 'HỢP ĐỒNG DỊCH VỤ\nĐiều 1: Phạm vi hợp đồng và nghĩa vụ các bên.\n' > sample/hop-dong.txt
+          printf 'License renewal checklist.\nProgram requirements.\n' > sample/checklist.txt
+          # Container runs as a non-root user; the named volume must pick up
+          # the image's /index ownership (this is part of what we test).
+          docker run --rm --entrypoint id llm-indexing:ci | grep -q 'uid=10001'
+          docker run --rm -v "$PWD/sample":/mirror:ro -v ci-index:/index \
+            llm-indexing:ci index /mirror --out /index --config /app/config.container.yaml
+          # Diacritic-insensitive: the unaccented query must find the VI doc.
+          docker run --rm -v ci-index:/index \
+            llm-indexing:ci search "hop dong" --index /index --config /app/config.container.yaml \
+            | grep -q 'hop-dong.txt'
+          docker run --rm -v ci-index:/index \
+            llm-indexing:ci search "checklist" --index /index --config /app/config.container.yaml \
+            | grep -q 'checklist.txt'
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        if: github.event_name == 'push'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+
+      - name: Push (main / tags)
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: cli
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

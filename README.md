@@ -71,6 +71,32 @@ to skip (faster on huge mail trees). The mirror tree lives at
 `index_out\sidecar\<drive>\` (one subfolder per drive); add the `index_out\sidecar`
 folder to Windows *Indexing Options* to content-search it from Explorer.
 
+## Run in Docker (Linux/servers)
+The image ships everything baked in — Tesseract (vie+eng), dictionaries, OCR
+data — so the running container needs **no network egress**. It runs as a
+non-root user (uid 10001); `/mirror` (input, mount read-only) and `/index`
+(output) are pre-owned by that user so named volumes work out of the box.
+```bash
+docker build -t llm-indexing .            # or pull ghcr.io/danganhtu01/llm-indexing
+
+# Index a folder tree into a named volume
+docker run --rm -v /path/to/docs:/mirror:ro -v idx:/index llm-indexing \
+    index /mirror --out /index --resume --config /app/config.container.yaml
+
+# Search it (diacritic-insensitive: "hop dong" finds "hợp đồng")
+docker run --rm -v idx:/index llm-indexing \
+    search "hop dong" --index /index --config /app/config.container.yaml
+```
+`config.container.yaml` is the Linux profile (system `tesseract`, `hash: true`,
+no sidecars, empty skip list) — mount your own file over it to customize.
+CI builds the image on every PR (with an index+search smoke test) and publishes
+`ghcr.io/danganhtu01/llm-indexing` on pushes to `main` and version tags.
+
+For orchestrators that drive stages over HTTP there is a second build target:
+`docker build --target supervised --build-arg SUPERVISOR_IMAGE=<image with
+/usr/local/bin/stage-shim> .` wraps the same image behind the supplied
+supervisor binary as entrypoint.
+
 ## Configuration
 Copy `config.example.yaml` → `config.yaml` (auto-loaded) or pass `--config`.
 Controls languages, OCR mode, skip lists, size caps, workers, Tesseract paths,
