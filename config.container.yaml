@@ -1,0 +1,24 @@
+# Linux/container profile — overrides the Windows-oriented defaults.
+# Use with: claude-index index <paths> --config /app/config.container.yaml
+
+# System tesseract from apt (tesseract-ocr + -vie + -eng), not a Windows path.
+tesseract_cmd: "tesseract"
+# Blank = ./data/tessdata (vendored by fetch_data.py at image build), then system.
+tessdata_dir: ""
+ocr: "auto"
+ocr_langs: "vie+eng"
+
+dict_dir: "data/dict"
+
+# Content hashing ON so downstream consumers can key incremental work on sha1.
+hash: true
+
+# Sidecar .txt mirrors are usually redundant in a pipeline (consumers can read
+# extracted text from index.sqlite); keep the shared volume lean.
+sidecar: "none"
+
+# PyMuPDF is globally lock-serialized; more workers than this mostly burn RAM.
+workers: 4
+
+# Directory NAMES to skip anywhere in the tree — adjust per deployment.
+skip_dirs: []
