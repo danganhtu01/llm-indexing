@@ -13,6 +13,11 @@
 # Dictionaries + tessdata are vendored at BUILD time (fetch_data.py needs
 # raw.githubusercontent.com) so the runtime container needs no egress.
 
+# Declared before the first FROM — an ARG used in a FROM line must live outside
+# every build stage. `scratch` keeps the default parseable; the supervised
+# target is only meaningful with a real image supplied by the orchestrator.
+ARG SUPERVISOR_IMAGE=scratch
+
 FROM python:3.10-slim AS cli
 # /mirror and /index are pre-created OWNED BY the indexer user: Docker copies
 # the image directory's ownership onto a named volume on first use, so the
@@ -37,7 +42,6 @@ USER indexer
 ENTRYPOINT ["claude-index"]
 
 # ---------------------------------------------------------------- supervised
-ARG SUPERVISOR_IMAGE=scratch
 FROM ${SUPERVISOR_IMAGE} AS supervisor
 
 FROM cli AS supervised
