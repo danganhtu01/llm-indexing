@@ -46,20 +46,23 @@ class IndexStore:
         self.out.mkdir(parents=True, exist_ok=True)
         self.resume = resume
         self.sidecar_mode = cfg.get("sidecar", "mirror")
+        self.artifacts = cfg.get("artifacts", True)
         self.db = sqlite3.connect(str(self.out / "index.sqlite"))
         self.db.executescript(SCHEMA)
         # resume: append to existing manifest/catalog instead of truncating them
         jsonl_path = self.out / "manifest.jsonl"
         csv_path = self.out / "catalog.csv"
         csv_append = resume and csv_path.exists() and csv_path.stat().st_size > 0
-        self._jsonl = open(jsonl_path, "a" if (resume and jsonl_path.exists()) else "w",
-                           encoding="utf-8")
-        self._csv_f = open(csv_path, "a" if csv_append else "w",
-                           newline="", encoding="utf-8-sig")
-        self._csv = csv.writer(self._csv_f)
-        if not csv_append:
-            self._csv.writerow(["path", "name", "ext", "size", "mtime", "lang",
-                                "method", "ocr_used", "chars"])
+        self._jsonl = self._csv_f = self._csv = None
+        if self.artifacts:
+            self._jsonl = open(jsonl_path, "a" if (resume and jsonl_path.exists()) else "w",
+                               encoding="utf-8")
+            self._csv_f = open(csv_path, "a" if csv_append else "w",
+                               newline="", encoding="utf-8-sig")
+            self._csv = csv.writer(self._csv_f)
+            if not csv_append:
+                self._csv.writerow(["path", "name", "ext", "size", "mtime", "lang",
+                                    "method", "ocr_used", "chars"])
         self._n = 0
 
     def existing_keys(self):
@@ -85,14 +88,16 @@ class IndexStore:
             "INSERT INTO fts(rowid,name,path,content,tokens) VALUES(?,?,?,?,?)",
             (fid, rec.name, rec.path, text, " ".join(tokens)),
         )
-        self._jsonl.write(json.dumps({
-            "path": rec.path, "name": rec.name, "ext": rec.ext, "dir": rec.dir,
-            "drive": rec.drive, "size": rec.size, "mtime": rec.mtime, "lang": lang,
-            "method": method, "ocr_used": ocr_used, "pages": pages, "chars": chars,
-            "snippet": text[:400],
-        }, ensure_ascii=False) + "\n")
-        self._csv.writerow([rec.path, rec.name, rec.ext, rec.size, f"{rec.mtime:.0f}",
-                            lang, method, int(ocr_used), chars])
+        if self._jsonl is not None:
+            self._jsonl.write(json.dumps({
+                "path": rec.path, "name": rec.name, "ext": rec.ext, "dir": rec.dir,
+                "drive": rec.drive, "size": rec.size, "mtime": rec.mtime, "lang": lang,
+                "method": method, "ocr_used": ocr_used, "pages": pages, "chars": chars,
+                "snippet": text[:400],
+            }, ensure_ascii=False) + "\n")
+        if self._csv is not None:
+            self._csv.writerow([rec.path, rec.name, rec.ext, rec.size, f"{rec.mtime:.0f}",
+                                lang, method, int(ocr_used), chars])
         # sidecars only for real extracted content (not plaintext, name-only, or errors)
         if (self.sidecar_mode != "none" and text.strip()
                 and method not in ("text", "name-only")
@@ -119,6 +124,8 @@ class IndexStore:
     def close(self):
         self.db.commit()
         for f in (self._jsonl, self._csv_f):
+            if f is None:
+                continue
             try:
                 f.close()
             except Exception:

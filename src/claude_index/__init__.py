@@ -6,4 +6,4 @@ Windows-Explorer sidecars). Also reports the folder with the most matches and a
 structural analysis of the tree.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

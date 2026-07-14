@@ -59,7 +59,8 @@ def _process(rec, cfg, ocr, dicts, normalizer, do_hash):
 def cmd_index(args):
     overrides = {
         "ocr": args.ocr, "sidecar": args.sidecar, "workers": args.workers,
-        "max_bytes": args.max_bytes,
+        "max_bytes": args.max_bytes, "ocr_langs": getattr(args, "ocr_langs", None),
+        "artifacts": False if getattr(args, "sqlite_only", False) else None,
     }
     cfg = Config.load(args.config, overrides)
     out = Path(args.out)
@@ -113,25 +114,27 @@ def cmd_index(args):
     if counts["skipped"]:
         print(f"Resume: skipped {counts['skipped']:,} files already indexed.")
 
-    # analysis report
-    db = connect(out)
-    analysis = run_analyze(db)
-    db.close()
-    reports = out / "reports"
-    reports.mkdir(parents=True, exist_ok=True)
-    label = ", ".join(args.paths)
-    (reports / "analysis.md").write_text(render_markdown(analysis, label), encoding="utf-8")
-    (reports / "analysis.json").write_text(
-        json.dumps(analysis, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    print(f"Analysis written: {reports / 'analysis.md'}")
-    busiest = analysis.get("top_folders_by_count", [])
-    if busiest:
-        print("Densest folders (overall):")
-        for folder, c in busiest[:5]:
-            print(f"  {c:>6,}  {folder}")
+    if cfg.get("artifacts", True):
+        db = connect(out)
+        analysis = run_analyze(db)
+        db.close()
+        reports = out / "reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        label = ", ".join(args.paths)
+        (reports / "analysis.md").write_text(render_markdown(analysis, label), encoding="utf-8")
+        (reports / "analysis.json").write_text(
+            json.dumps(analysis, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        print(f"Analysis written: {reports / 'analysis.md'}")
+        busiest = analysis.get("top_folders_by_count", [])
+        if busiest:
+            print("Densest folders (overall):")
+            for folder, c in busiest[:5]:
+                print(f"  {c:>6,}  {folder}")
     abs_out = out.resolve()
     print(f"\n📁 Index databases live in: {abs_out}")
-    contents = "index.sqlite · manifest.jsonl · catalog.csv · reports/"
+    contents = "index.sqlite"
+    if cfg.get("artifacts", True):
+        contents += " · manifest.jsonl · catalog.csv · reports/"
     if cfg["sidecar"] != "none":
         contents += f" · sidecar/ (Explorer-searchable .txt, {cfg['sidecar']} mode)"
     print(f"   {contents}")
@@ -207,6 +210,8 @@ def build_parser():
     pi.add_argument("paths", nargs="+", help="drives/folders to index, e.g. E:\\")
     pi.add_argument("--out", default=default_out, help="output dir (default: ./index_out)")
     pi.add_argument("--ocr", choices=["auto", "on", "off"], default=None)
+    pi.add_argument("--ocr-langs", default=None,
+                    help="Tesseract language expression, e.g. vie+eng or vie+eng+rus")
     pi.add_argument("--sidecar", choices=["mirror", "inplace", "none"], default=None,
                     help="Windows Explorer .txt sidecars (default: mirror)")
     pi.add_argument("--workers", type=int, default=None)
