@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --tag llm-indexing:test .
+      - name: Verify runtime and OCR languages
+        run: |
+          test "$(docker run --rm --entrypoint id llm-indexing:test -u)" = "10001"
+          docker run --rm --entrypoint tesseract llm-indexing:test --list-langs | grep -Fx eng
+          docker run --rm --entrypoint tesseract llm-indexing:test --list-langs | grep -Fx vie
+      - name: Smoke test the job service
+        run: |
+          mkdir -p input output
+          printf 'Know your customer at ngan hang.\n' > input/sample.txt
+          chmod 777 output
+          docker run -d --name indexer -p 127.0.0.1:9801:9801 \
+            -v "$PWD/input:/input:ro" -v "$PWD/output:/output" llm-indexing:test
+          ready=false
+          for attempt in $(seq 1 30); do
+            if docker run --rm --network host llm-indexing:test request --ping; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          docker run --rm --network host llm-indexing:test request \
+            --output corpus.sqlite --overwrite
+          test -f output/corpus.sqlite
+          docker run --rm -v "$PWD/output:/output:ro" llm-indexing:test \
+            search "ngan hang" --index /output/corpus.sqlite
+          docker rm -f indexer

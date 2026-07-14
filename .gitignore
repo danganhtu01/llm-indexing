@@ -1,14 +1,7 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.eggs/
-build/
-dist/
-.venv/
-venv/
+# Rust
+target/
 
-# Downloaded data (fetched by scripts/fetch_data.py; not committed)
+# Downloaded data (fetched by llm-index fetch-data; not committed)
 data/dict/
 data/tessdata/
 

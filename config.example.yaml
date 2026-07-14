@@ -1,9 +1,9 @@
-# claude-indexing configuration. Copy to config.yaml and edit, or pass --config.
+# llm-index configuration. Copy to config.yaml and edit, or pass --config.
 # All values shown are defaults; omit any key to keep the default.
 
 languages: [vi, en]          # languages to index/normalize for
 ocr: auto                    # auto | on | off  (auto = OCR only when no text layer)
-sidecar: mirror              # mirror | inplace | none  (Windows Explorer .txt sidecars)
+sidecar: mirror              # mirror | inplace | none
 workers: 8                   # parallel extraction threads
 max_bytes: 104857600         # 100 MB: files larger than this are indexed by name only
 max_chars: 1000000           # cap extracted characters per file
@@ -11,15 +11,11 @@ hash: false                  # compute sha1 (slower); false = use size+mtime as 
 ocr_max_pages: 20            # max PDF pages to OCR per file
 
 # Tesseract
-tesseract_cmd: "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
-tessdata_dir: ""             # blank = use ./data/tessdata then system tessdata
+tesseract_cmd: tesseract
 ocr_langs: "vie+eng"
 
-# Dictionaries (fetched by scripts/fetch_data.py)
-dict_dir: "data/dict"        # holds en_US.dic/.aff, vi_VN.dic/.aff, vi_words.txt
-abbreviations:
-  - "data/abbreviations_en.txt"
-  - "data/abbreviations_vi.txt"
+# Dictionaries are fetched with: llm-index fetch-data --data-dir data
+data_dir: data
 
 # Skip rules
 skip_dirs:
