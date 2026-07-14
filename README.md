@@ -68,7 +68,7 @@ after indexing succeeds.
 
 ## Native CLI
 
-Requires Rust 1.85+, Tesseract with the desired language data, and Poppler.
+Requires Rust 1.86+, Tesseract with the desired language data, and Poppler.
 
 ```bash
 cargo build --release --locked

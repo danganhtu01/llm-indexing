@@ -2,7 +2,7 @@
 name = "llm-indexing"
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.86"
 license = "MIT"
 repository = "https://github.com/danganhtu01/llm-indexing"
 description = "Rust-native EN/VI document indexer with OCR, SQLite FTS5, and an HTTP job service"
