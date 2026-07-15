@@ -16,6 +16,7 @@ this component.
 - Images and embedded Office/ODF media OCR
 - DOCX, XLSX, PPTX and OpenDocument XML text extraction
 - ZIP, RAR, 7z, TAR and gzip traversal with safe-path and recursion limits
+  (including UTF-8/Vietnamese archive entry names)
 - Local Whisper transcription for audio and video; video frame OCR is sampled
   in exhaustive mode
 - English stemming, Vietnamese segmentation, abbreviation expansion and
