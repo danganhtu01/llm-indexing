@@ -43,7 +43,9 @@ COPY --from=builder --chown=indexer:indexer /src/data /app/data
 COPY --from=builder --chown=indexer:indexer /models /app/models
 
 WORKDIR /app
-ENV WHISPER_MODEL=/app/models/ggml-small.bin \
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    WHISPER_MODEL=/app/models/ggml-small.bin \
     FASTEMBED_CACHE_DIR=/app/models/fastembed
 USER 10001:10001
 EXPOSE 9801

@@ -196,7 +196,7 @@ fn archive(
     depth: usize,
     max_chars: usize,
 ) -> Result<Extracted> {
-    let listing = Command::new("bsdtar").args(["-tf"]).arg(path).output()?;
+    let listing = bsdtar().args(["-tf"]).arg(path).output()?;
     if !listing.status.success() {
         anyhow::bail!(
             "archive listing failed: {}",
@@ -214,7 +214,7 @@ fn archive(
         }
     }
     let temp = tempdir()?;
-    let output = Command::new("bsdtar")
+    let output = bsdtar()
         .args(["-xf"])
         .arg(path)
         .arg("-C")
@@ -306,6 +306,17 @@ fn archive(
         ocr_used,
         pages,
     })
+}
+
+/// libarchive converts archive entry names through the process locale. The
+/// service intentionally runs without a generated locale package, so select
+/// Debian's built-in UTF-8 locale explicitly for Vietnamese and other Unicode
+/// filenames. A plain `C` locale makes bsdtar skip otherwise valid ZIP entries
+/// and return a false extraction error.
+fn bsdtar() -> Command {
+    let mut command = Command::new("bsdtar");
+    command.env("LANG", "C.UTF-8").env("LC_ALL", "C.UTF-8");
+    command
 }
 
 fn media(

@@ -12,8 +12,10 @@ mounted tree
 
 The walker rejects symlink escapes and applies directory/extension rules. Rayon
 workers extract content in parallel; one writer owns SQLite and commits in
-batches. Archives are unpacked through `bsdtar` only after safe relative-path
-validation, with a four-level recursion limit and 10,000-entry bound.
+batches. Archives are unpacked through `bsdtar` under the built-in `C.UTF-8`
+locale only after safe relative-path validation, preserving Vietnamese/Unicode
+entry names without installing mutable locale data. Archive traversal retains a
+four-level recursion limit and 10,000-entry bound.
 
 ### Extraction completeness
 
