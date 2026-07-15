@@ -1,56 +1,77 @@
 # Architecture
-
 ## Pipeline
 
 ```text
-paths -> walker -> extractor/OCR -> language normalization -> SQLite FTS5
+mounted tree
+  -> confined walker
+  -> document/archive/media extraction
+  -> exhaustive OCR + Whisper transcription
+  -> EN/VI normalization
+  -> SQLite files + FTS5 + embedded chunks
 ```
 
-The walker applies symlink, directory, extension, and size rules. Rayon workers
-extract and normalize files in parallel; a single writer owns SQLite and commits
-in batches. File name and path tokens remain searchable when content extraction
-is unsupported or fails.
+The walker rejects symlink escapes and applies directory/extension rules. Rayon
+workers extract content in parallel; one writer owns SQLite and commits in
+batches. Archives are unpacked through `bsdtar` only after safe relative-path
+validation, with a four-level recursion limit and 10,000-entry bound.
 
-Extraction is implemented in Rust for text, email, and ZIP/XML Office formats.
-The process invokes Poppler for PDFs and Tesseract for OCR. `ocr: auto` preserves
-a PDF text layer and rasterizes only when that layer is empty. OCR work is capped
-by `ocr_max_pages`.
+### Extraction completeness
 
-## Retrieval
+Normal `auto`, `on` and `off` modes retain configurable byte, character and OCR
+page limits. `exhaustive` bypasses those caps, rasterizes every PDF page at 250
+DPI, OCRs it even when Poppler found a text layer, and combines both results.
+Modern Office/ODF files contribute XML text and embedded-image OCR. Audio and
+video are decoded by FFmpeg to 16 kHz mono PCM and transcribed with the pinned
+multilingual Whisper small model; exhaustive video processing also OCRs sampled
+frames every 30 seconds.
 
-Normalization combines lowercased words, Unicode diacritic folding, English
-Snowball stems, Vietnamese maximum-matching compounds, and editable EN/VI
-abbreviation expansions. Raw content and enriched tokens are both stored in FTS.
+An extraction method ending in `-partial`, beginning `error:`, or equal to
+`name-only` is counted as incomplete. Empty extraction is partial. Unsupported
+or failed content is therefore visible to the caller and is not treated as a
+complete searchable document.
+
+## Retrieval schema
 
 ```sql
 files(id, path UNIQUE, drive, dir, name, ext, size, mtime,
       lang, method, ocr_used, pages, chars, sha1, indexed_at)
 fts USING fts5(name, path, content, tokens,
                tokenize="unicode61 remove_diacritics 2 tokenchars '_'")
+chunks(id, file_id, chunk_index, content, embedding BLOB, dimensions)
 ```
 
-The `search` and `top-folder` commands normalize queries with the same rules.
-Results are ranked with `bm25()`; folder aggregation groups matching file rows.
+Normalization combines lowercased words, Unicode diacritic folding, English
+Snowball stems, Vietnamese maximum-matching compounds and editable abbreviation
+expansions. FTS queries use the same normalization and BM25 ranking.
 
-## Service Boundary
+Complete content is split into overlapping 1,200-character chunks. FastEmbed's
+`multilingual-e5-small` produces 384 float32 values stored as a SQLite BLOB.
+Vector retrieval embeds the query with the E5 query prefix and ranks chunks by
+cosine similarity. The current corpus size is intentionally served by a bounded
+in-process scan, keeping the database portable and avoiding a second vector DB.
 
-The Axum service exposes health, submission, and job-status endpoints. A bounded
-Tokio channel serializes indexing jobs so concurrent requests cannot exhaust the
-host. Request bodies, pending jobs, worker threads, and retained job history are
-bounded.
+## Incremental consistency
 
-All input paths are canonicalized and must remain under configured read-only
-roots. Output is restricted to a plain `.sqlite` filename beneath the configured
-output root. Each job builds in a temporary output directory and renames the
-completed database into place. Failed jobs leave the prior database intact.
+Resume skips an unchanged path only when its size/mtime match, its extraction is
+complete, required exhaustive methods are present, and it has vector chunks.
+An optional, validated `include_paths` set narrows extraction to an exact list
+selected by the caller; the full walk still drives deletion pruning.
+The writer replaces each changed file's FTS row and chunks atomically. At the end
+of a successful tree walk, records absent from the source tree are pruned from
+all three tables. Job metrics expose files, OCR files, errors, incomplete files,
+embedded chunks, removed files and elapsed time. A cooperative cancellation flag
+is checked around extraction and embedding; cancellation drops the temporary
+database and preserves the last atomically published corpus.
 
-The image runs as UID/GID 10001 with no Linux capabilities, a read-only root
-filesystem under Compose, read-only inputs, and a writable output mount.
+## Service boundary
 
-## Language Extensions
+Axum exposes health, job submission/status/cancellation and semantic search. A bounded Tokio
+channel serializes jobs so concurrent requests cannot exhaust the host. Input
+paths must canonicalize under configured read-only roots. Output is restricted
+to a plain `.sqlite` filename under the output root; a temporary build is renamed
+only after success, preserving the previous database on failure.
 
-OCR language selection is data-driven through `ocr_langs`; installing an
-additional Tesseract trained-data package enables character recognition for that
-language. Retrieval quality beyond raw Unicode matching requires adding language
-detection and normalization rules in `normalize.rs`, plus relevant dictionaries
-under `data/`. No protocol or SQLite schema change is required.
+The image runs as an unprivileged UID, drops all capabilities, uses a read-only
+root filesystem, mounts input read-only and writes only the output mount. The
+Whisper and FastEmbed artifacts are downloaded and checksum-verified at image
+build time, allowing the live engine to remain on the internal no-egress network.

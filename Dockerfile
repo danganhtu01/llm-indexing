@@ -1,17 +1,33 @@
-FROM rust:1.86-bookworm AS builder
+FROM rust:1.88-trixie AS builder
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates cmake curl g++ pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV WHISPER_DONT_GENERATE_BINDINGS=1
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY data ./data
 RUN cargo build --release --locked \
-    && ./target/release/llm-index fetch-data --data-dir data --dictionaries-only
+    && cargo test --release --locked \
+    && ./target/release/llm-index fetch-data --data-dir data --dictionaries-only \
+    && mkdir -p /models/fastembed \
+    && curl --fail --location --retry 3 \
+       https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.bin \
+       --output /models/ggml-small.bin \
+    && echo "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b  /models/ggml-small.bin" \
+       | sha256sum --check \
+    && ./target/release/llm-index prefetch-models --embedding-cache /models/fastembed
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        antiword \
+        ffmpeg \
+        libarchive-tools \
         poppler-utils \
         tesseract-ocr \
         tesseract-ocr-eng \
@@ -19,13 +35,16 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 indexer \
     && useradd --uid 10001 --gid indexer --no-create-home --shell /usr/sbin/nologin indexer \
-    && mkdir -p /app/data /input /output \
+    && mkdir -p /app/data /app/models /input /output \
     && chown -R indexer:indexer /app /output
 
 COPY --from=builder /src/target/release/llm-index /usr/local/bin/llm-index
 COPY --from=builder --chown=indexer:indexer /src/data /app/data
+COPY --from=builder --chown=indexer:indexer /models /app/models
 
 WORKDIR /app
+ENV WHISPER_MODEL=/app/models/ggml-small.bin \
+    FASTEMBED_CACHE_DIR=/app/models/fastembed
 USER 10001:10001
 EXPOSE 9801
 VOLUME ["/output"]

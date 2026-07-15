@@ -39,6 +39,9 @@ fn indexes_and_searches_english_and_vietnamese() {
         config: config.clone(),
         resume: false,
         artifacts: true,
+        include_paths: None,
+        cancellation: None,
+        progress: None,
     })
     .unwrap();
     assert_eq!(stats.files, 3);

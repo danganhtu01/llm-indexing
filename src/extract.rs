@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ use tempfile::tempdir;
 use zip::ZipArchive;
 
 use crate::config::Config;
+use crate::media::Transcriber;
 use crate::ocr::TesseractOcr;
 
 const TEXT_EXTS: &[&str] = &[
@@ -41,6 +43,9 @@ const IMAGE_EXTS: &[&str] = &[
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".gif",
 ];
 const EMAIL_EXTS: &[&str] = &[".eml", ".wdseml", ".emlx"];
+const AUDIO_EXTS: &[&str] = &[".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"];
+const VIDEO_EXTS: &[&str] = &[".mkv", ".mp4", ".mov", ".m4v", ".avi", ".webm"];
+const ARCHIVE_EXTS: &[&str] = &[".zip", ".rar", ".7z", ".tar", ".gz", ".tgz"];
 
 #[derive(Debug, Clone)]
 pub struct Extracted {
@@ -67,14 +72,44 @@ pub fn extract(
     size: u64,
     config: &Config,
     ocr: &TesseractOcr,
+    transcriber: &Transcriber,
 ) -> Result<Extracted> {
-    if size > config.max_bytes || config.skip_ext(ext) {
+    extract_inner(path, ext, size, config, ocr, transcriber, 0)
+}
+
+fn extract_inner(
+    path: &Path,
+    ext: &str,
+    size: u64,
+    config: &Config,
+    ocr: &TesseractOcr,
+    transcriber: &Transcriber,
+    depth: usize,
+) -> Result<Extracted> {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("~$"))
+    {
+        return Ok(Extracted {
+            text: "Temporary Office lock file; no document body exists.".into(),
+            method: "excluded:office-lock".into(),
+            ocr_used: false,
+            pages: 0,
+        });
+    }
+    if (size > config.max_bytes && config.ocr != "exhaustive") || config.skip_ext(ext) {
         return Ok(Extracted::empty());
     }
+    let max_chars = if config.ocr == "exhaustive" {
+        usize::MAX / 4
+    } else {
+        config.max_chars
+    };
     if TEXT_EXTS.contains(&ext) || CODE_EXTS.contains(&ext) {
-        let raw = read_limited(path, config.max_chars.saturating_mul(4))?;
+        let raw = read_limited(path, max_chars.saturating_mul(4))?;
         return Ok(Extracted {
-            text: decode(&raw, config.max_chars),
+            text: decode(&raw, max_chars),
             method: "text".into(),
             ocr_used: false,
             pages: 0,
@@ -82,37 +117,34 @@ pub fn extract(
     }
     if EMAIL_EXTS.contains(&ext) {
         return Ok(Extracted {
-            text: email(path, config.max_chars)?,
+            text: email(path, max_chars)?,
             method: "email".into(),
             ocr_used: false,
             pages: 0,
         });
     }
     match ext {
+        ".pdf" if config.ocr == "exhaustive" => pdf_exhaustive(path, config, ocr),
         ".pdf" => pdf(path, config, ocr),
-        ".docx" => Ok(Extracted {
-            text: office_xml(path, &["word/"], config.max_chars)?,
-            method: "docx".into(),
-            ocr_used: false,
-            pages: 0,
-        }),
-        ".xlsx" | ".xlsm" => Ok(Extracted {
-            text: office_xml(path, &["xl/"], config.max_chars)?,
-            method: "xlsx".into(),
-            ocr_used: false,
-            pages: 0,
-        }),
-        ".pptx" => Ok(Extracted {
-            text: office_xml(path, &["ppt/slides/", "ppt/notesSlides/"], config.max_chars)?,
-            method: "pptx".into(),
-            ocr_used: false,
-            pages: 0,
-        }),
+        ".doc" => legacy_doc(path, max_chars),
+        ".docx" => office_archive(path, &["word/"], &["word/media/"], "docx", config, ocr),
+        ".xlsx" | ".xlsm" => office_archive(path, &["xl/"], &["xl/media/"], "xlsx", config, ocr),
+        ".pptx" => office_archive(
+            path,
+            &["ppt/slides/", "ppt/notesSlides/"],
+            &["ppt/media/"],
+            "pptx",
+            config,
+            ocr,
+        ),
+        ".odt" | ".ods" | ".odp" => {
+            office_archive(path, &["content.xml"], &["Pictures/"], "odf", config, ocr)
+        }
         _ if IMAGE_EXTS.contains(&ext)
-            && matches!(config.ocr.as_str(), "auto" | "on")
+            && matches!(config.ocr.as_str(), "auto" | "on" | "exhaustive")
             && ocr.available =>
         {
-            let text = truncate(ocr.image_to_text(path), config.max_chars);
+            let text = truncate(ocr.image_to_text(path), max_chars);
             Ok(Extracted {
                 ocr_used: !text.trim().is_empty(),
                 text,
@@ -120,8 +152,221 @@ pub fn extract(
                 pages: 1,
             })
         }
+        _ if AUDIO_EXTS.contains(&ext) || VIDEO_EXTS.contains(&ext) => {
+            media(path, ext, max_chars, ocr, transcriber)
+        }
+        _ if ARCHIVE_EXTS.contains(&ext) && depth < 4 => {
+            archive(path, config, ocr, transcriber, depth + 1, max_chars)
+        }
         _ => Ok(Extracted::empty()),
     }
+}
+
+fn legacy_doc(path: &Path, max_chars: usize) -> Result<Extracted> {
+    let output = Command::new("antiword")
+        .arg(path)
+        .output()
+        .with_context(|| format!("running antiword for {}", path.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "antiword failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    let text = truncate(
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        max_chars,
+    );
+    if text.trim().is_empty() {
+        anyhow::bail!("antiword produced no document text")
+    }
+    Ok(Extracted {
+        text,
+        method: "doc".into(),
+        ocr_used: false,
+        pages: 0,
+    })
+}
+
+fn archive(
+    path: &Path,
+    config: &Config,
+    ocr: &TesseractOcr,
+    transcriber: &Transcriber,
+    depth: usize,
+    max_chars: usize,
+) -> Result<Extracted> {
+    let listing = Command::new("bsdtar").args(["-tf"]).arg(path).output()?;
+    if !listing.status.success() {
+        anyhow::bail!(
+            "archive listing failed: {}",
+            String::from_utf8_lossy(&listing.stderr).trim()
+        )
+    }
+    for name in String::from_utf8_lossy(&listing.stdout).lines() {
+        let candidate = Path::new(name);
+        if candidate.is_absolute()
+            || candidate
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("archive contains an unsafe path")
+        }
+    }
+    let temp = tempdir()?;
+    let output = Command::new("bsdtar")
+        .args(["-xf"])
+        .arg(path)
+        .arg("-C")
+        .arg(temp.path())
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "archive extraction failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    let mut stack = vec![temp.path().to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(directory) = stack.pop() {
+        for entry in fs::read_dir(directory)?.flatten() {
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                files.push(entry.path());
+            }
+            if files.len() > 10_000 {
+                anyhow::bail!("archive exceeds the 10,000-entry safety limit")
+            }
+        }
+    }
+    files.sort();
+    let mut parts = Vec::new();
+    let mut partial = false;
+    let mut ocr_used = false;
+    let mut pages = 0;
+    for file in files {
+        let metadata = file.metadata()?;
+        let extension = file
+            .extension()
+            .map(|value| format!(".{}", value.to_string_lossy().to_lowercase()))
+            .unwrap_or_default();
+        match extract_inner(
+            &file,
+            &extension,
+            metadata.len(),
+            config,
+            ocr,
+            transcriber,
+            depth,
+        ) {
+            Ok(extracted) => {
+                partial |= extracted.method == "name-only"
+                    || extracted.method.starts_with("error:")
+                    || extracted.method.ends_with("-partial");
+                ocr_used |= extracted.ocr_used;
+                pages += extracted.pages;
+                if !extracted.text.trim().is_empty() {
+                    let relative = file.strip_prefix(temp.path()).unwrap_or(&file);
+                    parts.push(format!(
+                        "[archive entry: {}]\n{}",
+                        relative.display(),
+                        extracted.text
+                    ));
+                }
+            }
+            Err(error) => {
+                partial = true;
+                let relative = file.strip_prefix(temp.path()).unwrap_or(&file);
+                parts.push(format!(
+                    "[archive entry error: {}] {error:#}",
+                    relative.display()
+                ));
+            }
+        }
+        if parts.iter().map(String::len).sum::<usize>() >= max_chars {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        anyhow::bail!("archive contains no extractable content")
+    }
+    Ok(Extracted {
+        text: truncate(parts.join("\n\n"), max_chars),
+        method: if partial {
+            "archive-partial"
+        } else {
+            "archive"
+        }
+        .into(),
+        ocr_used,
+        pages,
+    })
+}
+
+fn media(
+    path: &Path,
+    ext: &str,
+    max_chars: usize,
+    ocr: &TesseractOcr,
+    transcriber: &Transcriber,
+) -> Result<Extracted> {
+    if !transcriber.available() {
+        anyhow::bail!("local Whisper transcription model is unavailable")
+    }
+    let transcript = transcriber.transcribe(path)?;
+    let mut sections = vec![format!("[Audio transcript]\n{transcript}")];
+    let mut frame_count = 0;
+    if VIDEO_EXTS.contains(&ext) && ocr.available {
+        let temp = tempdir()?;
+        let pattern = temp.path().join("frame-%06d.png");
+        let output = Command::new("ffmpeg")
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(path)
+            .args([
+                "-vf",
+                "fps=1/30,scale='min(1920,iw)':-2",
+                "-frames:v",
+                "1000",
+            ])
+            .arg(&pattern)
+            .output()?;
+        if output.status.success() {
+            let mut frames = fs::read_dir(temp.path())?
+                .flatten()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>();
+            frames.sort();
+            frame_count = frames.len();
+            let mut seen = HashSet::new();
+            let visual = frames
+                .into_iter()
+                .filter_map(|frame| {
+                    let text = ocr.image_to_text(&frame).trim().to_string();
+                    (!text.is_empty() && seen.insert(text.clone())).then_some(text)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !visual.is_empty() {
+                sections.push(format!("[Video frame OCR]\n{visual}"));
+            }
+        }
+    }
+    Ok(Extracted {
+        text: truncate(sections.join("\n\n"), max_chars),
+        method: if VIDEO_EXTS.contains(&ext) {
+            "video-transcript-ocr"
+        } else {
+            "audio-transcript"
+        }
+        .into(),
+        ocr_used: frame_count > 0,
+        pages: frame_count,
+    })
 }
 
 fn read_limited(path: &Path, limit: usize) -> Result<Vec<u8>> {
@@ -199,24 +444,70 @@ fn strip_html(html: &str) -> String {
     output
 }
 
-fn office_xml(path: &Path, prefixes: &[&str], max_chars: usize) -> Result<String> {
+fn office_archive(
+    path: &Path,
+    prefixes: &[&str],
+    media_prefixes: &[&str],
+    method: &str,
+    config: &Config,
+    ocr: &TesseractOcr,
+) -> Result<Extracted> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
     let mut parts = Vec::new();
+    let mut images = Vec::new();
+    let exhaustive = config.ocr == "exhaustive";
+    let temp = tempdir()?;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let name = entry.name().to_string();
-        if !name.ends_with(".xml") || !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
-            continue;
-        }
-        let mut xml = Vec::new();
-        entry.read_to_end(&mut xml)?;
-        parts.extend(xml_text(&xml));
-        if parts.iter().map(String::len).sum::<usize>() >= max_chars {
-            break;
+        if name.ends_with(".xml") && prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+            let mut xml = Vec::new();
+            entry.read_to_end(&mut xml)?;
+            parts.extend(xml_text(&xml));
+        } else if exhaustive
+            && ocr.available
+            && media_prefixes.iter().any(|prefix| name.starts_with(prefix))
+            && IMAGE_EXTS
+                .iter()
+                .any(|ext| name.to_lowercase().ends_with(ext))
+        {
+            let extension = Path::new(&name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("png");
+            let target = temp.path().join(format!("image-{i}.{extension}"));
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            fs::write(&target, bytes)?;
+            images.push(target);
         }
     }
-    Ok(truncate(parts.join("\n"), max_chars))
+    let mut ocr_used = false;
+    for image in &images {
+        let text = ocr.image_to_text(image);
+        if !text.trim().is_empty() {
+            ocr_used = true;
+            parts.push(format!("[Embedded image OCR]\n{text}"));
+        }
+    }
+    Ok(Extracted {
+        text: truncate(
+            parts.join("\n"),
+            if exhaustive {
+                usize::MAX
+            } else {
+                config.max_chars
+            },
+        ),
+        method: if ocr_used {
+            format!("{method}-ocr")
+        } else {
+            method.into()
+        },
+        ocr_used,
+        pages: images.len(),
+    })
 }
 
 fn xml_text(xml: &[u8]) -> Vec<String> {
@@ -249,6 +540,76 @@ fn xml_text(xml: &[u8]) -> Vec<String> {
         buf.clear();
     }
     out
+}
+
+fn pdf_exhaustive(path: &Path, _config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
+    if !ocr.available {
+        anyhow::bail!("Tesseract is unavailable for exhaustive PDF OCR")
+    }
+    let pages = pdf_pages(path);
+    if pages == 0 {
+        anyhow::bail!("PDF page count is unavailable")
+    }
+    let temp = tempdir()?;
+    let mut parts = Vec::with_capacity(pages);
+    let mut used_ocr = false;
+    for page in 1..=pages {
+        let output = Command::new("pdftotext")
+            .args(["-f", &page.to_string(), "-l", &page.to_string()])
+            .arg(path)
+            .arg("-")
+            .output();
+        let text = output
+            .ok()
+            .filter(|result| result.status.success())
+            .map(|result| String::from_utf8_lossy(&result.stdout).into_owned())
+            .unwrap_or_default();
+        let prefix = temp.path().join(format!("page-{page}"));
+        let rendered = Command::new("pdftoppm")
+            .args([
+                "-f",
+                &page.to_string(),
+                "-l",
+                &page.to_string(),
+                "-singlefile",
+                "-png",
+                "-r",
+                "250",
+            ])
+            .arg(path)
+            .arg(&prefix)
+            .output()?;
+        if !rendered.status.success() {
+            anyhow::bail!("failed to rasterize PDF page {page}")
+        }
+        let image = prefix.with_extension("png");
+        let recognized = ocr.image_to_text(&image);
+        let _ = fs::remove_file(image);
+        let page_text = match (text.trim().is_empty(), recognized.trim().is_empty()) {
+            (true, true) => format!("[Page {page}: no textual content detected]"),
+            (false, true) => format!("[Text layer]\n{text}"),
+            (true, false) => {
+                used_ocr = true;
+                format!("[OCR]\n{recognized}")
+            }
+            (false, false) => {
+                used_ocr = true;
+                format!("[Text layer]\n{text}\n[OCR]\n{recognized}")
+            }
+        };
+        parts.push(format!("[Page {page}]\n{page_text}"));
+    }
+    Ok(Extracted {
+        text: parts.join("\n\n"),
+        method: if used_ocr {
+            "pdf-exhaustive-ocr"
+        } else {
+            "pdf-exhaustive-text"
+        }
+        .into(),
+        ocr_used: used_ocr,
+        pages,
+    })
 }
 
 fn pdf(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {

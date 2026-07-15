@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -35,6 +35,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
   name, path, content, tokens,
   tokenize="unicode61 remove_diacritics 2 tokenchars '_'"
 );
+CREATE TABLE IF NOT EXISTS chunks(
+  id INTEGER PRIMARY KEY,
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  embedding BLOB NOT NULL,
+  dimensions INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  UNIQUE(file_id, chunk_index)
+);
+CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
 "#;
 
 pub struct IndexStore {
@@ -103,21 +114,49 @@ impl IndexStore {
         })
     }
 
-    pub fn existing_keys(&self) -> Result<HashMap<String, (u64, i64)>> {
+    pub fn existing_keys(&self) -> Result<HashMap<String, (u64, i64, String, bool)>> {
         let mut statement = self
             .connection
-            .prepare("SELECT path,size,mtime FROM files")?;
+            .prepare(
+                "SELECT f.path,f.size,f.mtime,f.method,EXISTS(SELECT 1 FROM chunks c WHERE c.file_id=f.id) \
+                 FROM files f",
+            )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)? as u64,
                 row.get::<_, f64>(2)? as i64,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? != 0,
             ))
         })?;
         Ok(rows
             .flatten()
-            .map(|(path, size, mtime)| (path, (size, mtime)))
+            .map(|(path, size, mtime, method, has_chunks)| {
+                (path, (size, mtime, method, has_chunks))
+            })
             .collect())
+    }
+
+    pub fn prune_missing(&mut self, current: &HashSet<String>) -> Result<usize> {
+        let mut statement = self.connection.prepare("SELECT id,path FROM files")?;
+        let stale = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .flatten()
+            .filter(|(_, path)| !current.contains(path))
+            .collect::<Vec<_>>();
+        drop(statement);
+        for (id, _) in &stale {
+            self.connection
+                .execute("DELETE FROM chunks WHERE file_id=?1", [id])?;
+            self.connection
+                .execute("DELETE FROM fts WHERE rowid=?1", [id])?;
+            self.connection
+                .execute("DELETE FROM files WHERE id=?1", [id])?;
+        }
+        Ok(stale.len())
     }
 
     pub fn add(&mut self, file: &ProcessedFile, indexed_at: f64) -> Result<()> {
@@ -127,6 +166,8 @@ impl IndexStore {
                 [&file.rec.path],
                 |row| row.get::<_, i64>(0),
             ) {
+                self.connection
+                    .execute("DELETE FROM chunks WHERE file_id=?1", [old_id])?;
                 self.connection
                     .execute("DELETE FROM fts WHERE rowid=?1", [old_id])?;
             }
@@ -148,6 +189,20 @@ impl IndexStore {
                 file.tokens.join(" ")
             ],
         )?;
+        for chunk in &file.chunks {
+            self.connection.execute(
+                "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model) \
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    id,
+                    chunk.index as i64,
+                    chunk.content,
+                    crate::embedding::vector_to_bytes(&chunk.vector),
+                    chunk.vector.len() as i64,
+                    crate::embedding::EMBEDDING_MODEL,
+                ],
+            )?;
+        }
         if let Some(jsonl) = &mut self.jsonl {
             serde_json::to_writer(
                 &mut *jsonl,
