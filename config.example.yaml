@@ -2,7 +2,7 @@
 # All values shown are defaults; omit any key to keep the default.
 
 languages: [vi, en]          # languages to index/normalize for
-ocr: auto                    # auto | on | off  (auto = OCR only when no text layer)
+ocr: auto                    # auto | on | off | exhaustive
 sidecar: mirror              # mirror | inplace | none
 workers: 8                   # parallel extraction threads
 max_bytes: 104857600         # 100 MB: files larger than this are indexed by name only
@@ -16,6 +16,12 @@ ocr_langs: "vie+eng"
 
 # Dictionaries are fetched with: llm-index fetch-data --data-dir data
 data_dir: data
+
+# Local media transcription and semantic embeddings. The container image bakes
+# these artifacts in; native installs must fetch/place them before indexing.
+whisper_model: models/ggml-small.bin
+embedding_cache: models/fastembed
+embedding_model: intfloat/multilingual-e5-small
 
 # Skip rules
 skip_dirs:

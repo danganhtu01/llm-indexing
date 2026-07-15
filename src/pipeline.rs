@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -9,7 +11,9 @@ use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 
 use crate::config::Config;
+use crate::embedding::Embedder;
 use crate::extract::extract;
+use crate::media::Transcriber;
 use crate::model::{FileRec, IndexStats, ProcessedFile};
 use crate::normalize::Normalizer;
 use crate::ocr::TesseractOcr;
@@ -22,6 +26,9 @@ pub struct IndexRequest<'a> {
     pub config: Config,
     pub resume: bool,
     pub artifacts: bool,
+    pub include_paths: Option<HashSet<String>>,
+    pub cancellation: Option<Arc<AtomicBool>>,
+    pub progress: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
 }
 
 pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
@@ -29,6 +36,8 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     let started = Instant::now();
     let normalizer = Arc::new(Normalizer::load(&request.config));
     let ocr = Arc::new(TesseractOcr::new(&request.config));
+    let transcriber = Arc::new(Transcriber::new(&request.config));
+    let mut embedder = Embedder::new(&request.config)?;
     let mut store = IndexStore::open(
         request.out,
         &request.config,
@@ -41,12 +50,32 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         Default::default()
     };
     let mut records = walk(request.paths, &request.config);
+    let current = records
+        .iter()
+        .map(|record| record.path.clone())
+        .collect::<HashSet<_>>();
+    let removed = if request.resume {
+        store.prune_missing(&current)?
+    } else {
+        0
+    };
+    if let Some(include_paths) = &request.include_paths {
+        records.retain(|record| include_paths.contains(&record.path));
+    }
     let before = records.len();
     if request.resume {
         records.retain(|record| {
             existing
                 .get(&record.path)
-                .map(|(size, mtime)| *size != record.size || *mtime != record.mtime as i64)
+                .map(|(size, mtime, method, has_chunks)| {
+                    *size != record.size
+                        || *mtime != record.mtime as i64
+                        || !*has_chunks
+                        || incomplete_method(method)
+                        || (request.config.ocr == "exhaustive"
+                            && record.ext == ".pdf"
+                            && !method.starts_with("pdf-exhaustive"))
+                })
                 .unwrap_or(true)
         });
     }
@@ -66,21 +95,61 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         .num_threads(request.config.workers)
         .build()?;
     let config = Arc::new(request.config.clone());
+    let total = records.len();
+    if let Some(progress) = &request.progress {
+        progress(0, total);
+    }
+    let completed = Arc::new(AtomicUsize::new(0));
+    let cancellation = request.cancellation.clone();
+    let progress = request.progress.clone();
     let processed = pool.install(|| {
         records
             .par_iter()
-            .map(|record| process(record.clone(), &config, &normalizer, &ocr))
+            .filter_map(|record| {
+                if cancellation
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    return None;
+                }
+                let file = process(record.clone(), &config, &normalizer, &ocr, &transcriber);
+                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(progress) = &progress {
+                    progress(count, total);
+                }
+                Some(file)
+            })
             .collect::<Vec<_>>()
     });
+    if request
+        .cancellation
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    {
+        anyhow::bail!("indexing cancelled")
+    }
     let mut stats = IndexStats {
         skipped,
+        removed,
         ..Default::default()
     };
-    for file in processed {
+    for mut file in processed {
+        if request
+            .cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            anyhow::bail!("indexing cancelled")
+        }
+        if !incomplete_method(&file.method) && !file.method.starts_with("excluded:") {
+            file.chunks = embedder.embed_document(&file.content)?;
+        }
         stats.files += 1;
         stats.bytes += file.rec.size;
         stats.ocr_files += usize::from(file.ocr_used);
         stats.errors += usize::from(file.method.starts_with("error:"));
+        stats.incomplete += usize::from(incomplete_method(&file.method));
+        stats.embedded_chunks += file.chunks.len();
         store.add(&file, now())?;
     }
     store.finish()?;
@@ -96,11 +165,13 @@ fn process(
     config: &Config,
     normalizer: &Normalizer,
     ocr: &TesseractOcr,
+    transcriber: &Transcriber,
 ) -> ProcessedFile {
     let path = Path::new(&record.path);
-    match extract(path, &record.ext, record.size, config, ocr) {
+    match extract(path, &record.ext, record.size, config, ocr, transcriber) {
         Ok(extracted) => {
-            let content = if extracted.text.trim().is_empty() {
+            let empty = extracted.text.trim().is_empty();
+            let content = if empty {
                 format!("{} {}", record.name, record.dir)
             } else {
                 extracted.text
@@ -119,10 +190,15 @@ fn process(
                 content,
                 tokens,
                 lang,
-                method: extracted.method,
+                method: if empty && !extracted.method.starts_with("excluded:") {
+                    format!("{}-partial", extracted.method)
+                } else {
+                    extracted.method
+                },
                 ocr_used: extracted.ocr_used,
                 pages: extracted.pages,
                 sha1: hash,
+                chunks: Vec::new(),
             }
         }
         Err(error) => ProcessedFile {
@@ -133,9 +209,14 @@ fn process(
             ocr_used: false,
             pages: 0,
             sha1: None,
+            chunks: Vec::new(),
             rec: record,
         },
     }
+}
+
+fn incomplete_method(method: &str) -> bool {
+    method == "name-only" || method.starts_with("error:") || method.ends_with("-partial")
 }
 
 fn sha1(path: &Path) -> Option<String> {

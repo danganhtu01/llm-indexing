@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::embedding::EmbeddedChunk;
+
 #[derive(Debug, Clone)]
 pub struct FileRec {
     pub path: String,
@@ -21,6 +23,7 @@ pub struct ProcessedFile {
     pub ocr_used: bool,
     pub pages: usize,
     pub sha1: Option<String>,
+    pub chunks: Vec<EmbeddedChunk>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -30,6 +33,9 @@ pub struct IndexStats {
     pub ocr_files: usize,
     pub errors: usize,
     pub skipped: usize,
+    pub incomplete: usize,
+    pub embedded_chunks: usize,
+    pub removed: usize,
     pub elapsed_seconds: f64,
 }
 

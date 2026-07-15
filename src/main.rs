@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use llm_indexing::config::Config;
+use llm_indexing::embedding::{vector_search, Embedder};
 use llm_indexing::normalize::Normalizer;
 use llm_indexing::pipeline::{run_index, IndexRequest};
 use llm_indexing::service::{router, JobRequest, ServiceConfig};
@@ -26,11 +27,13 @@ struct Cli {
 enum Command {
     Index(IndexArgs),
     Search(SearchArgs),
+    VectorSearch(VectorSearchArgs),
     TopFolder(TopFolderArgs),
     Analyze(AnalyzeArgs),
     Serve(ServeArgs),
     Request(RequestArgs),
     FetchData(FetchDataArgs),
+    PrefetchModels(PrefetchModelsArgs),
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -38,6 +41,7 @@ enum OcrMode {
     Auto,
     On,
     Off,
+    Exhaustive,
 }
 impl OcrMode {
     fn as_str(&self) -> &'static str {
@@ -45,6 +49,7 @@ impl OcrMode {
             Self::Auto => "auto",
             Self::On => "on",
             Self::Off => "off",
+            Self::Exhaustive => "exhaustive",
         }
     }
 }
@@ -80,6 +85,17 @@ struct SearchArgs {
     limit: usize,
     #[arg(long)]
     fuzzy: bool,
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct VectorSearchArgs {
+    query: String,
+    #[arg(long, default_value = "index_out/index.sqlite")]
+    index: PathBuf,
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -163,16 +179,31 @@ struct FetchDataArgs {
     ocr_only: bool,
 }
 
+#[derive(Args)]
+struct PrefetchModelsArgs {
+    #[arg(long, default_value = "/app/models/fastembed")]
+    embedding_cache: PathBuf,
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Index(args) => index(args),
         Command::Search(args) => search_command(args),
+        Command::VectorSearch(args) => vector_search_command(args),
         Command::TopFolder(args) => top_folder_command(args),
         Command::Analyze(args) => analyze_command(args),
         Command::Serve(args) => serve(args),
         Command::Request(args) => request(args),
         Command::FetchData(args) => fetch_data(args),
+        Command::PrefetchModels(args) => prefetch_models(args),
     }
+}
+
+fn vector_search_command(args: VectorSearchArgs) -> Result<()> {
+    let config = Config::load(args.config.as_deref())?;
+    let hits = vector_search(&args.index, &config, &args.query, args.limit)?;
+    println!("{}", serde_json::to_string_pretty(&hits)?);
+    Ok(())
 }
 
 fn index(args: IndexArgs) -> Result<()> {
@@ -198,6 +229,9 @@ fn index(args: IndexArgs) -> Result<()> {
         config,
         resume: args.resume,
         artifacts: true,
+        include_paths: None,
+        cancellation: None,
+        progress: None,
     })?;
     println!("{}", serde_json::to_string_pretty(&stats)?);
     println!(
@@ -331,6 +365,7 @@ fn request(args: RequestArgs) -> Result<()> {
         workers: args.workers,
         resume: args.resume,
         overwrite: args.overwrite,
+        include_paths: None,
     };
     let response = client
         .post(format!("{base}/index"))
@@ -419,6 +454,17 @@ fn fetch_data(args: FetchDataArgs) -> Result<()> {
         fs::write(&destination, &bytes)?;
         println!("{} {} bytes", destination.display(), bytes.len());
     }
+    Ok(())
+}
+
+fn prefetch_models(args: PrefetchModelsArgs) -> Result<()> {
+    let mut config = Config::default();
+    config.embedding_cache = args.embedding_cache;
+    let _ = Embedder::new(&config)?;
+    println!(
+        "embedding model cached at {}",
+        config.embedding_cache.display()
+    );
     Ok(())
 }
 
