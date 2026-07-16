@@ -124,7 +124,7 @@ pub fn vector_to_bytes(vector: &[f32]) -> Vec<u8> {
 }
 
 fn bytes_to_vector(bytes: &[u8]) -> Option<Vec<f32>> {
-    (bytes.len() % 4 == 0).then(|| {
+    bytes.len().is_multiple_of(4).then(|| {
         bytes
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))

@@ -11,7 +11,7 @@ COPY src ./src
 COPY data ./data
 RUN cargo build --release --locked \
     && cargo test --release --locked \
-    && ./target/release/llm-index fetch-data --data-dir data --dictionaries-only \
+    && ./target/release/llm-index fetch-data --data-dir data \
     && mkdir -p /models/fastembed \
     && curl --fail --location --retry 3 \
        https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.bin \
@@ -27,6 +27,7 @@ RUN apt-get update \
         ca-certificates \
         antiword \
         ffmpeg \
+        imagemagick \
         libarchive-tools \
         poppler-utils \
         tesseract-ocr \

@@ -553,7 +553,7 @@ fn xml_text(xml: &[u8]) -> Vec<String> {
     out
 }
 
-fn pdf_exhaustive(path: &Path, _config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
+fn pdf_exhaustive(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
     if !ocr.available {
         anyhow::bail!("Tesseract is unavailable for exhaustive PDF OCR")
     }
@@ -562,6 +562,7 @@ fn pdf_exhaustive(path: &Path, _config: &Config, ocr: &TesseractOcr) -> Result<E
         anyhow::bail!("PDF page count is unavailable")
     }
     let temp = tempdir()?;
+    let dpi = config.ocr_dpi.to_string();
     let mut parts = Vec::with_capacity(pages);
     let mut used_ocr = false;
     for page in 1..=pages {
@@ -585,7 +586,7 @@ fn pdf_exhaustive(path: &Path, _config: &Config, ocr: &TesseractOcr) -> Result<E
                 "-singlefile",
                 "-png",
                 "-r",
-                "250",
+                &dpi,
             ])
             .arg(path)
             .arg(&prefix)
@@ -646,8 +647,9 @@ fn pdf(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
     let temp = tempdir()?;
     let prefix = temp.path().join("page");
     let max_page = pages.max(1).min(config.ocr_max_pages);
+    let dpi = config.ocr_dpi.to_string();
     let status = Command::new("pdftoppm")
-        .args(["-f", "1", "-l", &max_page.to_string(), "-png", "-r", "200"])
+        .args(["-f", "1", "-l", &max_page.to_string(), "-png", "-r", &dpi])
         .arg(path)
         .arg(&prefix)
         .status();
