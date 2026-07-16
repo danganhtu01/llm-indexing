@@ -73,6 +73,16 @@ paths must canonicalize under configured read-only roots. Output is restricted
 to a plain `.sqlite` filename under the output root; a temporary build is renamed
 only after success, preserving the previous database on failure.
 
+Consumer apps used to open `corpus.sqlite` directly to render a directory tree
+or preview a document. `GET /corpus/tree`, `GET /corpus/documents/{id}/text`
+and `GET /corpus/status` (see `docs/HTTP_API.md`) serve that read-only join
+instead, so no consumer needs to decode the SQLite schema itself. `/corpus/tree`
+walks one named allowed input root (validated against the same allowed-roots
+model as `/index`) and joins it against the published database by each file's
+exact absolute path — precise where a by-name join could collide across
+directories. All three routes degrade to an empty/zeroed result when the
+corpus database hasn't been published yet.
+
 The image runs as an unprivileged UID, drops all capabilities, uses a read-only
 root filesystem, mounts input read-only and writes only the output mount. The
 Whisper and FastEmbed artifacts are downloaded and checksum-verified at image
