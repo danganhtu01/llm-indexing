@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 fn default_languages() -> Vec<String> {
-    vec!["vi".into(), "en".into()]
+    vec!["vi".into(), "en".into(), "ru".into(), "de".into()]
 }
 fn default_ocr() -> String {
     "auto".into()
@@ -30,6 +30,10 @@ fn default_tesseract() -> String {
     "tesseract".into()
 }
 fn default_ocr_langs() -> String {
+    // Default stays "vie+eng" — the common corpus and what jobs/portal pass
+    // explicitly today. Russian/German OCR (tesseract rus/deu, bundled as
+    // tessdata_best) is opt-in via "vie+eng+rus+deu" to avoid slowing every
+    // scan with unused language models.
     "vie+eng".into()
 }
 fn default_ocr_dpi() -> u32 {
@@ -215,5 +219,11 @@ mod tests {
         // Unspecified OCR knobs fall back to their defaults.
         assert_eq!(config.ocr_psm, "3");
         assert!(config.ocr_preprocess);
+    }
+
+    #[test]
+    fn yaml_overrides_ocr_langs_multilingual() {
+        let config: Config = serde_yaml::from_str("ocr_langs: vie+eng+rus+deu").unwrap();
+        assert_eq!(config.ocr_langs, "vie+eng+rus+deu");
     }
 }

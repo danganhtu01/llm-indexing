@@ -36,12 +36,28 @@ impl TesseractOcr {
             );
         }
         let best = config.data_dir.join("tessdata");
-        let tessdata = best.join("vie.traineddata").exists().then_some(best);
+        // Only prefer the bundled tessdata_best models when EVERY configured OCR
+        // language has a traineddata file there. A single missing model (e.g.
+        // rus/deu when the bundle only shipped vie/eng) would otherwise make
+        // tesseract fail for that language, so fall back to the system models.
+        let langs: Vec<&str> = config
+            .ocr_langs
+            .split('+')
+            .filter(|l| !l.is_empty())
+            .collect();
+        let bundle_complete = !langs.is_empty()
+            && langs
+                .iter()
+                .all(|lang| best.join(format!("{lang}.traineddata")).exists());
+        let tessdata = bundle_complete.then_some(best);
         match &tessdata {
             Some(dir) => {
                 tracing::info!(tessdata = %dir.display(), "OCR using bundled tessdata_best models")
             }
-            None => tracing::info!("OCR using system tessdata models (tessdata_best not bundled)"),
+            None => tracing::info!(
+                langs = %config.ocr_langs,
+                "OCR using system tessdata models (tessdata_best not bundled for every language)"
+            ),
         }
         let preprocess_cmd = if config.ocr_preprocess {
             let found = ["magick", "convert"].into_iter().find(|candidate| {
