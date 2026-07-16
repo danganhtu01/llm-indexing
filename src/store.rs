@@ -402,7 +402,13 @@ pub fn analyze(connection: &Connection) -> Result<Value> {
     }))
 }
 
-fn grouped(connection: &Connection, column: &str, limit: usize) -> Result<Vec<(String, i64)>> {
+/// Grouped counts for one `files` column, e.g. `("vi", 42)`. Shared with the
+/// HTTP service's `/corpus/status` aggregates.
+pub(crate) fn grouped(
+    connection: &Connection,
+    column: &str,
+    limit: usize,
+) -> Result<Vec<(String, i64)>> {
     let sql = format!(
         "SELECT {column},COUNT(*) FROM files GROUP BY {column} ORDER BY COUNT(*) DESC LIMIT ?1"
     );
