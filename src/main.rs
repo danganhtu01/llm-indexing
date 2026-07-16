@@ -437,6 +437,16 @@ fn fetch_data(args: FetchDataArgs) -> Result<()> {
             format!("{RAW}/tesseract-ocr/tessdata_best/main/eng.traineddata"),
             true,
         ),
+        (
+            "tessdata/rus.traineddata",
+            format!("{RAW}/tesseract-ocr/tessdata_best/main/rus.traineddata"),
+            true,
+        ),
+        (
+            "tessdata/deu.traineddata",
+            format!("{RAW}/tesseract-ocr/tessdata_best/main/deu.traineddata"),
+            true,
+        ),
     ];
     let client = reqwest::blocking::Client::new();
     for (relative, url, is_ocr) in files {

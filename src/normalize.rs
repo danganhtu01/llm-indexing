@@ -65,6 +65,13 @@ impl Normalizer {
         if words.is_empty() {
             return "und".into();
         }
+        let total_chars = sample.chars().count().max(1) as f64;
+        // Cyrillic is unambiguous among the languages we support, so decide it
+        // by script before the Latin-script vi/en/de heuristics below.
+        let cyrillic = sample.chars().filter(|c| is_cyrillic(*c)).count();
+        if cyrillic as f64 / total_chars > 0.02 {
+            return "ru".into();
+        }
         let vi_marks = sample.chars().filter(|c| is_vietnamese(*c)).count();
         let sampled = words.iter().take(300).collect::<Vec<_>>();
         let en_hits = sampled
@@ -75,14 +82,22 @@ impl Normalizer {
             .iter()
             .filter(|w| self.vi_words.contains(w.as_str()))
             .count();
+        let de_hits = sampled
+            .iter()
+            .filter(|w| GERMAN_STOPWORDS.contains(&w.as_str()))
+            .count();
         let n = sampled.len().max(1) as f64;
-        let is_vi = vi_marks as f64 / sample.chars().count().max(1) as f64 > 0.02
-            || vi_hits as f64 / n > 0.35;
+        let is_vi = vi_marks as f64 / total_chars > 0.02 || vi_hits as f64 / n > 0.35;
         let is_en = en_hits as f64 / n > 0.35;
-        match (is_vi, is_en, vi_marks > 0) {
-            (true, true, _) => "mixed",
-            (true, false, _) | (false, false, true) => "vi",
-            (false, true, _) => "en",
+        // German shares the Latin script (and many cognates) with English, so we
+        // key off German-specific function words / the ß grapheme rather than a
+        // Hunspell dictionary we don't ship; Vietnamese diacritics win outright.
+        let is_de = !is_vi && (sample.contains('ß') || de_hits as f64 / n > 0.15);
+        match (is_vi, is_en, is_de, vi_marks > 0) {
+            (true, true, _, _) => "mixed",
+            (true, false, _, _) | (false, false, false, true) => "vi",
+            (false, _, true, _) => "de",
+            (false, true, false, _) => "en",
             _ if en_hits >= vi_hits && en_hits > 0 => "en",
             _ => "und",
         }
@@ -206,12 +221,66 @@ fn is_vietnamese(c: char) -> bool {
         .contains(c.to_lowercase().next().unwrap_or(c))
 }
 
+/// Cyrillic + Cyrillic Supplement blocks — any presence flags Russian, the only
+/// Cyrillic-script language we index.
+fn is_cyrillic(c: char) -> bool {
+    matches!(c, '\u{0400}'..='\u{052F}')
+}
+
+/// Common German function words used as a cheap language signal — these rarely
+/// occur in English or Vietnamese text, so a handful of hits flags German
+/// without pulling in a full dictionary or a langdetect dependency.
+const GERMAN_STOPWORDS: &[&str] = &[
+    "der", "die", "das", "und", "ist", "nicht", "mit", "ein", "eine", "auch", "für", "von", "den",
+    "dem", "des", "sich", "auf", "werden", "wird", "aber", "oder", "als", "zum", "zur", "im",
+    "bei", "aus", "dass", "einer", "eines",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    fn normalizer() -> Normalizer {
+        // The Hunspell dicts are fetched at build time and absent from a bare
+        // checkout, but ru/de detection is script/stopword-based and needs none.
+        let mut config = Config::default();
+        config.data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data");
+        Normalizer::load(&config)
+    }
 
     #[test]
     fn folds_vietnamese() {
         assert_eq!(fold("Ngân hàng Đặng"), "Ngan hang Dang");
+    }
+
+    #[test]
+    fn folds_cyrillic_without_deleting_letters() {
+        // Stripping combining marks must not drop Cyrillic base letters — only
+        // the stress/accent marks (й→и, ё→е) fold away, leaving searchable text.
+        assert_eq!(fold("Москва"), "Москва");
+        assert_eq!(fold("Ёлка"), "Елка");
+    }
+
+    #[test]
+    fn folds_german_umlauts_and_eszett() {
+        assert_eq!(fold("Müller"), "Muller");
+        // ß has no combining-mark decomposition, so it survives folding intact.
+        assert_eq!(fold("Straße"), "Straße");
+    }
+
+    #[test]
+    fn detects_russian_by_script() {
+        assert_eq!(normalizer().detect_lang("Москва — столица России."), "ru");
+    }
+
+    #[test]
+    fn detects_german_by_stopwords() {
+        assert_eq!(
+            normalizer()
+                .detect_lang("Der Vertrag ist mit dem Kunden nicht unterschrieben und storniert."),
+            "de"
+        );
     }
 }

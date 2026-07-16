@@ -33,6 +33,8 @@ RUN apt-get update \
         tesseract-ocr \
         tesseract-ocr-eng \
         tesseract-ocr-vie \
+        tesseract-ocr-rus \
+        tesseract-ocr-deu \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 indexer \
     && useradd --uid 10001 --gid indexer --no-create-home --shell /usr/sbin/nologin indexer \
