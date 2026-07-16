@@ -4,7 +4,6 @@ use std::time::Duration;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use llm_indexing::service::{router, ServiceConfig};
-use rusqlite::Connection;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -88,74 +87,6 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
         .as_str()
         .unwrap()
         .contains("INDEX_ALLOWED_ROOTS"));
-}
-
-#[tokio::test]
-async fn http_fts_search_returns_hits_for_plain_sqlite() {
-    // Builds the SQLite store directly (no indexing job) so this test avoids
-    // the OCR/embedding pipeline entirely and only exercises /search/fts.
-    let temp = tempfile::tempdir().unwrap();
-    let output = temp.path().join("output");
-    fs::create_dir_all(&output).unwrap();
-    {
-        let connection = Connection::open(output.join("corpus.sqlite")).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT, dir TEXT, lang TEXT, method TEXT, size INTEGER);
-                 CREATE VIRTUAL TABLE fts USING fts5(name, path, content, tokens, tokenize=\"unicode61 remove_diacritics 2 tokenchars '_'\");
-                 INSERT INTO files(path,dir,lang,method,size) VALUES('/input/hello.txt','/input','vi','text',42);
-                 INSERT INTO fts(rowid,name,path,content,tokens) VALUES(1,'hello.txt','/input/hello.txt','Vietnamese ngan hang and English compliance.','vietnamese ngan hang english compliance');",
-            )
-            .unwrap();
-    }
-
-    let app = router(ServiceConfig {
-        output_root: output.clone(),
-        allowed_roots: vec![],
-        default_paths: vec![],
-        config_path: None,
-        ocr_langs: "vie+eng".into(),
-        workers: 1,
-        max_pending: 2,
-        max_body: 1024 * 1024,
-    })
-    .unwrap();
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/search/fts")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({"query":"compliance","output":"corpus.sqlite","limit":5}).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    let value: Value = serde_json::from_slice(&bytes).unwrap();
-    let hits = value["hits"].as_array().unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0]["path"], "/input/hello.txt");
-
-    let bad = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/search/fts")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({"query":"   ","output":"corpus.sqlite"}).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 }
 
 async fn wait_for_job(app: &axum::Router, id: &str) -> Value {

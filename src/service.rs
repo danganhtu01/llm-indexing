@@ -19,10 +19,7 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::embedding::vector_search;
-use crate::normalize::Normalizer;
 use crate::pipeline::{run_index, IndexRequest};
-use crate::store::{connect, search};
 use crate::VERSION;
 
 const MAX_HISTORY: usize = 1_000;
@@ -73,7 +70,6 @@ struct AppState {
     jobs: Arc<RwLock<HashMap<String, Value>>>,
     cancellations: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
     sender: mpsc::Sender<(String, JobRequest)>,
-    config: Arc<ServiceConfig>,
 }
 
 pub fn router(config: ServiceConfig) -> Result<Router> {
@@ -102,139 +98,15 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         jobs,
         cancellations,
         sender,
-        config: Arc::new(normalized),
     };
     Ok(Router::new()
         .route("/health", get(health))
         .route("/index", post(submit))
-        .route("/search/vector", post(search_vector))
-        .route("/search/fts", post(search_fts))
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/cancel", post(cancel_job))
         .layer(DefaultBodyLimit::max(max_body))
         .layer(TraceLayer::new_for_http())
         .with_state(state))
-}
-
-#[derive(Debug, Deserialize)]
-struct VectorSearchRequest {
-    query: String,
-    #[serde(default = "default_output")]
-    output: String,
-    #[serde(default = "default_limit")]
-    limit: usize,
-}
-
-fn default_limit() -> usize {
-    10
-}
-
-async fn search_vector(
-    State(state): State<AppState>,
-    Json(request): Json<VectorSearchRequest>,
-) -> Response {
-    if request.query.trim().is_empty()
-        || Path::new(&request.output)
-            .file_name()
-            .and_then(|name| name.to_str())
-            != Some(&request.output)
-        || !request.output.ends_with(".sqlite")
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":"query is required and output must be a plain .sqlite filename"})),
-        )
-            .into_response();
-    }
-    let service = state.config.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let config = Config::load(service.config_path.as_deref())?;
-        let database = service.output_root.join(request.output);
-        if !database.is_file() {
-            anyhow::bail!("index database does not exist")
-        }
-        vector_search(
-            &database,
-            &config,
-            request.query.trim(),
-            request.limit.clamp(1, 100),
-        )
-    })
-    .await;
-    match result {
-        Ok(Ok(hits)) => Json(json!({"hits":hits})).into_response(),
-        Ok(Err(error)) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error":format!("{error:#}")})),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":format!("semantic search worker: {error}")})),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct FtsSearchRequest {
-    query: String,
-    #[serde(default = "default_output")]
-    output: String,
-    #[serde(default = "default_limit")]
-    limit: usize,
-    #[serde(default)]
-    fuzzy: Option<bool>,
-}
-
-async fn search_fts(
-    State(state): State<AppState>,
-    Json(request): Json<FtsSearchRequest>,
-) -> Response {
-    if request.query.trim().is_empty()
-        || Path::new(&request.output)
-            .file_name()
-            .and_then(|name| name.to_str())
-            != Some(&request.output)
-        || !request.output.ends_with(".sqlite")
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":"query is required and output must be a plain .sqlite filename"})),
-        )
-            .into_response();
-    }
-    let service = state.config.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let config = Config::load(service.config_path.as_deref())?;
-        let normalizer = Normalizer::load(&config);
-        let database = service.output_root.join(request.output);
-        if !database.is_file() {
-            anyhow::bail!("index database does not exist")
-        }
-        let connection = connect(&database)?;
-        search(
-            &connection,
-            &normalizer,
-            request.query.trim(),
-            request.limit.clamp(1, 100),
-            request.fuzzy.unwrap_or(false),
-        )
-    })
-    .await;
-    match result {
-        Ok(Ok(hits)) => Json(json!({"hits":hits})).into_response(),
-        Ok(Err(error)) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error":format!("{error:#}")})),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":format!("full-text search worker: {error}")})),
-        )
-            .into_response(),
-    }
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
