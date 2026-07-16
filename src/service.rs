@@ -6,11 +6,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tempfile::Builder;
@@ -20,6 +22,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::pipeline::{run_index, IndexRequest};
+use crate::store::grouped;
 use crate::VERSION;
 
 const MAX_HISTORY: usize = 1_000;
@@ -70,6 +73,10 @@ struct AppState {
     jobs: Arc<RwLock<HashMap<String, Value>>>,
     cancellations: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
     sender: mpsc::Sender<(String, JobRequest)>,
+    output_root: PathBuf,
+    /// Allowed input roots keyed by their directory name (e.g. `/input` ->
+    /// `"input"`), the `root` query param accepted by `/corpus/tree`.
+    roots: Arc<HashMap<String, PathBuf>>,
 }
 
 pub fn router(config: ServiceConfig) -> Result<Router> {
@@ -88,6 +95,13 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
     let cancellations = Arc::new(RwLock::new(HashMap::new()));
     let (sender, receiver) = mpsc::channel(normalized.max_pending);
     let max_body = normalized.max_body;
+    let mut roots = HashMap::with_capacity(normalized.allowed_roots.len());
+    for root in &normalized.allowed_roots {
+        let name = root_name(root);
+        if roots.insert(name.clone(), root.clone()).is_some() {
+            anyhow::bail!("allowed roots must have unique directory names (duplicate: {name})")
+        }
+    }
     tokio::spawn(worker(
         receiver,
         jobs.clone(),
@@ -98,15 +112,29 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         jobs,
         cancellations,
         sender,
+        output_root: normalized.output_root.clone(),
+        roots: Arc::new(roots),
     };
     Ok(Router::new()
         .route("/health", get(health))
         .route("/index", post(submit))
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/corpus/tree", get(corpus_tree))
+        .route("/corpus/documents/{id}/text", get(corpus_document_text))
+        .route("/corpus/status", get(corpus_status_handler))
         .layer(DefaultBodyLimit::max(max_body))
         .layer(TraceLayer::new_for_http())
         .with_state(state))
+}
+
+/// The `root` query-param name for an allowed input root: its directory name
+/// (`/input` -> `"input"`), or the full path string for the rare case of a
+/// nameless root (e.g. `/`).
+fn root_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
@@ -303,12 +331,7 @@ fn run_job(
         anyhow::bail!("input path is outside INDEX_ALLOWED_ROOTS")
     }
     let include_paths = requested_paths(&paths, request.include_paths)?;
-    if Path::new(&request.output)
-        .file_name()
-        .and_then(|n| n.to_str())
-        != Some(&request.output)
-        || !request.output.ends_with(".sqlite")
-    {
+    if !valid_output_name(&request.output) {
         anyhow::bail!("output must be a plain filename ending in .sqlite")
     }
     if !matches!(request.ocr.as_str(), "auto" | "on" | "off" | "exhaustive") {
@@ -396,6 +419,296 @@ fn within(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
 }
 
+/// A published corpus database must be a plain filename (no directories, no
+/// traversal) ending in `.sqlite`, confining every job's output under
+/// `output_root`.
+fn valid_output_name(name: &str) -> bool {
+    Path::new(name).file_name().and_then(|n| n.to_str()) == Some(name) && name.ends_with(".sqlite")
+}
+
+// ── Corpus read surface (GET /corpus/tree, /corpus/documents/{id}/text, /corpus/status) ──
+//
+// READ-ONLY over whatever `corpus.sqlite` the most recent job published.
+// Consumer apps used to open the SQLite file directly; this surface lets them
+// stop decoding the schema themselves. The database is absent until the first
+// job completes — every route below degrades to an empty/zeroed result rather
+// than an error.
+
+#[derive(Debug, Deserialize)]
+struct TreeQuery {
+    root: String,
+    #[serde(default)]
+    output: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OutputQuery {
+    #[serde(default)]
+    output: Option<String>,
+}
+
+/// Resolve the `?output=` query param (default `corpus.sqlite`) to a path
+/// under `output_root`, rejecting anything that is not a confined plain
+/// filename ending in `.sqlite`. The error is small (kept out of `Response`,
+/// which `clippy::result_large_err` flags) and converts at each call site.
+fn resolve_output(
+    state: &AppState,
+    requested: Option<&str>,
+) -> Result<PathBuf, (StatusCode, Json<Value>)> {
+    let name = requested.unwrap_or("corpus.sqlite");
+    if !valid_output_name(name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"output must be a plain filename ending in .sqlite"})),
+        ));
+    }
+    Ok(state.output_root.join(name))
+}
+
+/// Open a corpus database read-only; `None` when it is absent or unreadable.
+fn open_ro(path: &Path) -> Option<Connection> {
+    if !path.exists() {
+        return None;
+    }
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
+}
+
+struct DocMeta {
+    id: i64,
+    character_count: i64,
+    method: String,
+    lang: String,
+    snippet: String,
+}
+
+/// One row per indexed file, keyed by its absolute path (`files.path`), which
+/// is exactly how the tree walk below reconstructs each entry's path — an
+/// exact join, unlike a by-name join that can collide across directories.
+fn corpus_index(path: &Path) -> HashMap<String, DocMeta> {
+    let Some(connection) = open_ro(path) else {
+        return HashMap::new();
+    };
+    let Ok(mut statement) = connection.prepare(
+        "SELECT f.path, f.id, COALESCE(f.chars,0), COALESCE(f.method,''), COALESCE(f.lang,''), \
+                COALESCE(substr(fts.content,1,400),'') \
+         FROM files f JOIN fts ON fts.rowid = f.id",
+    ) else {
+        return HashMap::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            DocMeta {
+                id: row.get(1)?,
+                character_count: row.get(2)?,
+                method: row.get(3)?,
+                lang: row.get(4)?,
+                snippet: row.get(5)?,
+            },
+        ))
+    }) else {
+        return HashMap::new();
+    };
+    rows.flatten().collect()
+}
+
+/// GET /corpus/tree?root=NAME[&output=corpus.sqlite]
+///
+/// A sorted recursive walk of one allowed input root, joined by absolute path
+/// against the published corpus database. `root` must name one of the
+/// service's configured allowed roots (its directory name); anything else is
+/// `400`. A root that doesn't (yet) exist on disk walks to an empty array,
+/// same as an absent corpus database.
+async fn corpus_tree(State(state): State<AppState>, Query(query): Query<TreeQuery>) -> Response {
+    let Some(root) = state.roots.get(&query.root).cloned() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"unknown root"})),
+        )
+            .into_response();
+    };
+    let output = match resolve_output(&state, query.output.as_deref()) {
+        Ok(path) => path,
+        Err(response) => return response.into_response(),
+    };
+    let entries = tokio::task::spawn_blocking(move || tree_entries(&root, &output))
+        .await
+        .unwrap_or_default();
+    Json(entries).into_response()
+}
+
+fn tree_entries(root: &Path, corpus_db: &Path) -> Vec<Value> {
+    let index = corpus_index(corpus_db);
+    let mut rows = Vec::new();
+    if root.is_dir() {
+        let _ = collect_tree(root, root, 0, &index, &mut rows);
+    }
+    rows
+}
+
+fn collect_tree(
+    root: &Path,
+    directory: &Path,
+    depth: usize,
+    index: &HashMap<String, DocMeta>,
+    rows: &mut Vec<Value>,
+) -> Result<()> {
+    let mut children = fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    children.sort_by(|left, right| {
+        let left_dir = left.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let right_dir = right.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        right_dir
+            .cmp(&left_dir)
+            .then_with(|| left.file_name().cmp(&right.file_name()))
+    });
+    for child in children {
+        // Mirror the indexing walker's default: symlinks are never followed,
+        // so the tree stays confined and matches what was actually indexed.
+        if child.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+            continue;
+        }
+        let path = child.path();
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        let is_dir = metadata.is_dir();
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let name = child.file_name().to_string_lossy().into_owned();
+        let document = (!is_dir)
+            .then(|| index.get(path.to_string_lossy().as_ref()))
+            .flatten();
+        let mut entry = json!({
+            "path": relative,
+            "name": name,
+            "kind": if is_dir { "dir" } else { "file" },
+            "depth": depth as i64,
+            "size_bytes": if is_dir { 0 } else { metadata.len().min(i64::MAX as u64) as i64 },
+            "modified_at": metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_secs() as i64)
+                .unwrap_or_default(),
+        });
+        if let Some(document) = document {
+            entry["document_id"] = json!(document.id);
+            entry["character_count"] = json!(document.character_count);
+            entry["method"] = json!(document.method);
+            entry["lang"] = json!(document.lang);
+            entry["snippet"] = json!(document.snippet);
+        }
+        rows.push(entry);
+        if is_dir {
+            collect_tree(root, &path, depth + 1, index, rows)?;
+        }
+    }
+    Ok(())
+}
+
+/// GET /corpus/documents/{id}/text[?output=corpus.sqlite]
+///
+/// Streams the extracted text for one document as `text/plain`. `404` when
+/// the corpus database is absent or holds no matching id.
+async fn corpus_document_text(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+    Query(query): Query<OutputQuery>,
+) -> Response {
+    let output = match resolve_output(&state, query.output.as_deref()) {
+        Ok(path) => path,
+        Err(response) => return response.into_response(),
+    };
+    let text = tokio::task::spawn_blocking(move || document_text(&output, id)).await;
+    let Ok(Some(content)) = text else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"document not found"})),
+        )
+            .into_response();
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(content))
+        .unwrap_or_else(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"response error"})),
+            )
+                .into_response()
+        })
+}
+
+fn document_text(corpus_db: &Path, id: i64) -> Option<String> {
+    let connection = open_ro(corpus_db)?;
+    connection
+        .query_row(
+            "SELECT fts.content FROM files f JOIN fts ON fts.rowid = f.id WHERE f.id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+/// GET /corpus/status[?output=corpus.sqlite]
+///
+/// Cheap corpus-wide aggregates: total indexed files/characters/bytes, OCR
+/// count, and language/method breakdowns. Zeroed when the database is absent.
+async fn corpus_status_handler(
+    State(state): State<AppState>,
+    Query(query): Query<OutputQuery>,
+) -> Response {
+    let output = match resolve_output(&state, query.output.as_deref()) {
+        Ok(path) => path,
+        Err(response) => return response.into_response(),
+    };
+    let value = tokio::task::spawn_blocking(move || corpus_status(&output))
+        .await
+        .unwrap_or_else(|_| empty_status());
+    Json(value).into_response()
+}
+
+fn corpus_status(path: &Path) -> Value {
+    let Some(connection) = open_ro(path) else {
+        return empty_status();
+    };
+    let indexed_files: i64 = connection
+        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+        .unwrap_or(0);
+    let total_characters: i64 = connection
+        .query_row("SELECT COALESCE(SUM(chars),0) FROM files", [], |r| r.get(0))
+        .unwrap_or(0);
+    let total_bytes: i64 = connection
+        .query_row("SELECT COALESCE(SUM(size),0) FROM files", [], |r| r.get(0))
+        .unwrap_or(0);
+    let ocr_files: i64 = connection
+        .query_row("SELECT COALESCE(SUM(ocr_used),0) FROM files", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
+    json!({
+        "indexed_files": indexed_files,
+        "total_characters": total_characters,
+        "total_bytes": total_bytes,
+        "ocr_files": ocr_files,
+        "languages": grouped(&connection, "lang", 10).unwrap_or_default(),
+        "methods": grouped(&connection, "method", 20).unwrap_or_default(),
+    })
+}
+
+fn empty_status() -> Value {
+    json!({
+        "indexed_files": 0, "total_characters": 0, "total_bytes": 0, "ocr_files": 0,
+        "languages": Vec::<(String, i64)>::new(), "methods": Vec::<(String, i64)>::new(),
+    })
+}
+
 fn prune_history(jobs: &mut HashMap<String, Value>) {
     if jobs.len() < MAX_HISTORY {
         return;
@@ -430,7 +743,28 @@ fn now() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::requested_paths;
+    use super::{requested_paths, root_name, valid_output_name};
+    use std::path::Path;
+
+    #[test]
+    fn root_name_uses_the_final_path_component() {
+        assert_eq!(root_name(Path::new("/input")), "input");
+        assert_eq!(root_name(Path::new("/input/downloads")), "downloads");
+    }
+
+    #[test]
+    fn root_name_falls_back_to_the_full_path_when_nameless() {
+        assert_eq!(root_name(Path::new("/")), "/");
+    }
+
+    #[test]
+    fn valid_output_name_rejects_paths_and_wrong_extension() {
+        assert!(valid_output_name("corpus.sqlite"));
+        assert!(!valid_output_name("../corpus.sqlite"));
+        assert!(!valid_output_name("sub/corpus.sqlite"));
+        assert!(!valid_output_name("corpus.db"));
+        assert!(!valid_output_name("/etc/corpus.sqlite"));
+    }
 
     #[test]
     fn requested_paths_are_exact_and_confined() {
