@@ -171,11 +171,11 @@ fn process(
     match extract(path, &record.ext, record.size, config, ocr, transcriber) {
         Ok(extracted) => {
             let empty = extracted.text.trim().is_empty();
-            let content = if empty {
+            let content = nfc(if empty {
                 format!("{} {}", record.name, record.dir)
             } else {
                 extracted.text
-            };
+            });
             let token_source = format!(
                 "{} {} {}",
                 content,
@@ -217,6 +217,19 @@ fn process(
 
 fn incomplete_method(method: &str) -> bool {
     method == "name-only" || method.starts_with("error:") || method.ends_with("-partial")
+}
+
+/// Normalize content to Unicode NFC at the storage boundary. OCR (Tesseract)
+/// emits Vietnamese diacritics as decomposed sequences (base letter + combining
+/// marks); stored and displayed content must be precomposed NFC so search and
+/// rendering behave consistently. Fast-path already-NFC text to avoid a re-alloc.
+fn nfc(text: String) -> String {
+    use unicode_normalization::{is_nfc, UnicodeNormalization};
+    if is_nfc(&text) {
+        text
+    } else {
+        text.nfc().collect()
+    }
 }
 
 fn sha1(path: &Path) -> Option<String> {
@@ -273,4 +286,22 @@ fn write_analysis(out: &Path, paths: &[PathBuf]) -> Result<()> {
     ));
     fs::write(reports.join("analysis.md"), markdown).context("writing analysis report")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nfc;
+
+    #[test]
+    fn nfc_precomposes_decomposed_vietnamese() {
+        // "tiếng Việt" typed with combining marks, as OCR would emit it.
+        let decomposed = "tie\u{0302}\u{0301}ng Vie\u{0323}\u{0302}t".to_string();
+        assert_eq!(nfc(decomposed), "tiếng Việt");
+    }
+
+    #[test]
+    fn nfc_leaves_precomposed_unchanged() {
+        let precomposed = "tiếng Việt".to_string();
+        assert_eq!(nfc(precomposed.clone()), precomposed);
+    }
 }

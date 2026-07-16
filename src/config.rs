@@ -32,6 +32,15 @@ fn default_tesseract() -> String {
 fn default_ocr_langs() -> String {
     "vie+eng".into()
 }
+fn default_ocr_dpi() -> u32 {
+    300
+}
+fn default_ocr_psm() -> String {
+    "3".into()
+}
+fn default_true() -> bool {
+    true
+}
 fn default_data_dir() -> PathBuf {
     PathBuf::from("data")
 }
@@ -95,6 +104,15 @@ pub struct Config {
     pub tesseract_cmd: String,
     #[serde(default = "default_ocr_langs")]
     pub ocr_langs: String,
+    /// Rasterization DPI for PDF page OCR — 300 is Tesseract's sweet spot.
+    #[serde(default = "default_ocr_dpi")]
+    pub ocr_dpi: u32,
+    /// Tesseract page-segmentation mode; a near-empty result retries with 6.
+    #[serde(default = "default_ocr_psm")]
+    pub ocr_psm: String,
+    /// Grayscale + deskew + contrast-stretch inputs before OCR (ImageMagick).
+    #[serde(default = "default_true")]
+    pub ocr_preprocess: bool,
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
     #[serde(default = "default_whisper_model")]
@@ -127,6 +145,9 @@ impl Default for Config {
             ocr_max_pages: default_ocr_pages(),
             tesseract_cmd: default_tesseract(),
             ocr_langs: default_ocr_langs(),
+            ocr_dpi: default_ocr_dpi(),
+            ocr_psm: default_ocr_psm(),
+            ocr_preprocess: true,
             data_dir: default_data_dir(),
             whisper_model: default_whisper_model(),
             embedding_cache: default_embedding_cache(),
@@ -172,5 +193,27 @@ impl Config {
 
     pub fn skip_ext(&self, ext: &str) -> bool {
         self.skip_exts_lower.contains(&ext.to_lowercase())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn ocr_defaults() {
+        let config = Config::default();
+        assert_eq!(config.ocr_dpi, 300);
+        assert_eq!(config.ocr_psm, "3");
+        assert!(config.ocr_preprocess);
+    }
+
+    #[test]
+    fn yaml_overrides_ocr_dpi() {
+        let config: Config = serde_yaml::from_str("ocr_dpi: 200").unwrap();
+        assert_eq!(config.ocr_dpi, 200);
+        // Unspecified OCR knobs fall back to their defaults.
+        assert_eq!(config.ocr_psm, "3");
+        assert!(config.ocr_preprocess);
     }
 }
