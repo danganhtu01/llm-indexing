@@ -1,0 +1,11 @@
+.git
+.github
+target
+index_out
+input
+output
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+data/dict
+data/tessdata
