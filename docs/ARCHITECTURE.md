@@ -18,6 +18,27 @@ paths ─► walker.walk ─► extract.extract ─► lang.detect_lang ─► n
 - **normalize** — builds the high-recall token bag (see below).
 - **store** — writes all sinks; provides `search` / `top_folders` readers.
 
+## Container service
+
+The Docker image wraps the same pipeline in a queued resident HTTP service:
+
+```text
+client -> POST :9801/index -> queue -> validate mounted paths
+       -> temporary IndexStore -> atomic rename -> /output/<corpus>.sqlite
+```
+
+Input roots are read-only mounts and requests are confined to
+`INDEX_ALLOWED_ROOTS`. Container jobs disable the CLI's JSONL, CSV, report, and
+sidecar sinks, so only the completed SQLite database is built and published.
+The socket uses the asynchronous HTTP contract in `SOCKET-PROTOCOL.md`; health
+and job polling stay responsive while the single background index worker runs.
+
+The base image installs Tesseract's Vietnamese and English packs. Additional
+packs are selected with the `TESSERACT_LANG_PACKAGES` image build argument and
+activated per job with `ocr_langs` (for example `vie+eng+rus`). The extraction
+and normalization layers remain pluggable for language-specific stemming and
+dictionary enrichment beyond OCR.
+
 ## Token enrichment (the core of recall)
 For each document `enrich(text, lang)` emits a de-duplicated bag combining:
 1. **raw words** (Unicode word runs, lowercased);

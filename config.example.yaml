@@ -13,7 +13,7 @@ ocr_max_pages: 20            # max PDF pages to OCR per file
 # Tesseract
 tesseract_cmd: "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
 tessdata_dir: ""             # blank = use ./data/tessdata then system tessdata
-ocr_langs: "vie+eng"
+ocr_langs: "vie+eng"          # add installed packs later, e.g. vie+eng+rus
 
 # Dictionaries (fetched by scripts/fetch_data.py)
 dict_dir: "data/dict"        # holds en_US.dic/.aff, vi_VN.dic/.aff, vi_words.txt

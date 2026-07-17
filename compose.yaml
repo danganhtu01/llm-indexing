@@ -1,0 +1,29 @@
+services:
+  indexer:
+    build:
+      context: .
+      args:
+        TESSERACT_LANG_PACKAGES: ${TESSERACT_LANG_PACKAGES:-tesseract-ocr-eng tesseract-ocr-vie}
+    image: llm-indexing:local
+    init: true
+    restart: unless-stopped
+    read_only: true
+    user: "${INDEX_UID:-1000}:${INDEX_GID:-1000}"
+    environment:
+      INDEX_ALLOWED_ROOTS: /input
+      INDEX_DEFAULT_PATHS: /input
+      INDEX_OUTPUT_ROOT: /output
+      INDEX_WORKERS: ${INDEX_WORKERS:-4}
+      INDEX_MAX_PENDING: ${INDEX_MAX_PENDING:-32}
+      OCR_LANGS: ${OCR_LANGS:-vie+eng}
+    ports:
+      - "${INDEX_BIND:-127.0.0.1:9801}:9801"
+    volumes:
+      - ${INDEX_INPUT:-./input}:/input:ro
+      - ${INDEX_OUTPUT:-./output}:/output
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=2g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

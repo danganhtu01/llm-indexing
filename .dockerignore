@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.sqlite
+*.sqlite-*
+index_out
+input
+output
+run
+logs
+data/tessdata

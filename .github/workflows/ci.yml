@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Test
+        run: |
+          python -m pip install -e . pytest
+          python -m pytest -q
+
+      - name: Build image
+        run: docker build -t llm-indexing:ci .
+
+      - name: Smoke image, HTTP job, and OCR languages
+        run: |
+          set -eux
+          mkdir -p .ci-input .ci-output
+          chmod 777 .ci-output
+          printf 'Báo cáo ngân hàng. English compliance report.\n' > .ci-input/sample.txt
+          docker run --rm --entrypoint id llm-indexing:ci | grep -q 'uid=10001'
+          docker run --rm --entrypoint tesseract llm-indexing:ci --list-langs > .ci-langs
+          grep -qx eng .ci-langs
+          grep -qx vie .ci-langs
+          docker run -d --name idx -p 127.0.0.1:19801:9801 \
+            -v "$PWD/.ci-input:/input:ro" -v "$PWD/.ci-output:/output" llm-indexing:ci
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:19801/health && break; sleep 0.5; done
+          job=$(curl -sf -H 'content-type: application/json' \
+            -d '{"id":"ci","paths":["/input"],"output":"corpus.sqlite","ocr":"off"}' \
+            http://127.0.0.1:19801/index)
+          echo "$job" | grep -q 'queued'
+          for i in $(seq 1 60); do
+            state=$(curl -sf http://127.0.0.1:19801/jobs/ci)
+            echo "$state" | grep -q 'complete' && break
+            echo "$state" | grep -q 'error' && exit 1
+            sleep 0.5
+          done
+          test -s .ci-output/corpus.sqlite
+          python - <<'PY'
+          import sqlite3
+          db = sqlite3.connect('.ci-output/corpus.sqlite')
+          assert db.execute('select count(*) from files').fetchone() == (1,)
+          assert db.execute("select count(*) from fts where fts match 'ngan'").fetchone() == (1,)
+          PY
+          docker rm -f idx

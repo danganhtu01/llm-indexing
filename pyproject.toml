@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-indexing"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fast bilingual (English/Vietnamese) full-text indexer for large drives, with OCR and folder analytics."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,8 @@ dependencies = [
 
 [project.scripts]
 claude-index = "claude_index.cli:main"
+claude-index-server = "claude_index.server:main"
+claude-index-request = "claude_index.client:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

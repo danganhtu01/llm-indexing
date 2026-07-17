@@ -29,11 +29,20 @@ FILES = {
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--force", action="store_true", help="re-download existing files")
+    group = ap.add_mutually_exclusive_group()
+    group.add_argument("--dictionaries-only", action="store_true",
+                       help="download Hunspell/wordlist data but not Tesseract models")
+    group.add_argument("--ocr-only", action="store_true",
+                       help="download Tesseract models but not dictionaries")
     args = ap.parse_args()
     DICT.mkdir(parents=True, exist_ok=True)
     TESS.mkdir(parents=True, exist_ok=True)
     ok = True
     for dst, url in FILES.items():
+        if args.dictionaries_only and dst.parent == TESS:
+            continue
+        if args.ocr_only and dst.parent == DICT:
+            continue
         if dst.exists() and not args.force:
             print(f"skip  {dst.name} (exists)")
             continue

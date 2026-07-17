@@ -64,6 +64,39 @@ claude-index analyze --index index_out --md report.md
 # Index ALL plugged-in drives at once (overnight; auto-resumes on crash/interruption)
 .\index-all-drives.ps1            # -> %SystemDrive%\index_out  (override: -Out 'D:\idx')
 ```
+
+## Docker socket service
+
+Like `llm-redaction`, the container accepts jobs over a resident HTTP socket and
+atomically publishes a portable SQLite FTS5 corpus. The indexer initiates no
+runtime network connections and mounts source data read-only.
+
+```bash
+mkdir -p input output
+docker compose build
+docker compose up -d
+
+# Index all mounted input directories into ./output/corpus.sqlite.
+docker compose exec indexer claude-index-request \
+  --url http://127.0.0.1:9801 --path /input --output corpus.sqlite --ocr auto
+```
+
+The request returns after `GET /jobs/{id}` reaches `complete`; use `--no-wait`
+to keep job polling in the caller. The finished database appears in `./output`.
+
+Set `INDEX_INPUT=/absolute/source` and `INDEX_OUTPUT=/absolute/output` in the
+environment or a `.env` file to mount other host directories. The default image
+ships Tesseract OCR for Vietnamese and English (`vie+eng`). To add Russian:
+
+```bash
+TESSERACT_LANG_PACKAGES="tesseract-ocr-eng tesseract-ocr-vie tesseract-ocr-rus" \
+OCR_LANGS="vie+eng+rus" docker compose build
+```
+
+The service binds `127.0.0.1:9801` by default. Other containers can call
+`http://indexer:9801` when attached to the same internal Docker network. See
+[`docs/SOCKET-PROTOCOL.md`](docs/SOCKET-PROTOCOL.md) for the asynchronous API.
+
 Sidecars default to **`mirror`** — a parallel `.txt` tree under the output dir
 that Windows Explorer can content-search (source drives stay untouched). Use
 `--sidecar inplace` to write text next to each source file, or `--sidecar none`
@@ -78,16 +111,17 @@ dictionary/abbreviation paths. See comments in that file.
 
 ## Repo layout
 ```
-src/claude_index/   walker · extract · ocr · lang · normalize · dictionaries · store · analyze · cli
+src/claude_index/   walker · extract · ocr · normalize · store · socket server/client · cli
 data/               abbreviations_*.txt (committed); dict/ + tessdata/ (fetched, gitignored)
 scripts/            install_windows.ps1 · fetch_data.py
 index-all-drives.ps1   overnight all-drives runner (path-independent; auto-resume)
-docs/ARCHITECTURE.md   pipeline + schema + extension points
-tests/test_smoke.py    end-to-end EN/VI/abbrev/top-folder check
+docs/               architecture, SQLite schema, and socket protocol
+tests/              EN/VI search smoke test + socket integration test
 ```
 
 ## Status
-v0.1 — validated on a real 80K-file drive (Thunderbird email backup) and on
+v0.2 — containerized HTTP job service; the indexing core was previously validated
+on a real 80K-file drive (Thunderbird email backup) and on
 EN+VI OCR. See `docs/ARCHITECTURE.md` for architecture and design decisions.
 
 MIT licensed.
