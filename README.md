@@ -26,6 +26,9 @@ this component.
   folder aggregation, manifests, reports and optional sidecars
 - Bounded HTTP job queue with input/output path confinement, live per-file
   counters and cooperative cancellation
+- Optional local vision analysis of photos/video (EXIF, perceptual hash,
+  quality, CLIP tags, object detection, best-effort captions), off by default
+  — see [Vision (photos & video)](#vision-photos--video)
 
 `ocr: exhaustive` removes the normal byte, character and PDF-page caps. It OCRs
 every PDF page even when a text layer exists, inspects embedded Office images,
@@ -76,6 +79,27 @@ cargo build --release --locked
 
 Copy `config.example.yaml` to override OCR, extraction, Whisper, embedding,
 worker, sidecar and skip settings.
+
+## Vision (photos & video)
+
+Local, offline computer-vision understanding of photos and video — EXIF,
+perceptual hash and quality metrics (`meta`), CLIP zero-shot tags plus object
+detection (`tags`), and a best-effort caption (`captions`) — written into a
+new `vision` table and appended to each file's searchable FTS content. No
+network access at index time; models are fetched only via an explicit,
+pinned-checksum step. Default `off` everywhere: existing databases, `method`
+values and FTS content are byte-identical until a caller opts in.
+
+```bash
+./target/release/llm-index fetch-data --vision           # one-time, pinned SHA-256
+./target/release/llm-index index ./photos --out index_out --vision tags
+./target/release/llm-index serve --vision-max tags        # allow jobs up to `tags`
+```
+
+Full tier reference, config knobs (`--vision`, `--vision-max` /
+`INDEX_VISION_MAX`, `VisionConfig`), the model/license table, consumer
+compatibility notes and performance/security details:
+[`docs/VISION.md`](docs/VISION.md).
 
 ## Output and incremental behavior
 
