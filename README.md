@@ -80,6 +80,34 @@ cargo build --release --locked
 Copy `config.example.yaml` to override OCR, extraction, Whisper, embedding,
 worker, sidecar and skip settings.
 
+## Per-job OCR / vision settings
+
+Beyond the service-wide `config.yaml` defaults, every `index` job (native CLI
+or `POST /index`) can override OCR quality (`dpi`, `psm`, `preprocess`,
+`max_pages`, `langs`) and vision quality (`detector`, `detector_conf`,
+`tagger`, `tag_threshold`, `tag_top_k`, `captioner`, `max_frames`,
+`timeout_secs`) for that job alone:
+
+```bash
+./target/release/llm-index index ./documents --out index_out \
+  --ocr-dpi 600 --ocr-psm 6 --vision-detector-conf 0.6
+```
+
+```json
+{ "paths": ["/input"], "ocr_opts": {"dpi": 600}, "vision_opts": {"detector_conf": 0.6} }
+```
+
+Both entry points, plus the YAML config's `ocr:`/`vision:` sections, resolve
+through the one merge path in `src/settings.rs`
+(`OcrSettings`/`VisionSettings::merge`, precedence per-job override > service
+config > built-in default) — there is exactly one definition of each knob.
+`GET /settings` reports the running server's bounds, installed OCR languages
+and available vision models so a caller never has to hardcode them; see
+[`docs/HTTP_API.md`](docs/HTTP_API.md#ocr_opts--vision_opts--per-job-quality-overrides)
+for the full validation table and
+[`docs/HTTP_API.md#get-settings`](docs/HTTP_API.md#get-settings) for the
+discovery response shape.
+
 ## Vision (photos & video)
 
 Local, offline computer-vision understanding of photos and video — EXIF,

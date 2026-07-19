@@ -9,7 +9,16 @@ feature is **off by default everywhere**; `ff-lc-app`, `da-academic` and any
 other existing caller see zero behavior change unless they explicitly opt in.
 
 Authoritative design contract: `docs/VISION-SPEC.md`. GPU/hardware research
-(RTX 3070 Ti stack, throughput estimates, licensing survey): `docs/VISION-RESEARCH.md`.
+(RTX 3070 Ti stack, throughput estimates, licensing survey):
+`docs/VISION-RESEARCH.md`. Per-job overrides of the vision knobs below
+(`detector`, `detector_conf`, `tagger`, `tag_threshold`, `tag_top_k`,
+`captioner`, `max_frames`, `timeout_secs`) — plus the matching OCR knobs — are
+the wave-2 settings surface: `docs/SETTINGS-SPEC.md` (design contract),
+[`docs/HTTP_API.md`](HTTP_API.md#ocr_opts--vision_opts--per-job-quality-overrides)
+(`ocr_opts`/`vision_opts` on `POST /index`, validation table, matching
+`--ocr-*`/`--vision-*` CLI flags) and
+[`docs/HTTP_API.md#get-settings`](HTTP_API.md#get-settings) (capability
+discovery: bounds, installed OCR languages, model presence).
 
 ## Status
 

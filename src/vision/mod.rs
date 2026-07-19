@@ -176,6 +176,80 @@ pub fn corrupt_models(models_dir: &Path, requested: VisionMode) -> Vec<PathBuf> 
         .collect()
 }
 
+/// Vision tiers (excluding `off`) that can actually run under `models_dir` right
+/// now: every model file the tier needs is present AND hash-verified, and any
+/// CLIP cache it relies on is staged. Reuses the submit/job pre-flight helpers
+/// ([`missing_vision_prereqs`] + [`corrupt_models`]) so the `GET /settings`
+/// capability report and the job gate never disagree. Returned ascending
+/// (`meta < tags < captions`); `meta` is pure code so it is always ready.
+pub fn available_tiers(models_dir: &Path) -> Vec<VisionMode> {
+    [VisionMode::Meta, VisionMode::Tags, VisionMode::Captions]
+        .into_iter()
+        .filter(|tier| tier_available(models_dir, *tier))
+        .collect()
+}
+
+/// Whether `tier` can run under `models_dir`: nothing it needs is missing and
+/// nothing present is corrupt (existence + pinned-hash check, per SETTINGS-SPEC
+/// §2). `off`/`meta` need no models, so they are always available.
+pub fn tier_available(models_dir: &Path, tier: VisionMode) -> bool {
+    missing_vision_prereqs(models_dir, tier).is_empty()
+        && corrupt_models(models_dir, tier).is_empty()
+}
+
+/// Whether one pinned [`VISION_MODELS`] artifact named by `relative` is present
+/// under `models_dir` and — when a SHA-256 is pinned — matches it. An unpinned
+/// artifact (the Florence stub) counts as ready on mere presence, mirroring
+/// `fetch-data`'s skip-verification-when-unpinned posture. CLIP is not a
+/// `VISION_MODELS` entry (it lives in the fastembed cache) — see
+/// [`tagger_present`].
+fn model_ready(models_dir: &Path, relative: &str) -> bool {
+    let Some(model) = VISION_MODELS
+        .iter()
+        .find(|model| model.relative == relative)
+    else {
+        return false;
+    };
+    let path = models_dir.join(model.relative);
+    if !path.is_file() {
+        return false;
+    }
+    match model.sha256 {
+        Some(expected) => sha256_file(&path)
+            .map(|actual| actual.eq_ignore_ascii_case(expected))
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
+/// Whether the object detector (`nano` → RF-DETR-Nano) is present and hash-valid
+/// under `models_dir`. Backs the `detectors[].present` flag in `GET /settings`.
+pub fn detector_present(models_dir: &Path) -> bool {
+    model_ready(models_dir, detector::RFDETR_NANO_ONNX)
+}
+
+/// Whether the zero-shot tagger (`clip`) cache is staged under `models_dir`.
+/// Backs the `taggers[].present` flag in `GET /settings`.
+pub fn tagger_present(models_dir: &Path) -> bool {
+    clip::cache_present(models_dir)
+}
+
+/// Whether the captioner (`florence2`) files are all present under `models_dir`.
+/// The Florence artifacts are unpinned in v1, so this is a pure existence check
+/// (both files) — expected `false` until the captions tier ships. Backs the
+/// `captioners[].present` flag in `GET /settings`.
+pub fn captioner_present(models_dir: &Path) -> bool {
+    let florence: Vec<&str> = VISION_MODELS
+        .iter()
+        .filter(|model| model.tier == VisionMode::Captions)
+        .map(|model| model.relative)
+        .collect();
+    !florence.is_empty()
+        && florence
+            .iter()
+            .all(|relative| model_ready(models_dir, relative))
+}
+
 /// Stream a file's lowercase-hex SHA-256 without loading it all into memory
 /// (mirrors the chunked hashing in `pipeline::sha1`).
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -319,25 +393,40 @@ impl VisionAnalyzer {
             result.mode = VisionMode::Meta;
         }
         if mode.includes(VisionMode::Tags) {
-            // Run both model-backed sub-tiers, then only advance the recorded
-            // `mode` when they actually succeeded. A missing detector model or a
-            // failed CLIP init records the error but leaves `mode` at `meta`, so
+            // Run each model-backed sub-tier, then only advance the recorded `mode`
+            // when the ones that ran actually succeeded. The detector/tagger
+            // toggles (`vision_opts.detector`/`tagger`) gate them: an `off` toggle
+            // SKIPS that sub-tier entirely (no model load, no cost) and counts as
+            // "ok" so it doesn't hold `mode` back at meta. A missing detector model
+            // or failed CLIP init records the error but leaves `mode` at `meta`, so
             // a later `--resume` retries the file (see `needs_vision_reprocess`)
             // instead of treating the whole corpus as already at the tags tier.
-            let detector_ok = run_tier(&mut result, |out| {
-                detector::fill(&image, &self.models_dir, &self.cfg, out)
-            });
-            let clip_ok = run_tier(&mut result, |out| {
-                clip::fill(&image, &self.models_dir, &self.cfg, out)
-            });
+            let detector_ok = if self.cfg.detector_enabled() {
+                run_tier(&mut result, |out| {
+                    detector::fill(&image, &self.models_dir, &self.cfg, out)
+                })
+            } else {
+                true
+            };
+            let clip_ok = if self.cfg.tagger_enabled() {
+                run_tier(&mut result, |out| {
+                    clip::fill(&image, &self.models_dir, &self.cfg, out)
+                })
+            } else {
+                true
+            };
             if detector_ok && clip_ok {
                 result.mode = VisionMode::Tags;
             }
         }
         if mode.includes(VisionMode::Captions) {
-            let caption_ok = run_tier(&mut result, |out| {
-                caption::fill(&image, &self.models_dir, &self.cfg, out)
-            });
+            let caption_ok = if self.cfg.captioner_enabled() {
+                run_tier(&mut result, |out| {
+                    caption::fill(&image, &self.models_dir, &self.cfg, out)
+                })
+            } else {
+                true
+            };
             if caption_ok {
                 result.mode = VisionMode::Captions;
             }
@@ -447,6 +536,69 @@ mod tests {
         let broken = analyzer_with(250_000_000).analyze_image(&bad, VisionMode::Tags);
         assert_eq!(broken.error.as_deref(), Some("decode-error"));
         assert_eq!(broken.mode, VisionMode::Tags);
+    }
+
+    #[test]
+    fn available_tiers_gate_on_verified_model_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Empty models dir: only the pure-code `meta` tier is available; `tags`
+        // and `captions` are gated out (detector + CLIP cache absent).
+        assert_eq!(available_tiers(dir.path()), vec![VisionMode::Meta]);
+        assert!(tier_available(dir.path(), VisionMode::Meta));
+        assert!(!tier_available(dir.path(), VisionMode::Tags));
+
+        // Planting a file with the detector's name but the wrong bytes does NOT
+        // make `tags` available — the pinned-hash check rejects it (and the CLIP
+        // cache is still absent). Existence alone is never enough.
+        std::fs::write(
+            dir.path().join(detector::RFDETR_NANO_ONNX),
+            b"not the real detector",
+        )
+        .unwrap();
+        assert!(!detector_present(dir.path()));
+        assert!(!tier_available(dir.path(), VisionMode::Tags));
+        assert_eq!(available_tiers(dir.path()), vec![VisionMode::Meta]);
+    }
+
+    #[test]
+    fn captioner_present_flips_with_its_model_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // The two (unpinned) Florence files gate the captioner flag by existence.
+        let florence: Vec<&str> = VISION_MODELS
+            .iter()
+            .filter(|model| model.tier == VisionMode::Captions)
+            .map(|model| model.relative)
+            .collect();
+        assert!(!captioner_present(dir.path()));
+        for relative in &florence {
+            std::fs::write(dir.path().join(relative), b"stub").unwrap();
+        }
+        assert!(captioner_present(dir.path()));
+        // Removing any one required model file flips the reported capability off.
+        std::fs::remove_file(dir.path().join(florence[0])).unwrap();
+        assert!(!captioner_present(dir.path()));
+    }
+
+    #[test]
+    fn disabled_sub_models_skip_execution() {
+        // detector + tagger both `off`: the tags tier then needs no model, so
+        // analyze_image over an EMPTY models dir completes without error and still
+        // records the tags tier — proving the toggles gate execution rather than
+        // being accepted-and-ignored (the pre-fix code tried to load the absent
+        // detector, errored, and downgraded the file to meta).
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.png");
+        image::RgbImage::new(4, 3).save(&good).unwrap();
+        let mut config = Config::default();
+        config.vision.detector = "off".into();
+        config.vision.tagger = "off".into();
+        config.finalize();
+        let analyzer = VisionAnalyzer::new(&config).unwrap();
+        let result = analyzer.analyze_image(&good, VisionMode::Tags);
+        assert_eq!(result.error, None, "{:?}", result.error);
+        assert_eq!(result.mode, VisionMode::Tags);
+        assert!(result.objects.is_empty());
+        assert!(result.tags.is_empty());
     }
 
     #[test]
