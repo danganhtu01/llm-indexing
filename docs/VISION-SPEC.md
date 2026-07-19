@@ -7,14 +7,24 @@ LLM APIs, no network at index time. Default OFF everywhere; existing consumers
 (ff-lc-app, da-academic, llm-search, drives-analytics) see zero behavior change
 until a caller opts in.
 
+> **AMENDMENT 2026-07-19 (post-research, supersedes any YOLO reference in this spec
+> or in worker prompts):** the object detector is **RF-DETR-Nano (Apache-2.0)**, NOT
+> Ultralytics YOLO11 — YOLO's AGPL-3.0 code+weights are a licensing hazard for this
+> FinFan-adjacent engine, and RF-DETR-Nano matches it on COCO (48.4 AP) with official
+> ONNX export and DETR-style postprocessing (no NMS needed). Evidence + sources:
+> docs/VISION-RESEARCH.md §2/§6. Worker V3: implement `src/vision/detector.rs`
+> (instead of yolo.rs); pin the official RF-DETR-Nano ONNX artifact + sha256 in
+> fetch-data; verify the label map from the model card. Runner-up if RF-DETR ONNX
+> proves unusable from ort: D-FINE-L (also Apache-2.0).
+
 Approved tiers:
 - **meta** (pure code): EXIF (camera, datetime, GPS), dimensions, 64-bit DCT
   perceptual hash (near-duplicate detection), quality metrics (blur via variance of
   Laplacian, over/under-exposure via histogram).
 - **tags** (small local CV models): CLIP image embedding + zero-shot tags against a
   curated vocabulary (via fastembed, ALREADY a dependency — it bundles ONNX Runtime
-  and supports ImageEmbedding + the paired clip text encoder), and YOLO11 object
-  detection (counts per label) via the `ort` crate.
+  and supports ImageEmbedding + the paired clip text encoder), and RF-DETR-Nano
+  object detection (counts per label) via the `ort` crate (see AMENDMENT above).
 - **captions** (opt-in, best-effort): Florence-2-base ONNX one/two-sentence caption.
 - **video**: ffmpeg (already a runtime dep) scene-change keyframes (fixed-interval
   fallback), capped at `max_frames` (default 12), per-frame tags pipeline,
@@ -95,7 +105,7 @@ camera: Apple iPhone 15 Pro, 2024-06-01T18:22, GPS 10.79,106.70
 | Purpose | Model | Runtime | Approx size |
 |---|---|---|---|
 | Image embedding + tag scoring | CLIP ViT-B/32 (image + paired text encoder) | fastembed (existing dep) | ~350 MB |
-| Object detection | YOLO11n or YOLO11s ONNX (COCO-80) | `ort` (same version tree fastembed uses — check `cargo tree`) | 10–20 MB |
+| Object detection | RF-DETR-Nano ONNX (COCO, Apache-2.0; DETR-style, no NMS) | `ort` (same version tree fastembed uses — check `cargo tree`) | ~20–40 MB |
 | Captions (opt-in) | Florence-2-base ONNX (encoder/decoder) | `ort`, greedy decode, ≤64 tokens | ~500 MB |
 
 Tag vocabulary: repo file `data/vision-tags.txt` (~300 curated labels: scene types,
@@ -117,8 +127,8 @@ in-tree (DCT for pHash is ~40 lines — implement, don't add a dep).
 - `src/store.rs:14-49` SCHEMA const (add vision DDL), add `upsert_vision` +
   prune-with-files.
 - `src/config.rs` add `VisionConfig` (tier cap for native mode, model paths under
-  `<data_dir>/vision`, thresholds: tag_score ≥0.22 top-8, yolo conf ≥0.4 iou 0.45,
-  max_frames 12, timeouts, max_pixels).
+  `<data_dir>/vision`, thresholds: tag_score ≥0.22 top-8, detector conf ≥0.5
+  (DETR-style postprocess, no NMS), max_frames 12, timeouts, max_pixels).
 - `src/service.rs:42-69` JobRequest + submit validation (`--vision-max`),
   `src/main.rs:124-144` ServeArgs / `:431-449` fetch-data extension.
 - `src/ocr.rs` untouched.
@@ -129,7 +139,7 @@ in-tree (DCT for pHash is ~40 lines — implement, don't add a dep).
 |---|---|
 | V1 plumbing | src/vision/mod.rs + types.rs (VisionMode enum, orchestrator API, per-tier trait/stubs), config.rs additions, JobRequest/serve/index/fetch-data wiring, store.rs vision DDL + upsert, pipeline.rs hooks (change detection + content append), submit pre-flight validation |
 | V2 tier-meta | src/vision/{exif.rs, phash.rs, quality.rs} + their tests |
-| V3 tier-tags | src/vision/{clip.rs, yolo.rs} + data/vision-tags.txt + their tests |
+| V3 tier-tags | src/vision/{clip.rs, detector.rs} + data/vision-tags.txt + their tests (AMENDMENT: RF-DETR-Nano, not YOLO) |
 | V4 video | src/vision/video.rs (keyframes, aggregation, transcript merge point) + tests |
 | V5 captions | src/vision/caption.rs (Florence-2 greedy; if genuinely not landable to passing-test quality, a clean `Err(unsupported)` stub + docs note — do NOT block the release on it) |
 | V6 docs | README vision section, docs/VISION.md (usage, config, models+licenses, fetch-data, perf guidance CPU vs GPU, consumer compat notes) |
