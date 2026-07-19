@@ -11,6 +11,7 @@ use llm_indexing::embedding::{vector_search, Embedder};
 use llm_indexing::normalize::Normalizer;
 use llm_indexing::pipeline::{run_index, IndexRequest};
 use llm_indexing::service::{router, JobRequest, ServiceConfig};
+use llm_indexing::settings::{tessdata_sources, OcrSettings, VisionSettings};
 use llm_indexing::store::{analyze, connect, search, top_folders};
 use llm_indexing::vision::{VisionMode, VISION_MODELS};
 use llm_indexing::VERSION;
@@ -78,6 +79,33 @@ struct IndexArgs {
     vision: Option<VisionMode>,
     #[arg(long)]
     resume: bool,
+    // Per-job OCR quality overrides (feed the SAME settings merge as the HTTP
+    // `ocr_opts`); language selection stays on the legacy `--ocr-langs` above.
+    #[arg(long)]
+    ocr_dpi: Option<u32>,
+    #[arg(long)]
+    ocr_psm: Option<String>,
+    #[arg(long)]
+    ocr_preprocess: Option<bool>,
+    #[arg(long)]
+    ocr_max_pages: Option<usize>,
+    // Per-job vision overrides (feed the SAME settings merge as `vision_opts`).
+    #[arg(long)]
+    vision_detector: Option<String>,
+    #[arg(long)]
+    vision_detector_conf: Option<f32>,
+    #[arg(long)]
+    vision_tagger: Option<String>,
+    #[arg(long)]
+    vision_tag_threshold: Option<f32>,
+    #[arg(long)]
+    vision_tag_top_k: Option<usize>,
+    #[arg(long)]
+    vision_captioner: Option<String>,
+    #[arg(long)]
+    vision_max_frames: Option<usize>,
+    #[arg(long)]
+    vision_timeout_secs: Option<u64>,
 }
 
 #[derive(Args)]
@@ -226,8 +254,18 @@ fn index(args: IndexArgs) -> Result<()> {
     if let Some(ocr) = args.ocr {
         config.ocr = ocr.as_str().into()
     }
-    if let Some(langs) = args.ocr_langs {
-        config.ocr_langs = langs
+    if let Some(langs) = &args.ocr_langs {
+        // Same installed-tessdata gate the HTTP `ocr_opts.langs` submit uses, so the
+        // CLI cannot silently OCR every page empty with an uninstalled/cross-source
+        // language selection.
+        let (bundled, system) = tessdata_sources(&config);
+        OcrSettings {
+            langs: Some(langs.clone()),
+            ..Default::default()
+        }
+        .validate_langs(&bundled, &system)
+        .map_err(|error| anyhow::anyhow!(error))?;
+        config.ocr_langs = langs.clone();
     }
     if let Some(sidecar) = args.sidecar {
         config.sidecar = sidecar
@@ -241,6 +279,34 @@ fn index(args: IndexArgs) -> Result<()> {
     if let Some(vision) = args.vision {
         config.vision.max = vision
     }
+    // Per-job OCR/vision quality knobs go through the SAME merge + validation
+    // path as the HTTP `ocr_opts`/`vision_opts`, so CLI and service stay at
+    // parity. `--ocr-langs` (legacy, above) remains the language selector.
+    let ocr_over = OcrSettings {
+        dpi: args.ocr_dpi,
+        psm: args.ocr_psm.clone(),
+        preprocess: args.ocr_preprocess,
+        max_pages: args.ocr_max_pages,
+        langs: None,
+    };
+    ocr_over
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    OcrSettings::resolve(&config, Some(&ocr_over)).apply_to(&mut config);
+    let vision_over = VisionSettings {
+        detector: args.vision_detector.clone(),
+        detector_conf: args.vision_detector_conf,
+        tagger: args.vision_tagger.clone(),
+        tag_threshold: args.vision_tag_threshold,
+        tag_top_k: args.vision_tag_top_k,
+        captioner: args.vision_captioner.clone(),
+        max_frames: args.vision_max_frames,
+        timeout_secs: args.vision_timeout_secs,
+    };
+    vision_over
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    VisionSettings::resolve(&config, Some(&vision_over)).apply_to(&mut config);
     let stats = run_index(IndexRequest {
         paths: &args.paths,
         out: &args.out,
@@ -394,6 +460,8 @@ fn request(args: RequestArgs) -> Result<()> {
         overwrite: args.overwrite,
         include_paths: None,
         vision: Some(args.vision.as_str().to_string()),
+        ocr_opts: None,
+        vision_opts: None,
     };
     let response = client
         .post(format!("{base}/index"))

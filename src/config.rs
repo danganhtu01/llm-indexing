@@ -7,6 +7,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::vision::VisionMode;
 
+/// Upper bound on indexing worker threads. The single definition of the ceiling
+/// used by [`Config::finalize`], the service per-job clamp, and the `workers.max`
+/// value `GET /settings` advertises.
+pub const MAX_WORKERS: usize = 64;
+
+/// Clamp a requested worker count into `1..=MAX_WORKERS` — the SINGLE clamp used
+/// by [`Config::finalize`], the service per-job worker resolution (`run_job`), and
+/// the `workers.default` `GET /settings` advertises, so the advertised default,
+/// the config value, and the count a job actually runs with can never disagree.
+pub fn clamp_workers(workers: usize) -> usize {
+    workers.clamp(1, MAX_WORKERS)
+}
+
 fn default_languages() -> Vec<String> {
     vec!["vi".into(), "en".into(), "ru".into(), "de".into()]
 }
@@ -90,6 +103,15 @@ fn default_skip_exts() -> Vec<String> {
 fn default_vision_models_dir() -> PathBuf {
     PathBuf::from("vision")
 }
+fn default_detector() -> String {
+    crate::settings::DETECTOR_DEFAULT.into()
+}
+fn default_tagger() -> String {
+    crate::settings::TAGGER_DEFAULT.into()
+}
+fn default_captioner() -> String {
+    crate::settings::CAPTIONER_DEFAULT.into()
+}
 fn default_tag_score() -> f32 {
     0.22
 }
@@ -132,6 +154,17 @@ pub struct VisionConfig {
     /// [`Config::vision_models_dir`]).
     #[serde(default = "default_vision_models_dir")]
     pub models_dir: PathBuf,
+    /// Object-detector selection: the v1 model id (`nano`) or `off` to skip
+    /// detection while still running the rest of the requested tier. A per-job
+    /// `vision_opts.detector` overrides it through the settings merge.
+    #[serde(default = "default_detector")]
+    pub detector: String,
+    /// Zero-shot tagger selection: `clip`, or `off` to skip tagging/embedding.
+    #[serde(default = "default_tagger")]
+    pub tagger: String,
+    /// Captioner selection: `florence2`, or `off` to skip captioning.
+    #[serde(default = "default_captioner")]
+    pub captioner: String,
     /// Minimum CLIP zero-shot tag score to keep.
     #[serde(default = "default_tag_score")]
     pub tag_score: f32,
@@ -164,6 +197,9 @@ impl Default for VisionConfig {
         Self {
             max: VisionMode::Off,
             models_dir: default_vision_models_dir(),
+            detector: default_detector(),
+            tagger: default_tagger(),
+            captioner: default_captioner(),
             tag_score: default_tag_score(),
             tag_top_k: default_tag_top_k(),
             detector_conf: default_detector_conf(),
@@ -173,6 +209,24 @@ impl Default for VisionConfig {
             max_pixels: default_max_pixels(),
             max_alloc_bytes: default_max_alloc_bytes(),
         }
+    }
+}
+
+impl VisionConfig {
+    /// Whether the object-detector sub-tier runs (`detector != "off"`). Set from
+    /// `vision_opts.detector`/config and consulted by
+    /// [`VisionAnalyzer::analyze_image`](crate::vision::VisionAnalyzer::analyze_image)
+    /// so an `off` toggle genuinely skips detection.
+    pub fn detector_enabled(&self) -> bool {
+        !self.detector.eq_ignore_ascii_case("off")
+    }
+    /// Whether the zero-shot tagger sub-tier runs (`tagger != "off"`).
+    pub fn tagger_enabled(&self) -> bool {
+        !self.tagger.eq_ignore_ascii_case("off")
+    }
+    /// Whether the captioner sub-tier runs (`captioner != "off"`).
+    pub fn captioner_enabled(&self) -> bool {
+        !self.captioner.eq_ignore_ascii_case("off")
     }
 }
 
@@ -279,7 +333,45 @@ impl Config {
     }
 
     pub fn finalize(&mut self) {
-        self.workers = self.workers.clamp(1, 64);
+        self.workers = clamp_workers(self.workers);
+        // Clamp the OCR/vision knobs to the settings-surface bounds (their single
+        // definition in `settings.rs`). Only per-job overrides are validated at
+        // submit; without this a mis-set config base would flow unvalidated into
+        // every job (e.g. `pdftoppm -r 9999`) and make GET /settings advertise a
+        // default outside its own min/max. Idempotent (finalize may run twice).
+        use crate::settings::{
+            OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE, VISION_DETECTOR_CONF_RANGE,
+            VISION_MAX_FRAMES_RANGE, VISION_TAG_THRESHOLD_RANGE, VISION_TAG_TOP_K_RANGE,
+            VISION_TIMEOUT_RANGE,
+        };
+        self.ocr_dpi = self.ocr_dpi.clamp(OCR_DPI_RANGE.0, OCR_DPI_RANGE.1);
+        self.ocr_max_pages = self
+            .ocr_max_pages
+            .clamp(OCR_MAX_PAGES_RANGE.0, OCR_MAX_PAGES_RANGE.1);
+        self.ocr_psm = match self.ocr_psm.trim().parse::<u8>() {
+            Ok(value) => value.clamp(OCR_PSM_RANGE.0, OCR_PSM_RANGE.1).to_string(),
+            Err(_) => default_ocr_psm(),
+        };
+        self.vision.detector_conf = self
+            .vision
+            .detector_conf
+            .clamp(VISION_DETECTOR_CONF_RANGE.0, VISION_DETECTOR_CONF_RANGE.1);
+        self.vision.tag_score = self
+            .vision
+            .tag_score
+            .clamp(VISION_TAG_THRESHOLD_RANGE.0, VISION_TAG_THRESHOLD_RANGE.1);
+        self.vision.tag_top_k = self
+            .vision
+            .tag_top_k
+            .clamp(VISION_TAG_TOP_K_RANGE.0, VISION_TAG_TOP_K_RANGE.1);
+        self.vision.max_frames = self
+            .vision
+            .max_frames
+            .clamp(VISION_MAX_FRAMES_RANGE.0, VISION_MAX_FRAMES_RANGE.1);
+        self.vision.timeout_secs = self
+            .vision
+            .timeout_secs
+            .clamp(VISION_TIMEOUT_RANGE.0, VISION_TIMEOUT_RANGE.1);
         self.skip_dirs_upper = self.skip_dirs.iter().map(|s| s.to_uppercase()).collect();
         self.skip_exts_lower = self.skip_exts.iter().map(|s| s.to_lowercase()).collect();
     }
@@ -330,5 +422,30 @@ mod tests {
     fn yaml_overrides_ocr_langs_multilingual() {
         let config: Config = serde_yaml::from_str("ocr_langs: vie+eng+rus+deu").unwrap();
         assert_eq!(config.ocr_langs, "vie+eng+rus+deu");
+    }
+
+    #[test]
+    fn finalize_clamps_out_of_range_config_knobs() {
+        // A mis-set config base is corrected to the settings-surface bounds so it
+        // cannot flow unvalidated into jobs or make GET /settings self-contradict.
+        let mut config: Config = serde_yaml::from_str(
+            "ocr_dpi: 9999\nocr_max_pages: 100000\nocr_psm: '99'\n\
+             vision:\n  tag_top_k: 999\n  timeout_secs: 100000\n  detector_conf: 5.0\n",
+        )
+        .unwrap();
+        config.finalize();
+        assert_eq!(config.ocr_dpi, 1200);
+        assert_eq!(config.ocr_max_pages, 500);
+        assert_eq!(config.ocr_psm, "13");
+        assert_eq!(config.vision.tag_top_k, 32);
+        assert_eq!(config.vision.timeout_secs, 1800);
+        assert!((config.vision.detector_conf - 0.95).abs() < 1e-6);
+    }
+
+    #[test]
+    fn finalize_resets_unparsable_psm_to_default() {
+        let mut config: Config = serde_yaml::from_str("ocr_psm: auto").unwrap();
+        config.finalize();
+        assert_eq!(config.ocr_psm, "3");
     }
 }

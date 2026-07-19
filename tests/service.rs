@@ -388,3 +388,115 @@ async fn submit_accepts_off_vision_without_models() {
     let (status, _) = submit_vision(&app, "v-off", "off").await;
     assert_eq!(status, StatusCode::ACCEPTED);
 }
+
+// ── Per-job settings validation (ocr_opts / vision_opts) rejected at submit ──
+//
+// Each rejects with a field-specific 400 BEFORE the job is queued, so they
+// never load the (network-fetched) embedding model.
+
+async fn submit_body(app: &axum::Router, body: Value) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/index")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn submit_rejects_out_of_range_ocr_dpi() {
+    let app = vision_router(VisionMode::Off);
+    let (status, body) = submit_body(
+        &app,
+        json!({"id":"dpi-bad","ocr":"off","ocr_opts":{"dpi":5000}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"].as_str().unwrap().contains("ocr.dpi"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn submit_rejects_uninstalled_ocr_language() {
+    // "zzz" is not a real tesseract pack, so it is absent from the bundled and
+    // system tessdata alike regardless of what the box has installed.
+    let app = vision_router(VisionMode::Off);
+    let (status, body) = submit_body(
+        &app,
+        json!({"id":"lang-bad","ocr":"off","ocr_opts":{"langs":"zzz"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("zzz"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("ocr.langs"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn submit_rejects_out_of_range_vision_setting() {
+    // vision_opts is validated even with the tier off/omitted.
+    let app = vision_router(VisionMode::Off);
+    let (status, body) = submit_body(
+        &app,
+        json!({"id":"vk-bad","ocr":"off","vision_opts":{"tag_top_k":99}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"].as_str().unwrap().contains("tag_top_k"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn settings_route_serves_the_capability_contract() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let app = router(ServiceConfig {
+        output_root: temp.path().join("output"),
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers: 7,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        // A high cap; with no models staged the endpoint still only offers `meta`.
+        vision_max: VisionMode::Tags,
+    })
+    .unwrap();
+
+    let response = get(&app, "/settings").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let settings: Value = serde_json::from_slice(&body).unwrap();
+
+    // The process advertises its real worker default/ceiling and OCR modes.
+    assert_eq!(settings["workers"]["default"], 7);
+    assert_eq!(settings["workers"]["max"], 64);
+    assert_eq!(
+        settings["ocr"]["modes"],
+        json!(["auto", "on", "off", "exhaustive"])
+    );
+    assert!(settings["ocr"]["langs_installed"].is_array());
+    // Vision: the cap is echoed, and the tags tier is gated OUT because its
+    // models were never staged — only pure-code `meta` is available.
+    assert_eq!(settings["vision"]["max_tier"], "tags");
+    assert_eq!(settings["vision"]["tiers_available"], json!(["meta"]));
+    assert_eq!(settings["vision"]["detectors"][0]["id"], "nano");
+    assert_eq!(settings["vision"]["detectors"][0]["present"], false);
+}
