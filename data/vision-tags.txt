@@ -1,0 +1,387 @@
+# Zero-shot vision tag vocabulary for the CLIP ViT-B/32 tags tier.
+#
+# One label per line. Blank lines and lines starting with '#' are ignored.
+# Each label is embedded once per process by the paired CLIP text encoder
+# (behind a "a photo of {label}" prompt template, see src/vision/clip.rs) and
+# scored against the image embedding by cosine similarity; the top-k above the
+# configured threshold are stored in vision.tags_json and the searchable
+# [vision] block. Keep labels short, concrete, and visually distinctive.
+#
+# ~300 curated labels grouped by the categories in VISION-SPEC section 3.
+
+# --- Scene types: outdoor ---
+beach
+ocean
+lake
+river
+waterfall
+mountain
+forest
+jungle
+desert
+canyon
+valley
+field
+meadow
+garden
+park
+playground
+farm
+vineyard
+orchard
+snow
+glacier
+volcano
+cave
+cliff
+island
+coast
+harbor
+countryside
+sunrise
+sunset
+night sky
+starry sky
+rainbow
+storm
+fog
+rain
+autumn leaves
+cherry blossoms
+
+# --- Scene types: urban ---
+city skyline
+street
+alley
+bridge
+tunnel
+highway
+parking lot
+construction site
+skyscraper
+building facade
+house
+apartment
+suburb
+town square
+market
+shopping mall
+storefront
+restaurant interior
+cafe
+bar
+hotel lobby
+airport
+train station
+subway platform
+bus stop
+gas station
+factory
+warehouse
+stadium
+church
+temple
+mosque
+castle
+monument
+statue
+fountain
+cemetery
+
+# --- Scene types: indoor ---
+living room
+bedroom
+kitchen
+bathroom
+dining room
+office
+classroom
+library
+hospital room
+laboratory
+gym
+theater
+concert
+museum
+art gallery
+conference room
+hallway
+staircase
+elevator
+basement
+garage
+warehouse interior
+
+# --- People and groups ---
+portrait
+selfie
+group of people
+crowd
+family photo
+wedding
+graduation
+birthday party
+baby
+child
+teenager
+elderly person
+couple
+athlete
+dancer
+musician
+speaker on stage
+person working
+person cooking
+person exercising
+person reading
+person sleeping
+hands
+face closeup
+
+# --- Animals and pets ---
+dog
+cat
+puppy
+kitten
+horse
+cow
+sheep
+goat
+pig
+chicken
+duck
+rabbit
+hamster
+bird
+parrot
+eagle
+owl
+fish
+aquarium
+turtle
+snake
+lizard
+frog
+butterfly
+bee
+spider
+elephant
+lion
+tiger
+bear
+deer
+fox
+wolf
+monkey
+zebra
+giraffe
+dolphin
+whale
+shark
+insect
+
+# --- Vehicles ---
+car
+sports car
+truck
+bus
+motorcycle
+bicycle
+scooter
+van
+taxi
+ambulance
+fire truck
+police car
+tractor
+train
+tram
+airplane
+helicopter
+boat
+sailboat
+ship
+ferry
+canoe
+submarine
+rocket
+
+# --- Food and drink ---
+breakfast
+sandwich
+burger
+pizza
+pasta
+salad
+soup
+sushi
+noodles
+rice dish
+steak
+seafood
+barbecue
+fried food
+dessert
+cake
+ice cream
+chocolate
+fruit
+vegetables
+bread
+cheese
+coffee cup
+tea
+cocktail
+wine
+beer
+smoothie
+plated meal
+street food
+
+# --- Documents and paperwork ---
+document
+printed text
+handwritten note
+letter
+contract
+form
+invoice
+receipt
+bank statement
+passport
+identity card
+drivers license
+certificate
+diploma
+resume
+report
+spreadsheet
+table of numbers
+chart
+graph
+map
+blueprint
+newspaper
+magazine
+book page
+ticket
+boarding pass
+business card
+envelope
+stamp
+signature
+notebook page
+sticky note
+ledger
+
+# --- Screens, UI and digital ---
+screenshot
+computer screen
+smartphone screen
+website
+web page
+mobile app
+login screen
+dashboard
+code editor
+terminal window
+spreadsheet software
+presentation slide
+video call
+chat conversation
+email inbox
+social media post
+error message
+settings menu
+map application
+game screenshot
+qr code
+barcode
+
+# --- Objects and everyday items ---
+whiteboard
+chalkboard
+flip chart
+poster
+sign
+billboard
+banner
+clock
+watch
+phone
+laptop
+tablet
+keyboard
+camera
+television
+speaker
+headphones
+book
+magazine stack
+pen
+pencil
+scissors
+key
+wallet
+bag
+backpack
+suitcase
+umbrella
+bottle
+cup
+plate
+bowl
+box
+package
+tool
+hammer
+screwdriver
+plant
+flower
+tree
+furniture
+chair
+table
+sofa
+bed
+lamp
+mirror
+window
+door
+painting
+sculpture
+jewelry
+clothing
+shoes
+hat
+glasses
+toy
+ball
+musical instrument
+guitar
+piano
+drum
+candle
+fireworks
+balloon
+
+# --- Media types and formats ---
+black and white photo
+vintage photo
+aerial view
+drone shot
+underwater photo
+macro photo
+panorama
+collage
+cartoon
+illustration
+diagram
+logo
+meme
+infographic
+scanned page
+photocopy
+low light photo
+blurry photo
+overexposed photo

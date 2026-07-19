@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::pipeline::{run_index, IndexRequest};
 use crate::store::grouped;
+use crate::vision::{corrupt_models, missing_vision_prereqs, VisionMode};
 use crate::VERSION;
 
 const MAX_HISTORY: usize = 1_000;
@@ -37,6 +38,9 @@ pub struct ServiceConfig {
     pub workers: usize,
     pub max_pending: usize,
     pub max_body: usize,
+    /// Highest vision tier this server will accept (`serve --vision-max`,
+    /// default `off`); requests above it are rejected at submit.
+    pub vision_max: VisionMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +63,10 @@ pub struct JobRequest {
     pub overwrite: bool,
     #[serde(default)]
     pub include_paths: Option<Vec<String>>,
+    /// Requested vision tier (`off`|`meta`|`tags`|`captions`); `None` means
+    /// `off`. Validated at submit against the server's `--vision-max` cap.
+    #[serde(default)]
+    pub vision: Option<String>,
 }
 
 fn default_output() -> String {
@@ -77,6 +85,11 @@ struct AppState {
     /// Allowed input roots keyed by their directory name (e.g. `/input` ->
     /// `"input"`), the `root` query param accepted by `/corpus/tree`.
     roots: Arc<HashMap<String, PathBuf>>,
+    /// Highest vision tier accepted at submit.
+    vision_max: VisionMode,
+    /// Config source used to resolve vision model paths for the submit
+    /// pre-flight.
+    config_path: Option<PathBuf>,
 }
 
 pub fn router(config: ServiceConfig) -> Result<Router> {
@@ -114,6 +127,8 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         sender,
         output_root: normalized.output_root.clone(),
         roots: Arc::new(roots),
+        vision_max: normalized.vision_max,
+        config_path: normalized.config_path.clone(),
     };
     Ok(Router::new()
         .route("/health", get(health))
@@ -147,7 +162,59 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"ok": true, "service": "llm-indexing", "version": VERSION, "busy": busy}))
 }
 
+/// Validate a job's requested vision tier against the server cap and, when the
+/// tier needs models, the on-disk model files. Returns the resolved tier or a
+/// small error tuple (kept out of `Response`, which `clippy::result_large_err`
+/// flags) that the caller turns into a job-level `400`.
+fn validate_vision(
+    state: &AppState,
+    requested: Option<&str>,
+) -> Result<VisionMode, (StatusCode, Json<Value>)> {
+    let mode = requested
+        .unwrap_or("off")
+        .parse::<VisionMode>()
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"status":"error","error": error})),
+            )
+        })?;
+    if mode > state.vision_max {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status":"error",
+                "error": format!(
+                    "vision tier '{}' exceeds this server's maximum '{}'",
+                    mode, state.vision_max
+                )
+            })),
+        ));
+    }
+    if mode.needs_models() {
+        let config = Config::load(state.config_path.as_deref()).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status":"error","error": format!("loading config: {error:#}")})),
+            )
+        })?;
+        if !missing_vision_prereqs(&config.vision_models_dir(), mode).is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "status":"error",
+                    "error":"vision models missing; run llm-index fetch-data --vision"
+                })),
+            ));
+        }
+    }
+    Ok(mode)
+}
+
 async fn submit(State(state): State<AppState>, Json(mut request): Json<JobRequest>) -> Response {
+    if let Err((status, body)) = validate_vision(&state, request.vision.as_deref()) {
+        return (status, body).into_response();
+    }
     let id = request
         .id
         .take()
@@ -354,6 +421,32 @@ fn run_job(
         .unwrap_or_else(|| service.ocr_langs.clone());
     config.workers = request.workers.unwrap_or(service.workers).clamp(1, 64);
     config.sidecar = "none".into();
+    // Resolve the vision tier, clamped to the server cap as defence in depth
+    // (submit already validated it against the same cap and model presence).
+    let requested_vision: VisionMode = request
+        .vision
+        .as_deref()
+        .unwrap_or("off")
+        .parse()
+        .unwrap_or(VisionMode::Off);
+    config.vision.max = requested_vision.min(service.vision_max);
+    if config.vision.max.needs_models() {
+        let models_dir = config.vision_models_dir();
+        if !missing_vision_prereqs(&models_dir, config.vision.max).is_empty() {
+            anyhow::bail!("vision models missing; run llm-index fetch-data --vision")
+        }
+        // Integrity gate — runs on this blocking worker thread (never the async
+        // submit path), so hashing the ~100 MB detector is safe. A present but
+        // corrupt/tampered pinned model fails the job as a whole, before any file
+        // is processed, rather than surfacing as per-file errors mid-run.
+        let corrupt = corrupt_models(&models_dir, config.vision.max);
+        if !corrupt.is_empty() {
+            anyhow::bail!(
+                "vision model integrity check failed (corrupt/truncated/tampered); \
+                 re-run llm-index fetch-data --vision --force: {corrupt:?}"
+            )
+        }
+    }
     let progress_id = id.to_owned();
     let stats = run_index(IndexRequest {
         paths: &paths,
@@ -377,6 +470,7 @@ fn run_job(
         "id":id,"status":"complete","database":destination,"files":stats.files,
         "ocr_files":stats.ocr_files,"errors":stats.errors,"skipped":stats.skipped,
         "incomplete":stats.incomplete,"embedded_chunks":stats.embedded_chunks,"removed":stats.removed,
+        "vision_files":stats.vision_files,"vision":config.vision.max.as_str(),
         "elapsed_seconds":stats.elapsed_seconds,"ocr_langs":config.ocr_langs,"completed_at":now()
     }))
 }
