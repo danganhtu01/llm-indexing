@@ -54,14 +54,14 @@ skip_dirs:
 # segment and never crosses a separator; a leading "?:" matches any drive
 # letter; "/" and "\" are interchangeable.
 #
-# Left COMMENTED OUT on purpose. This list is already the compiled default on a
-# Windows build, so uncommenting it unchanged buys nothing; on Linux the default
-# is empty, and enabling ten "?:"-anchored patterns there only adds a per
-# directory match that can never hit. Uncomment when you want to CHANGE the set
-# — an explicit list replaces the defaults rather than extending them.
+# Left COMMENTED OUT on purpose: the right list for the platform is already the
+# compiled default, so uncommenting either block unchanged buys nothing.
+# Uncomment only to CHANGE the set — an explicit list REPLACES the defaults
+# rather than extending them, and it replaces them on every platform, so a list
+# written for one OS silently disarms the other.
 #
-# Only the AppData segment of a user profile is excluded: Documents, Desktop and
-# the rest of C:\Users\<name> are still indexed.
+# Windows defaults. Only the AppData segment of a profile is excluded —
+# Documents, Desktop and the rest of C:\Users\<name> are still indexed.
 # skip_paths:
 #   - "?:/Windows"
 #   - "?:/Program Files"
@@ -73,6 +73,24 @@ skip_dirs:
 #   - "?:/PerfLogs"
 #   - "?:/System Volume Information"
 #   - "?:/$Recycle.Bin"
+#
+# Linux defaults. These are not just noise: /proc/kcore is a regular file
+# reporting the machine's entire address space (~128 TB apparent) and
+# /proc/<pid> regenerates as processes come and go, so indexing / without them
+# walks a tree with no fixed size and no end.
+#
+# /tmp, /var/log, /opt and /usr are deliberately NOT excluded — they hold real
+# content often enough that excluding them by default would be worse than the
+# noise. Add them here if your deployment wants them gone.
+# skip_paths:
+#   - "/proc"
+#   - "/sys"
+#   - "/dev"
+#   - "/run"
+#   - "/snap"
+#   - "/var/lib/docker"
+#   - "/var/lib/containers"
+#   - "/lost+found"
 skip_exts:                   # never open for content (still indexed by name)
   - ".sys"
   - ".dll"
