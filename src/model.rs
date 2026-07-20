@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::embedding::EmbeddedChunk;
+use crate::vision::VisionResult;
 
 #[derive(Debug, Clone)]
 pub struct FileRec {
@@ -24,6 +25,9 @@ pub struct ProcessedFile {
     pub pages: usize,
     pub sha1: Option<String>,
     pub chunks: Vec<EmbeddedChunk>,
+    /// Vision analysis for image/video files when a job opts in; `None` for the
+    /// off-path and non-vision files.
+    pub vision: Option<VisionResult>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -36,6 +40,7 @@ pub struct IndexStats {
     pub incomplete: usize,
     pub embedded_chunks: usize,
     pub removed: usize,
+    pub vision_files: usize,
     pub elapsed_seconds: f64,
 }
 

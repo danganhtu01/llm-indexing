@@ -86,6 +86,12 @@ impl TesseractOcr {
         }
     }
 
+    /// The page-segmentation mode this handle drives tesseract with. Per-job
+    /// `ocr_opts.psm` flows here through the settings merge (`settings.rs`).
+    pub fn psm(&self) -> &str {
+        &self.psm
+    }
+
     pub fn image_to_text(&self, path: &Path) -> String {
         if !self.available {
             return String::new();
