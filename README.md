@@ -26,6 +26,9 @@ this component.
   folder aggregation, manifests, reports and optional sidecars
 - Bounded HTTP job queue with input/output path confinement, live per-file
   counters and cooperative cancellation
+- Optional local vision analysis of photos/video (EXIF, perceptual hash,
+  quality, CLIP tags, object detection, best-effort captions), off by default
+  — see [Vision (photos & video)](#vision-photos--video)
 
 `ocr: exhaustive` removes the normal byte, character and PDF-page caps. It OCRs
 every PDF page even when a text layer exists, inspects embedded Office images,
@@ -76,6 +79,55 @@ cargo build --release --locked
 
 Copy `config.example.yaml` to override OCR, extraction, Whisper, embedding,
 worker, sidecar and skip settings.
+
+## Per-job OCR / vision settings
+
+Beyond the service-wide `config.yaml` defaults, every `index` job (native CLI
+or `POST /index`) can override OCR quality (`dpi`, `psm`, `preprocess`,
+`max_pages`, `langs`) and vision quality (`detector`, `detector_conf`,
+`tagger`, `tag_threshold`, `tag_top_k`, `captioner`, `max_frames`,
+`timeout_secs`) for that job alone:
+
+```bash
+./target/release/llm-index index ./documents --out index_out \
+  --ocr-dpi 600 --ocr-psm 6 --vision-detector-conf 0.6
+```
+
+```json
+{ "paths": ["/input"], "ocr_opts": {"dpi": 600}, "vision_opts": {"detector_conf": 0.6} }
+```
+
+Both entry points, plus the YAML config's `ocr:`/`vision:` sections, resolve
+through the one merge path in `src/settings.rs`
+(`OcrSettings`/`VisionSettings::merge`, precedence per-job override > service
+config > built-in default) — there is exactly one definition of each knob.
+`GET /settings` reports the running server's bounds, installed OCR languages
+and available vision models so a caller never has to hardcode them; see
+[`docs/HTTP_API.md`](docs/HTTP_API.md#ocr_opts--vision_opts--per-job-quality-overrides)
+for the full validation table and
+[`docs/HTTP_API.md#get-settings`](docs/HTTP_API.md#get-settings) for the
+discovery response shape.
+
+## Vision (photos & video)
+
+Local, offline computer-vision understanding of photos and video — EXIF,
+perceptual hash and quality metrics (`meta`), CLIP zero-shot tags plus object
+detection (`tags`), and a best-effort caption (`captions`) — written into a
+new `vision` table and appended to each file's searchable FTS content. No
+network access at index time; models are fetched only via an explicit,
+pinned-checksum step. Default `off` everywhere: existing databases, `method`
+values and FTS content are byte-identical until a caller opts in.
+
+```bash
+./target/release/llm-index fetch-data --vision           # one-time, pinned SHA-256
+./target/release/llm-index index ./photos --out index_out --vision tags
+./target/release/llm-index serve --vision-max tags        # allow jobs up to `tags`
+```
+
+Full tier reference, config knobs (`--vision`, `--vision-max` /
+`INDEX_VISION_MAX`, `VisionConfig`), the model/license table, consumer
+compatibility notes and performance/security details:
+[`docs/VISION.md`](docs/VISION.md).
 
 ## Output and incremental behavior
 

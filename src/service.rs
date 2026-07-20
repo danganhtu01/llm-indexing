@@ -20,12 +20,24 @@ use tokio::sync::{mpsc, RwLock};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use crate::config::Config;
+use crate::config::{clamp_workers, Config, MAX_WORKERS};
 use crate::pipeline::{run_index, IndexRequest};
+use crate::settings::{
+    installed_tessdata_langs, tessdata_sources, OcrSettings, VisionSettings, CAPTIONERS, DETECTORS,
+    OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE, TAGGERS,
+};
 use crate::store::grouped;
+use crate::vision::{
+    available_tiers, captioner_present, corrupt_models, detector_present, missing_vision_prereqs,
+    tagger_present, VisionMode,
+};
 use crate::VERSION;
 
 const MAX_HISTORY: usize = 1_000;
+
+/// Accepted `ocr` modes — the single definition backing both the submit-time
+/// validation and the list `GET /settings` advertises.
+const OCR_MODES: &[&str] = &["auto", "on", "off", "exhaustive"];
 
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
@@ -37,6 +49,9 @@ pub struct ServiceConfig {
     pub workers: usize,
     pub max_pending: usize,
     pub max_body: usize,
+    /// Highest vision tier this server will accept (`serve --vision-max`,
+    /// default `off`); requests above it are rejected at submit.
+    pub vision_max: VisionMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +74,19 @@ pub struct JobRequest {
     pub overwrite: bool,
     #[serde(default)]
     pub include_paths: Option<Vec<String>>,
+    /// Requested vision tier (`off`|`meta`|`tags`|`captions`); `None` means
+    /// `off`. Validated at submit against the server's `--vision-max` cap.
+    #[serde(default)]
+    pub vision: Option<String>,
+    /// Per-job OCR quality overrides (dpi/psm/preprocess/max_pages/langs),
+    /// merged over the service config via the single settings path. Validated at
+    /// submit → `400` naming the field. Absent ⇒ exactly today's behavior.
+    #[serde(default)]
+    pub ocr_opts: Option<OcrSettings>,
+    /// Per-job vision overrides (detector/tagger/captioner + numeric knobs),
+    /// active only when the requested tier != off and capped by `--vision-max`.
+    #[serde(default)]
+    pub vision_opts: Option<VisionSettings>,
 }
 
 fn default_output() -> String {
@@ -77,6 +105,14 @@ struct AppState {
     /// Allowed input roots keyed by their directory name (e.g. `/input` ->
     /// `"input"`), the `root` query param accepted by `/corpus/tree`.
     roots: Arc<HashMap<String, PathBuf>>,
+    /// Highest vision tier accepted at submit.
+    vision_max: VisionMode,
+    /// Config source used to resolve vision model paths for the submit
+    /// pre-flight.
+    config_path: Option<PathBuf>,
+    /// Default worker count this serve process runs jobs with; advertised by
+    /// `GET /settings` as `workers.default`.
+    workers: usize,
 }
 
 pub fn router(config: ServiceConfig) -> Result<Router> {
@@ -114,9 +150,13 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         sender,
         output_root: normalized.output_root.clone(),
         roots: Arc::new(roots),
+        vision_max: normalized.vision_max,
+        config_path: normalized.config_path.clone(),
+        workers: normalized.workers,
     };
     Ok(Router::new()
         .route("/health", get(health))
+        .route("/settings", get(settings))
         .route("/index", post(submit))
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/cancel", post(cancel_job))
@@ -147,7 +187,251 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"ok": true, "service": "llm-indexing", "version": VERSION, "busy": busy}))
 }
 
+/// GET /settings — read-only capability discovery (SETTINGS-SPEC §2).
+///
+/// The contract the consumer apps (ff-lc-app / da-academic / drives-analytics)
+/// render their OCR/vision settings UIs from, so no client hardcodes ranges,
+/// installed languages, or which vision tiers this process can actually run.
+/// Purely additive; touches no job state.
+///
+/// The probe reads the config file, enumerates the tessdata dir, execs
+/// `tesseract --list-langs`, and hash-verifies the (up to ~100 MB) vision model
+/// files — all blocking — so it runs on a blocking worker, never the async
+/// executor.
+async fn settings(State(state): State<AppState>) -> Response {
+    let config_path = state.config_path.clone();
+    let vision_max = state.vision_max;
+    let workers = state.workers;
+    match tokio::task::spawn_blocking(move || {
+        build_settings(config_path.as_deref(), vision_max, workers)
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => {
+            // Log the full chain server-side but keep the client body generic — the
+            // anyhow context embeds the absolute server-side config path.
+            tracing::error!(error = %format!("{error:#}"), "building /settings response failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status":"error","error":"loading settings"})),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status":"error","error":"settings probe failed"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Build the `GET /settings` body. Ranges come from the single `settings.rs`
+/// bound consts and defaults from the loaded [`Config`] (the same fields the W1
+/// `OcrSettings`/`VisionSettings` bases read), so nothing here re-defines a knob.
+fn build_settings(
+    config_path: Option<&Path>,
+    vision_max: VisionMode,
+    workers: usize,
+) -> Result<Value> {
+    let config = Config::load(config_path)?;
+    let models_dir = config.vision_models_dir();
+    let langs_installed: Vec<String> = installed_tessdata_langs(&config).into_iter().collect();
+    let psm_values: Vec<String> = (OCR_PSM_RANGE.0..=OCR_PSM_RANGE.1)
+        .map(|value| value.to_string())
+        .collect();
+    // Only tiers within this process's `--vision-max` cap AND with their models
+    // present/verified are offered.
+    let tiers_available: Vec<&str> = available_tiers(&models_dir)
+        .into_iter()
+        .filter(|tier| *tier <= vision_max)
+        .map(|tier| tier.as_str())
+        .collect();
+    Ok(json!({
+        "version": VERSION,
+        "ocr": {
+            "modes": OCR_MODES,
+            "langs_installed": langs_installed,
+            "dpi": {"min": OCR_DPI_RANGE.0, "max": OCR_DPI_RANGE.1, "default": config.ocr_dpi},
+            "psm": {"values": psm_values, "default": config.ocr_psm},
+            "preprocess_default": config.ocr_preprocess,
+            "max_pages": {
+                "min": OCR_MAX_PAGES_RANGE.0, "max": OCR_MAX_PAGES_RANGE.1,
+                "default": config.ocr_max_pages
+            },
+        },
+        "vision": {
+            "max_tier": vision_max.as_str(),
+            "tiers_available": tiers_available,
+            "detectors": sub_models(DETECTORS, detector_present(&models_dir)),
+            "taggers": sub_models(TAGGERS, tagger_present(&models_dir)),
+            "captioners": sub_models(CAPTIONERS, captioner_present(&models_dir)),
+            "defaults": {
+                "detector_conf": config.vision.detector_conf,
+                "tag_threshold": config.vision.tag_score,
+                "tag_top_k": config.vision.tag_top_k,
+                "max_frames": config.vision.max_frames,
+                "timeout_secs": config.vision.timeout_secs,
+            },
+        },
+        // Route the advertised default through the SAME clamp `run_job` applies, so
+        // /settings never reports a default outside its own `max` (or below 1).
+        "workers": {"default": clamp_workers(workers), "max": MAX_WORKERS},
+    }))
+}
+
+/// One `{"id","present"}` entry per selectable sub-model id (the accepted enum
+/// values from `settings.rs` minus the `off` toggle), tagged with whether its
+/// backing model files are staged. In v1 each category has a single model, so
+/// they share one `present` flag.
+fn sub_models(ids: &[&str], present: bool) -> Vec<Value> {
+    ids.iter()
+        .filter(|id| **id != "off")
+        .map(|id| json!({"id": id, "present": present}))
+        .collect()
+}
+
+/// Validate a job's requested vision tier against the server cap and, when the
+/// tier needs models, the on-disk model files. Returns the resolved tier or a
+/// small error tuple (kept out of `Response`, which `clippy::result_large_err`
+/// flags) that the caller turns into a job-level `400`.
+fn validate_vision(
+    state: &AppState,
+    requested: Option<&str>,
+) -> Result<VisionMode, (StatusCode, Json<Value>)> {
+    let mode = requested
+        .unwrap_or("off")
+        .parse::<VisionMode>()
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"status":"error","error": error})),
+            )
+        })?;
+    if mode > state.vision_max {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status":"error",
+                "error": format!(
+                    "vision tier '{}' exceeds this server's maximum '{}'",
+                    mode, state.vision_max
+                )
+            })),
+        ));
+    }
+    if mode.needs_models() {
+        let config = Config::load(state.config_path.as_deref()).map_err(|_error| {
+            // Generic body — the anyhow context embeds the server-side config path.
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status":"error","error":"loading service configuration"})),
+            )
+        })?;
+        if !missing_vision_prereqs(&config.vision_models_dir(), mode).is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "status":"error",
+                    "error":"vision models missing; run llm-index fetch-data --vision"
+                })),
+            ));
+        }
+    }
+    Ok(mode)
+}
+
+/// Cheap (no-I/O) per-field range/enum validation of a job's OCR/vision
+/// overrides, using the same merge structs the pipeline later applies. Returns a
+/// field-specific `400` (small tuple kept out of `Response`, which
+/// `clippy::result_large_err` flags). The OCR language check is deliberately
+/// NOT here: it reads the config file and execs `tesseract --list-langs`, so
+/// submit runs it via [`validate_request_langs`] on a blocking worker rather than
+/// blocking the async executor.
+fn validate_job_fields(request: &JobRequest) -> Result<(), (StatusCode, Json<Value>)> {
+    if let Some(ocr) = &request.ocr_opts {
+        ocr.validate().map_err(bad_field)?;
+    }
+    if let Some(vision) = &request.vision_opts {
+        vision.validate().map_err(bad_field)?;
+    }
+    Ok(())
+}
+
+/// The per-request OCR language selection actually in effect: `ocr_opts.langs`
+/// wins over the legacy top-level `ocr_langs`, matching `run_job`'s precedence.
+/// `None` ⇒ the client supplied no language, so the (trusted) service default is
+/// used and there is nothing per-request to validate. Guarding on this closes the
+/// bypass where the legacy `ocr_langs` alias reached tesseract unvalidated while
+/// `ocr_opts.langs` was gated.
+fn effective_request_langs(request: &JobRequest) -> Option<String> {
+    request
+        .ocr_opts
+        .as_ref()
+        .and_then(|ocr| ocr.langs.clone())
+        .or_else(|| request.ocr_langs.clone())
+}
+
+/// Blocking: validate `langs` against the installed tessdata using the same
+/// source-aware resolution `TesseractOcr` uses. Reads the config file and execs
+/// `tesseract --list-langs`, so callers run it via `spawn_blocking`. On rejection
+/// returns the HTTP status + message; a config-load failure is reported
+/// generically, never echoing the server-side config path.
+fn validate_request_langs(
+    config_path: Option<PathBuf>,
+    langs: String,
+) -> Result<(), (StatusCode, String)> {
+    let config = Config::load(config_path.as_deref()).map_err(|_error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "loading service configuration".to_string(),
+        )
+    })?;
+    let (bundled, system) = tessdata_sources(&config);
+    OcrSettings {
+        langs: Some(langs),
+        ..Default::default()
+    }
+    .validate_langs(&bundled, &system)
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+/// A field-specific submit rejection, matching the `{"status":"error","error"}`
+/// shape the other submit validations use.
+fn bad_field(message: String) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"status":"error","error": message})),
+    )
+}
+
 async fn submit(State(state): State<AppState>, Json(mut request): Json<JobRequest>) -> Response {
+    if let Err((status, body)) = validate_vision(&state, request.vision.as_deref()) {
+        return (status, body).into_response();
+    }
+    if let Err((status, body)) = validate_job_fields(&request) {
+        return (status, body).into_response();
+    }
+    // OCR language validation reads the config file and execs `tesseract
+    // --list-langs`; run it on a blocking worker so a slow/stalled tesseract never
+    // pins the async executor thread (the identical /settings probe does the same).
+    if let Some(langs) = effective_request_langs(&request) {
+        let config_path = state.config_path.clone();
+        match tokio::task::spawn_blocking(move || validate_request_langs(config_path, langs)).await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err((status, message))) => {
+                return (status, Json(json!({"status":"error","error": message}))).into_response();
+            }
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"status":"error","error":"settings validation failed"})),
+                )
+                    .into_response();
+            }
+        }
+    }
     let id = request
         .id
         .take()
@@ -334,7 +618,7 @@ fn run_job(
     if !valid_output_name(&request.output) {
         anyhow::bail!("output must be a plain filename ending in .sqlite")
     }
-    if !matches!(request.ocr.as_str(), "auto" | "on" | "off" | "exhaustive") {
+    if !OCR_MODES.contains(&request.ocr.as_str()) {
         anyhow::bail!("ocr must be auto, on, off, or exhaustive")
     }
     let destination = service.output_root.join(&request.output);
@@ -352,8 +636,43 @@ fn run_job(
     config.ocr_langs = request
         .ocr_langs
         .unwrap_or_else(|| service.ocr_langs.clone());
-    config.workers = request.workers.unwrap_or(service.workers).clamp(1, 64);
+    config.workers = clamp_workers(request.workers.unwrap_or(service.workers));
     config.sidecar = "none".into();
+    // Per-job OCR quality knobs merged over the (built-in ⊕ YAML ⊕ legacy-langs)
+    // base through the single settings path; submit already validated them. When
+    // `ocr_opts` is absent this reproduces the config verbatim (off-path
+    // unchanged). An `ocr_opts.langs` here wins over the legacy top-level
+    // `ocr_langs` set just above (it is the merge base).
+    OcrSettings::resolve(&config, request.ocr_opts.as_ref()).apply_to(&mut config);
+    // Resolve the vision tier, clamped to the server cap as defence in depth
+    // (submit already validated it against the same cap and model presence).
+    let requested_vision: VisionMode = request
+        .vision
+        .as_deref()
+        .unwrap_or("off")
+        .parse()
+        .unwrap_or(VisionMode::Off);
+    config.vision.max = requested_vision.min(service.vision_max);
+    // Per-job vision knobs (detector_conf/tag_threshold/tag_top_k/max_frames/
+    // timeout_secs) merged over the config base; inert when the tier is off.
+    VisionSettings::resolve(&config, request.vision_opts.as_ref()).apply_to(&mut config);
+    if config.vision.max.needs_models() {
+        let models_dir = config.vision_models_dir();
+        if !missing_vision_prereqs(&models_dir, config.vision.max).is_empty() {
+            anyhow::bail!("vision models missing; run llm-index fetch-data --vision")
+        }
+        // Integrity gate — runs on this blocking worker thread (never the async
+        // submit path), so hashing the ~100 MB detector is safe. A present but
+        // corrupt/tampered pinned model fails the job as a whole, before any file
+        // is processed, rather than surfacing as per-file errors mid-run.
+        let corrupt = corrupt_models(&models_dir, config.vision.max);
+        if !corrupt.is_empty() {
+            anyhow::bail!(
+                "vision model integrity check failed (corrupt/truncated/tampered); \
+                 re-run llm-index fetch-data --vision --force: {corrupt:?}"
+            )
+        }
+    }
     let progress_id = id.to_owned();
     let stats = run_index(IndexRequest {
         paths: &paths,
@@ -377,6 +696,7 @@ fn run_job(
         "id":id,"status":"complete","database":destination,"files":stats.files,
         "ocr_files":stats.ocr_files,"errors":stats.errors,"skipped":stats.skipped,
         "incomplete":stats.incomplete,"embedded_chunks":stats.embedded_chunks,"removed":stats.removed,
+        "vision_files":stats.vision_files,"vision":config.vision.max.as_str(),
         "elapsed_seconds":stats.elapsed_seconds,"ocr_langs":config.ocr_langs,"completed_at":now()
     }))
 }
@@ -743,8 +1063,138 @@ fn now() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{requested_paths, root_name, valid_output_name};
+    use super::{build_settings, requested_paths, root_name, valid_output_name};
+    use crate::config::{Config, MAX_WORKERS};
+    use crate::settings::{
+        OcrSettings, VisionSettings, OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE,
+    };
+    use crate::vision::VisionMode;
     use std::path::Path;
+
+    /// Write a config file whose `data_dir` resolves to `dir`, so `build_settings`
+    /// enumerates the fixture tessdata/vision trees created under it.
+    fn config_pointing_at(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "data_dir: .\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn settings_reports_the_spec_shape() {
+        let value = build_settings(None, VisionMode::Off, 4).unwrap();
+        // Top-level blocks.
+        assert_eq!(value["version"], crate::VERSION);
+        assert_eq!(value["workers"]["default"], 4);
+        assert_eq!(value["workers"]["max"], MAX_WORKERS);
+        // OCR block: modes list + range triples + defaults are all present.
+        assert_eq!(
+            value["ocr"]["modes"],
+            serde_json::json!(["auto", "on", "off", "exhaustive"])
+        );
+        assert!(value["ocr"]["langs_installed"].is_array());
+        assert!(value["ocr"]["dpi"]["min"].is_number());
+        assert_eq!(value["ocr"]["psm"]["values"].as_array().unwrap().len(), 14);
+        assert!(value["ocr"]["preprocess_default"].is_boolean());
+        // Vision block: cap, gated tiers, per-sub-model present flags, defaults.
+        assert_eq!(value["vision"]["max_tier"], "off");
+        assert!(value["vision"]["tiers_available"].is_array());
+        for category in ["detectors", "taggers", "captioners"] {
+            let list = value["vision"][category].as_array().unwrap();
+            assert_eq!(list.len(), 1, "{category}");
+            assert!(list[0]["id"].is_string());
+            assert!(list[0]["present"].is_boolean());
+        }
+        assert!(value["vision"]["defaults"]["detector_conf"].is_number());
+    }
+
+    #[test]
+    fn settings_enumerates_the_fixture_tessdata_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let tessdata = temp.path().join("tessdata");
+        std::fs::create_dir_all(&tessdata).unwrap();
+        for name in ["eng.traineddata", "vie.traineddata", "readme.txt"] {
+            std::fs::write(tessdata.join(name), b"x").unwrap();
+        }
+        let config = config_pointing_at(temp.path());
+
+        let value = build_settings(Some(&config), VisionMode::Off, 4).unwrap();
+        let langs: Vec<String> = value["ocr"]["langs_installed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect();
+        // The bundled fixture stems appear; the non-traineddata file does not.
+        // (System `tesseract --list-langs` packs may add more — assert a subset.)
+        assert!(langs.contains(&"eng".to_string()), "{langs:?}");
+        assert!(langs.contains(&"vie".to_string()), "{langs:?}");
+        assert!(!langs.contains(&"readme".to_string()), "{langs:?}");
+    }
+
+    #[test]
+    fn tiers_available_gate_on_models_and_respect_the_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_pointing_at(temp.path());
+
+        // A high cap but no staged vision models: only the pure-code `meta` tier
+        // is offered; `tags`/`captions` are gated out and every sub-model reads
+        // not-present.
+        let value = build_settings(Some(&config), VisionMode::Captions, 4).unwrap();
+        assert_eq!(value["vision"]["max_tier"], "captions");
+        assert_eq!(
+            value["vision"]["tiers_available"],
+            serde_json::json!(["meta"])
+        );
+        assert_eq!(value["vision"]["detectors"][0]["present"], false);
+        assert_eq!(value["vision"]["captioners"][0]["present"], false);
+
+        // Planting a wrongly-hashed detector must NOT flip `tags` on — the
+        // pinned-hash gate rejects it, so the offered tiers are unchanged.
+        let vision_dir = temp.path().join("vision");
+        std::fs::create_dir_all(&vision_dir).unwrap();
+        std::fs::write(vision_dir.join("rf-detr-nano.onnx"), b"bogus").unwrap();
+        let value = build_settings(Some(&config), VisionMode::Captions, 4).unwrap();
+        assert_eq!(
+            value["vision"]["tiers_available"],
+            serde_json::json!(["meta"])
+        );
+        assert_eq!(value["vision"]["detectors"][0]["present"], false);
+
+        // The cap itself gates the list: at `off` nothing is offered.
+        let capped = build_settings(Some(&config), VisionMode::Off, 4).unwrap();
+        assert_eq!(capped["vision"]["tiers_available"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn settings_defaults_and_ranges_mirror_the_w1_source() {
+        // Ranges come from the single settings.rs bound consts; defaults from the
+        // same Config fields the W1 OcrSettings/VisionSettings bases read — no
+        // knob is redefined in the /settings builder.
+        let value = build_settings(None, VisionMode::Off, 4).unwrap();
+        let config = Config::default();
+        let ocr = OcrSettings::from_config(&config);
+        let vision = VisionSettings::from_config(&config);
+
+        assert_eq!(value["ocr"]["dpi"]["min"], OCR_DPI_RANGE.0);
+        assert_eq!(value["ocr"]["dpi"]["max"], OCR_DPI_RANGE.1);
+        assert_eq!(value["ocr"]["dpi"]["default"], ocr.dpi.unwrap());
+        assert_eq!(value["ocr"]["psm"]["default"], ocr.psm.clone().unwrap());
+        assert_eq!(
+            value["ocr"]["psm"]["values"].as_array().unwrap().len(),
+            (OCR_PSM_RANGE.1 - OCR_PSM_RANGE.0 + 1) as usize
+        );
+        assert_eq!(value["ocr"]["preprocess_default"], ocr.preprocess.unwrap());
+        assert_eq!(value["ocr"]["max_pages"]["min"], OCR_MAX_PAGES_RANGE.0);
+        assert_eq!(value["ocr"]["max_pages"]["max"], OCR_MAX_PAGES_RANGE.1);
+        assert_eq!(value["ocr"]["max_pages"]["default"], ocr.max_pages.unwrap());
+
+        let defaults = &value["vision"]["defaults"];
+        assert_eq!(defaults["detector_conf"], vision.detector_conf.unwrap());
+        assert_eq!(defaults["tag_threshold"], vision.tag_threshold.unwrap());
+        assert_eq!(defaults["tag_top_k"], vision.tag_top_k.unwrap());
+        assert_eq!(defaults["max_frames"], vision.max_frames.unwrap());
+        assert_eq!(defaults["timeout_secs"], vision.timeout_secs.unwrap());
+    }
 
     #[test]
     fn root_name_uses_the_final_path_component() {

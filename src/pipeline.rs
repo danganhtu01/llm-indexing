@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,9 @@ use crate::model::{FileRec, IndexStats, ProcessedFile};
 use crate::normalize::Normalizer;
 use crate::ocr::TesseractOcr;
 use crate::store::{analyze, connect, IndexStore};
+use crate::vision::{
+    is_video_ext, is_vision_ext, needs_vision_reprocess, VisionAnalyzer, VisionMode, VisionResult,
+};
 use crate::walker::walk;
 
 pub struct IndexRequest<'a> {
@@ -37,6 +40,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     let normalizer = Arc::new(Normalizer::load(&request.config));
     let ocr = Arc::new(TesseractOcr::new(&request.config));
     let transcriber = Arc::new(Transcriber::new(&request.config));
+    let vision = Arc::new(VisionAnalyzer::new(&request.config)?);
     let mut embedder = Embedder::new(&request.config)?;
     let mut store = IndexStore::open(
         request.out,
@@ -48,6 +52,11 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         store.existing_keys()?
     } else {
         Default::default()
+    };
+    let vision_modes = if request.resume && request.config.vision.max != VisionMode::Off {
+        store.existing_vision_modes()?
+    } else {
+        HashMap::new()
     };
     let mut records = walk(request.paths, &request.config);
     let current = records
@@ -75,6 +84,13 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
                         || (request.config.ocr == "exhaustive"
                             && record.ext == ".pdf"
                             && !method.starts_with("pdf-exhaustive"))
+                        || needs_vision_reprocess(
+                            request.config.vision.max,
+                            vision_modes
+                                .get(&record.path)
+                                .and_then(|mode| mode.parse().ok()),
+                            &record.ext,
+                        )
                 })
                 .unwrap_or(true)
         });
@@ -112,7 +128,14 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
                 {
                     return None;
                 }
-                let file = process(record.clone(), &config, &normalizer, &ocr, &transcriber);
+                let file = process(
+                    record.clone(),
+                    &config,
+                    &normalizer,
+                    &ocr,
+                    &transcriber,
+                    &vision,
+                );
                 let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 if let Some(progress) = &progress {
                     progress(count, total);
@@ -150,6 +173,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         stats.errors += usize::from(file.method.starts_with("error:"));
         stats.incomplete += usize::from(incomplete_method(&file.method));
         stats.embedded_chunks += file.chunks.len();
+        stats.vision_files += usize::from(file.vision.is_some());
         store.add(&file, now())?;
     }
     store.finish()?;
@@ -166,16 +190,24 @@ fn process(
     normalizer: &Normalizer,
     ocr: &TesseractOcr,
     transcriber: &Transcriber,
+    analyzer: &VisionAnalyzer,
 ) -> ProcessedFile {
     let path = Path::new(&record.path);
     match extract(path, &record.ext, record.size, config, ocr, transcriber) {
         Ok(extracted) => {
             let empty = extracted.text.trim().is_empty();
-            let content = nfc(if empty {
+            let mut content = nfc(if empty {
                 format!("{} {}", record.name, record.dir)
             } else {
                 extracted.text
             });
+            // Vision composes WITH the extracted (OCR) text: append the
+            // searchable `[vision]` block, leaving `method` untouched so
+            // consumers keying on it are unaffected.
+            let vision = run_vision(analyzer, path, &record.ext, config.vision.max);
+            if let Some(block) = vision.as_ref().and_then(VisionResult::content_block) {
+                content = nfc(format!("{content}\n{block}"));
+            }
             let token_source = format!(
                 "{} {} {}",
                 content,
@@ -199,6 +231,7 @@ fn process(
                 pages: extracted.pages,
                 sha1: hash,
                 chunks: Vec::new(),
+                vision,
             }
         }
         Err(error) => ProcessedFile {
@@ -210,9 +243,30 @@ fn process(
             pages: 0,
             sha1: None,
             chunks: Vec::new(),
+            vision: None,
             rec: record,
         },
     }
+}
+
+/// Run vision analysis for an eligible file, returning a result only when a tier
+/// actually ran (or recorded a decode error). Non-vision extensions and the
+/// off-path return `None`, so nothing is attached and the off-path is inert.
+fn run_vision(
+    analyzer: &VisionAnalyzer,
+    path: &Path,
+    ext: &str,
+    mode: VisionMode,
+) -> Option<VisionResult> {
+    if mode == VisionMode::Off || !is_vision_ext(ext) {
+        return None;
+    }
+    let result = if is_video_ext(ext) {
+        analyzer.analyze_video(path, mode)
+    } else {
+        analyzer.analyze_image(path, mode)
+    };
+    (result.mode != VisionMode::Off || result.error.is_some()).then_some(result)
 }
 
 fn incomplete_method(method: &str) -> bool {

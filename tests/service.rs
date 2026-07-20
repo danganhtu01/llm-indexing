@@ -4,6 +4,7 @@ use std::time::Duration;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use llm_indexing::service::{router, ServiceConfig};
+use llm_indexing::vision::VisionMode;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -27,6 +28,7 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
         workers: 1,
         max_pending: 2,
         max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
     })
     .unwrap();
 
@@ -90,7 +92,12 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
 }
 
 async fn wait_for_job(app: &axum::Router, id: &str) -> Value {
-    for _ in 0..100 {
+    // Budget generously: a real `/index` job loads the e5 embedding model
+    // (several seconds of CPU init on a cold cache) before it can complete, so
+    // a tight poll window flakes as "job did not finish" on slower boxes even
+    // though the job succeeds. 30s stays bounded enough to catch a truly hung
+    // job while never racing correct-but-slow model loading.
+    for _ in 0..1500 {
         let response = app
             .clone()
             .oneshot(
@@ -178,6 +185,7 @@ async fn corpus_tree_rejects_an_unknown_root() {
         workers: 1,
         max_pending: 2,
         max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
     })
     .unwrap();
 
@@ -205,6 +213,7 @@ async fn corpus_surface_degrades_to_empty_before_any_index_job() {
         workers: 1,
         max_pending: 2,
         max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
     })
     .unwrap();
 
@@ -250,6 +259,7 @@ async fn corpus_tree_status_and_document_text_join_the_published_database() {
         workers: 1,
         max_pending: 2,
         max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
     })
     .unwrap();
 
@@ -294,4 +304,199 @@ async fn corpus_tree_status_and_document_text_join_the_published_database() {
 
     let missing = get(&app, "/corpus/documents/999/text").await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+// ── Vision submit validation (--vision-max cap, unknown tier, missing models) ──
+//
+// All three reject at submit before the job is queued, so they never touch the
+// (network-fetched) embedding model.
+
+fn vision_router(vision_max: VisionMode) -> axum::Router {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    router(ServiceConfig {
+        output_root: temp.path().join("output"),
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers: 1,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max,
+    })
+    .unwrap()
+}
+
+async fn submit_vision(app: &axum::Router, id: &str, vision: &str) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/index")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"id": id, "ocr": "off", "vision": vision}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn submit_rejects_an_unknown_vision_tier() {
+    let app = vision_router(VisionMode::Captions);
+    let (status, body) = submit_vision(&app, "v-unknown", "blurry").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("unknown vision tier"));
+}
+
+#[tokio::test]
+async fn submit_rejects_a_tier_above_the_server_cap() {
+    // Default cap is off, so even `meta` is refused.
+    let app = vision_router(VisionMode::Off);
+    let (status, body) = submit_vision(&app, "v-capped", "tags").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("maximum"));
+}
+
+#[tokio::test]
+async fn submit_rejects_when_vision_models_are_missing() {
+    // Cap allows tags, but no model files exist under the default data dir.
+    let app = vision_router(VisionMode::Tags);
+    let (status, body) = submit_vision(&app, "v-nomodels", "tags").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("fetch-data --vision"));
+}
+
+#[tokio::test]
+async fn submit_accepts_off_vision_without_models() {
+    // `off` (and an omitted field) must never trip vision validation.
+    let app = vision_router(VisionMode::Off);
+    let (status, _) = submit_vision(&app, "v-off", "off").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+}
+
+// ── Per-job settings validation (ocr_opts / vision_opts) rejected at submit ──
+//
+// Each rejects with a field-specific 400 BEFORE the job is queued, so they
+// never load the (network-fetched) embedding model.
+
+async fn submit_body(app: &axum::Router, body: Value) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/index")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn submit_rejects_out_of_range_ocr_dpi() {
+    let app = vision_router(VisionMode::Off);
+    let (status, body) = submit_body(
+        &app,
+        json!({"id":"dpi-bad","ocr":"off","ocr_opts":{"dpi":5000}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"].as_str().unwrap().contains("ocr.dpi"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn submit_rejects_uninstalled_ocr_language() {
+    // "zzz" is not a real tesseract pack, so it is absent from the bundled and
+    // system tessdata alike regardless of what the box has installed.
+    let app = vision_router(VisionMode::Off);
+    let (status, body) = submit_body(
+        &app,
+        json!({"id":"lang-bad","ocr":"off","ocr_opts":{"langs":"zzz"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("zzz"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("ocr.langs"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn submit_rejects_out_of_range_vision_setting() {
+    // vision_opts is validated even with the tier off/omitted.
+    let app = vision_router(VisionMode::Off);
+    let (status, body) = submit_body(
+        &app,
+        json!({"id":"vk-bad","ocr":"off","vision_opts":{"tag_top_k":99}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"].as_str().unwrap().contains("tag_top_k"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn settings_route_serves_the_capability_contract() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let app = router(ServiceConfig {
+        output_root: temp.path().join("output"),
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers: 7,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        // A high cap; with no models staged the endpoint still only offers `meta`.
+        vision_max: VisionMode::Tags,
+    })
+    .unwrap();
+
+    let response = get(&app, "/settings").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let settings: Value = serde_json::from_slice(&body).unwrap();
+
+    // The process advertises its real worker default/ceiling and OCR modes.
+    assert_eq!(settings["workers"]["default"], 7);
+    assert_eq!(settings["workers"]["max"], 64);
+    assert_eq!(
+        settings["ocr"]["modes"],
+        json!(["auto", "on", "off", "exhaustive"])
+    );
+    assert!(settings["ocr"]["langs_installed"].is_array());
+    // Vision: the cap is echoed, and the tags tier is gated OUT because its
+    // models were never staged — only pure-code `meta` is available.
+    assert_eq!(settings["vision"]["max_tier"], "tags");
+    assert_eq!(settings["vision"]["tiers_available"], json!(["meta"]));
+    assert_eq!(settings["vision"]["detectors"][0]["id"], "nano");
+    assert_eq!(settings["vision"]["detectors"][0]["present"], false);
 }

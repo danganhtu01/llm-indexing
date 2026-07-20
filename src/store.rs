@@ -4,12 +4,13 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::model::{ProcessedFile, SearchHit};
 use crate::normalize::{fold, words, Normalizer};
+use crate::vision::VisionResult;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS files(
@@ -46,6 +47,20 @@ CREATE TABLE IF NOT EXISTS chunks(
   UNIQUE(file_id, chunk_index)
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
+CREATE TABLE IF NOT EXISTS vision(
+  file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL,
+  width INTEGER, height INTEGER,
+  phash TEXT,
+  exif_json TEXT, quality_json TEXT,
+  objects_json TEXT,
+  tags_json TEXT,
+  caption TEXT,
+  embedding BLOB, embedding_model TEXT, dimensions INTEGER,
+  frames INTEGER,
+  elapsed_ms INTEGER, error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_vision_phash ON vision(phash);
 "#;
 
 pub struct IndexStore {
@@ -138,6 +153,18 @@ impl IndexStore {
             .collect())
     }
 
+    /// The highest vision tier recorded per file path, for the resume
+    /// change-detection upgrade rule. Absent files simply aren't in the map.
+    pub fn existing_vision_modes(&self) -> Result<HashMap<String, String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT f.path, v.mode FROM vision v JOIN files f ON f.id = v.file_id")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
     pub fn prune_missing(&mut self, current: &HashSet<String>) -> Result<usize> {
         let mut statement = self.connection.prepare("SELECT id,path FROM files")?;
         let stale = statement
@@ -152,6 +179,8 @@ impl IndexStore {
             self.connection
                 .execute("DELETE FROM chunks WHERE file_id=?1", [id])?;
             self.connection
+                .execute("DELETE FROM vision WHERE file_id=?1", [id])?;
+            self.connection
                 .execute("DELETE FROM fts WHERE rowid=?1", [id])?;
             self.connection
                 .execute("DELETE FROM files WHERE id=?1", [id])?;
@@ -160,17 +189,51 @@ impl IndexStore {
     }
 
     pub fn add(&mut self, file: &ProcessedFile, indexed_at: f64) -> Result<()> {
-        if self.resume {
-            if let Ok(old_id) = self.connection.query_row(
-                "SELECT id FROM files WHERE path=?1",
-                [&file.rec.path],
-                |row| row.get::<_, i64>(0),
-            ) {
-                self.connection
-                    .execute("DELETE FROM chunks WHERE file_id=?1", [old_id])?;
-                self.connection
-                    .execute("DELETE FROM fts WHERE rowid=?1", [old_id])?;
-            }
+        // On resume the file row is INSERT OR REPLACE'd, which mints a new rowid
+        // on the UNIQUE(path) conflict, so the previous id's chunks/fts are
+        // deleted here and its vision row is reconciled after the re-insert.
+        let old = if self.resume {
+            self.connection
+                .query_row(
+                    "SELECT id,size,mtime FROM files WHERE path=?1",
+                    [&file.rec.path],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, f64>(2)?,
+                        ))
+                    },
+                )
+                .ok()
+        } else {
+            None
+        };
+        let old_id = old.map(|(id, _, _)| id);
+        // Capture the old vision row BEFORE the INSERT OR REPLACE below: the
+        // bundled SQLite runs with foreign_keys ON, so replacing the files row
+        // cascade-deletes its vision row. A carry-forward therefore has to
+        // re-insert the captured row under the new rowid, not re-point the old
+        // one (which no longer exists). Only needed when this job produced no
+        // vision result of its own.
+        let carried_vision: Option<Vec<rusqlite::types::Value>> = match old_id {
+            Some(old_id) if file.vision.is_none() => self
+                .connection
+                .query_row(
+                    "SELECT mode,width,height,phash,exif_json,quality_json,objects_json,\
+                     tags_json,caption,embedding,embedding_model,dimensions,frames,elapsed_ms,error \
+                     FROM vision WHERE file_id=?1",
+                    [old_id],
+                    |row| (0..15).map(|i| row.get::<_, rusqlite::types::Value>(i)).collect(),
+                )
+                .optional()?,
+            _ => None,
+        };
+        if let Some(old_id) = old_id {
+            self.connection
+                .execute("DELETE FROM chunks WHERE file_id=?1", [old_id])?;
+            self.connection
+                .execute("DELETE FROM fts WHERE rowid=?1", [old_id])?;
         }
         self.connection.execute(
             "INSERT OR REPLACE INTO files(path,drive,dir,name,ext,size,mtime,lang,method,ocr_used,pages,chars,sha1,indexed_at) \
@@ -202,6 +265,40 @@ impl IndexStore {
                     crate::embedding::EMBEDDING_MODEL,
                 ],
             )?;
+        }
+        // Vision reconciliation across the rowid change on resume. The REPLACE
+        // above cascade-dropped any old vision row (foreign_keys ON):
+        //  - this job produced a result -> write it under the new rowid;
+        //  - it did not, and the bytes are UNCHANGED -> carry the captured row
+        //    forward (spec: a lower/off tier must never drop vision);
+        //  - it did not, and the bytes CHANGED -> leave it dropped, since the
+        //    old phash/tags/embedding would now lie about the new content.
+        match (&file.vision, old_id) {
+            (Some(result), _) => {
+                self.upsert_vision(id, result)?;
+            }
+            (None, Some(old_id)) => {
+                // Belt-and-braces: on a foreign_keys=OFF build the old row would
+                // survive under the stale id, so clear it before re-attaching.
+                self.connection
+                    .execute("DELETE FROM vision WHERE file_id=?1", [old_id])?;
+                let unchanged = old.is_some_and(|(_, size, mtime)| {
+                    size == file.rec.size as i64 && mtime as i64 == file.rec.mtime as i64
+                });
+                if let (true, Some(values)) = (unchanged, carried_vision) {
+                    let mut row: Vec<rusqlite::types::Value> = Vec::with_capacity(16);
+                    row.push(rusqlite::types::Value::Integer(id));
+                    row.extend(values);
+                    self.connection.execute(
+                        "INSERT OR REPLACE INTO vision(file_id,mode,width,height,phash,exif_json,\
+                         quality_json,objects_json,tags_json,caption,embedding,embedding_model,\
+                         dimensions,frames,elapsed_ms,error) \
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                        rusqlite::params_from_iter(row),
+                    )?;
+                }
+            }
+            (None, None) => {}
         }
         if let Some(jsonl) = &mut self.jsonl {
             serde_json::to_writer(
@@ -253,6 +350,55 @@ impl IndexStore {
         if let Some(writer) = &mut self.catalog {
             writer.flush()?
         }
+        Ok(())
+    }
+
+    /// Insert or replace the `vision` row for `file_id`. Keyed on the file's
+    /// primary key, so a re-analysis overwrites cleanly.
+    pub fn upsert_vision(&self, file_id: i64, vision: &VisionResult) -> Result<()> {
+        let exif_json = vision
+            .exif
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let quality_json = vision
+            .quality
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let objects_json = (!vision.objects.is_empty())
+            .then(|| serde_json::to_string(&vision.objects))
+            .transpose()?;
+        let tags_json = (!vision.tags.is_empty())
+            .then(|| serde_json::to_string(&vision.tags))
+            .transpose()?;
+        let embedding = vision
+            .embedding
+            .as_ref()
+            .map(|vector| crate::embedding::vector_to_bytes(vector));
+        self.connection.execute(
+            "INSERT OR REPLACE INTO vision(file_id,mode,width,height,phash,exif_json,quality_json,\
+             objects_json,tags_json,caption,embedding,embedding_model,dimensions,frames,elapsed_ms,error) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            params![
+                file_id,
+                vision.mode.as_str(),
+                vision.width.map(i64::from),
+                vision.height.map(i64::from),
+                vision.phash,
+                exif_json,
+                quality_json,
+                objects_json,
+                tags_json,
+                vision.caption,
+                embedding,
+                vision.embedding_model,
+                vision.dimensions.map(|value| value as i64),
+                vision.frames.map(|value| value as i64),
+                vision.elapsed_ms.map(|value| value as i64),
+                vision.error,
+            ],
+        )?;
         Ok(())
     }
 
@@ -418,4 +564,154 @@ pub(crate) fn grouped(
         .flatten()
         .collect();
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::FileRec;
+    use crate::vision::{VisionMode, VisionResult};
+
+    fn sample_file(path: &str) -> ProcessedFile {
+        ProcessedFile {
+            rec: FileRec {
+                path: path.into(),
+                name: "photo.jpg".into(),
+                ext: ".jpg".into(),
+                dir: "album".into(),
+                drive: "/".into(),
+                size: 10,
+                mtime: 0.0,
+            },
+            content: "some indexed text".into(),
+            tokens: vec!["some".into(), "indexed".into(), "text".into()],
+            lang: "en".into(),
+            method: "text".into(),
+            ocr_used: false,
+            pages: 0,
+            sha1: None,
+            chunks: Vec::new(),
+            vision: None,
+        }
+    }
+
+    fn off_config() -> Config {
+        let mut config = Config::default();
+        config.sidecar = "none".into();
+        config
+    }
+
+    #[test]
+    fn off_path_writes_no_vision_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        store.add(&sample_file("/a/photo.jpg"), 0.0).unwrap();
+        store.finish().unwrap();
+
+        let connection = connect(temp.path()).unwrap();
+        let files: i64 = connection
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        let vision: i64 = connection
+            .query_row("SELECT COUNT(*) FROM vision", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(vision, 0);
+    }
+
+    #[test]
+    fn upsert_vision_round_trips_through_add() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut file = sample_file("/a/photo.jpg");
+        file.vision = Some(VisionResult {
+            mode: VisionMode::Meta,
+            width: Some(640),
+            height: Some(480),
+            phash: Some("00ff00ff00ff00ff".into()),
+            elapsed_ms: Some(12),
+            ..Default::default()
+        });
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        store.add(&file, 0.0).unwrap();
+        store.finish().unwrap();
+
+        let connection = connect(temp.path()).unwrap();
+        let (mode, width, phash): (String, i64, String) = connection
+            .query_row(
+                "SELECT mode,width,phash FROM vision v JOIN files f ON f.id=v.file_id \
+                 WHERE f.path=?1",
+                params!["/a/photo.jpg"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(mode, "meta");
+        assert_eq!(width, 640);
+        assert_eq!(phash, "00ff00ff00ff00ff");
+    }
+
+    fn tagged_photo(path: &str) -> ProcessedFile {
+        let mut file = sample_file(path);
+        file.vision = Some(VisionResult {
+            mode: VisionMode::Tags,
+            phash: Some("aaaaaaaaaaaaaaaa".into()),
+            ..Default::default()
+        });
+        file
+    }
+
+    #[test]
+    fn resume_drops_stale_vision_when_bytes_change() {
+        let temp = tempfile::tempdir().unwrap();
+        // Initial index: photo.jpg gets a vision row describing image A.
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        store.add(&tagged_photo("/a/photo.jpg"), 0.0).unwrap();
+        store.finish().unwrap();
+
+        // Resume with vision OFF (vision=None) but the file's bytes changed
+        // (size + mtime differ): the stale vision row must be dropped, not
+        // silently re-attached to the new content.
+        let mut changed = sample_file("/a/photo.jpg");
+        changed.rec.size = 999;
+        changed.rec.mtime = 123.0;
+        let mut store = IndexStore::open(temp.path(), &off_config(), true, false).unwrap();
+        store.add(&changed, 1.0).unwrap();
+        store.finish().unwrap();
+
+        let connection = connect(temp.path()).unwrap();
+        let vision: i64 = connection
+            .query_row("SELECT COUNT(*) FROM vision", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            vision, 0,
+            "stale vision row must be dropped on content change"
+        );
+    }
+
+    #[test]
+    fn resume_keeps_vision_when_bytes_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        store.add(&tagged_photo("/a/photo.jpg"), 0.0).unwrap();
+        store.finish().unwrap();
+
+        // Resume with vision OFF and identical bytes: a lower/off tier must NOT
+        // drop the existing vision row; it is carried forward to the new rowid.
+        let mut same = sample_file("/a/photo.jpg");
+        same.vision = None;
+        let mut store = IndexStore::open(temp.path(), &off_config(), true, false).unwrap();
+        store.add(&same, 1.0).unwrap();
+        store.finish().unwrap();
+
+        let connection = connect(temp.path()).unwrap();
+        let (count, phash): (i64, String) = connection
+            .query_row(
+                "SELECT COUNT(*),COALESCE(MAX(phash),'') FROM vision v \
+                 JOIN files f ON f.id=v.file_id WHERE f.path=?1",
+                params!["/a/photo.jpg"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "vision row carried forward on unchanged bytes");
+        assert_eq!(phash, "aaaaaaaaaaaaaaaa");
+    }
 }

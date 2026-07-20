@@ -11,7 +11,9 @@ use llm_indexing::embedding::{vector_search, Embedder};
 use llm_indexing::normalize::Normalizer;
 use llm_indexing::pipeline::{run_index, IndexRequest};
 use llm_indexing::service::{router, JobRequest, ServiceConfig};
+use llm_indexing::settings::{tessdata_sources, OcrSettings, VisionSettings};
 use llm_indexing::store::{analyze, connect, search, top_folders};
+use llm_indexing::vision::{VisionMode, VISION_MODELS};
 use llm_indexing::VERSION;
 use serde_json::Value;
 
@@ -72,8 +74,38 @@ struct IndexArgs {
     workers: Option<usize>,
     #[arg(long)]
     max_bytes: Option<u64>,
+    /// Vision analysis tier: off (default), meta, tags, or captions.
+    #[arg(long, value_enum)]
+    vision: Option<VisionMode>,
     #[arg(long)]
     resume: bool,
+    // Per-job OCR quality overrides (feed the SAME settings merge as the HTTP
+    // `ocr_opts`); language selection stays on the legacy `--ocr-langs` above.
+    #[arg(long)]
+    ocr_dpi: Option<u32>,
+    #[arg(long)]
+    ocr_psm: Option<String>,
+    #[arg(long)]
+    ocr_preprocess: Option<bool>,
+    #[arg(long)]
+    ocr_max_pages: Option<usize>,
+    // Per-job vision overrides (feed the SAME settings merge as `vision_opts`).
+    #[arg(long)]
+    vision_detector: Option<String>,
+    #[arg(long)]
+    vision_detector_conf: Option<f32>,
+    #[arg(long)]
+    vision_tagger: Option<String>,
+    #[arg(long)]
+    vision_tag_threshold: Option<f32>,
+    #[arg(long)]
+    vision_tag_top_k: Option<usize>,
+    #[arg(long)]
+    vision_captioner: Option<String>,
+    #[arg(long)]
+    vision_max_frames: Option<usize>,
+    #[arg(long)]
+    vision_timeout_secs: Option<u64>,
 }
 
 #[derive(Args)]
@@ -141,6 +173,10 @@ struct ServeArgs {
     max_pending: usize,
     #[arg(long, default_value_t = 1024 * 1024)]
     max_body: usize,
+    /// Highest vision tier this server accepts (env fallback
+    /// `INDEX_VISION_MAX`); requests above it are rejected. Default `off`.
+    #[arg(long = "vision-max", value_enum)]
+    vision_max: Option<VisionMode>,
 }
 
 #[derive(Args)]
@@ -161,6 +197,9 @@ struct RequestArgs {
     ocr_langs: Option<String>,
     #[arg(long)]
     workers: Option<usize>,
+    /// Vision analysis tier: off (default), meta, tags, or captions.
+    #[arg(long, value_enum, default_value = "off")]
+    vision: VisionMode,
     #[arg(long)]
     resume: bool,
     #[arg(long)]
@@ -177,6 +216,10 @@ struct FetchDataArgs {
     dictionaries_only: bool,
     #[arg(long, conflicts_with = "dictionaries_only")]
     ocr_only: bool,
+    /// Fetch the vision models (RF-DETR-Nano detector / Florence-2) with pinned
+    /// SHA-256 verification instead of dictionaries/OCR data.
+    #[arg(long, conflicts_with_all = ["dictionaries_only", "ocr_only"])]
+    vision: bool,
 }
 
 #[derive(Args)]
@@ -211,8 +254,18 @@ fn index(args: IndexArgs) -> Result<()> {
     if let Some(ocr) = args.ocr {
         config.ocr = ocr.as_str().into()
     }
-    if let Some(langs) = args.ocr_langs {
-        config.ocr_langs = langs
+    if let Some(langs) = &args.ocr_langs {
+        // Same installed-tessdata gate the HTTP `ocr_opts.langs` submit uses, so the
+        // CLI cannot silently OCR every page empty with an uninstalled/cross-source
+        // language selection.
+        let (bundled, system) = tessdata_sources(&config);
+        OcrSettings {
+            langs: Some(langs.clone()),
+            ..Default::default()
+        }
+        .validate_langs(&bundled, &system)
+        .map_err(|error| anyhow::anyhow!(error))?;
+        config.ocr_langs = langs.clone();
     }
     if let Some(sidecar) = args.sidecar {
         config.sidecar = sidecar
@@ -223,6 +276,37 @@ fn index(args: IndexArgs) -> Result<()> {
     if let Some(max_bytes) = args.max_bytes {
         config.max_bytes = max_bytes
     }
+    if let Some(vision) = args.vision {
+        config.vision.max = vision
+    }
+    // Per-job OCR/vision quality knobs go through the SAME merge + validation
+    // path as the HTTP `ocr_opts`/`vision_opts`, so CLI and service stay at
+    // parity. `--ocr-langs` (legacy, above) remains the language selector.
+    let ocr_over = OcrSettings {
+        dpi: args.ocr_dpi,
+        psm: args.ocr_psm.clone(),
+        preprocess: args.ocr_preprocess,
+        max_pages: args.ocr_max_pages,
+        langs: None,
+    };
+    ocr_over
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    OcrSettings::resolve(&config, Some(&ocr_over)).apply_to(&mut config);
+    let vision_over = VisionSettings {
+        detector: args.vision_detector.clone(),
+        detector_conf: args.vision_detector_conf,
+        tagger: args.vision_tagger.clone(),
+        tag_threshold: args.vision_tag_threshold,
+        tag_top_k: args.vision_tag_top_k,
+        captioner: args.vision_captioner.clone(),
+        max_frames: args.vision_max_frames,
+        timeout_secs: args.vision_timeout_secs,
+    };
+    vision_over
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    VisionSettings::resolve(&config, Some(&vision_over)).apply_to(&mut config);
     let stats = run_index(IndexRequest {
         paths: &args.paths,
         out: &args.out,
@@ -319,6 +403,14 @@ fn serve(args: ServeArgs) -> Result<()> {
     } else {
         args.default_paths
     };
+    let vision_max = args
+        .vision_max
+        .or_else(|| {
+            std::env::var("INDEX_VISION_MAX")
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(VisionMode::Off);
     let config = ServiceConfig {
         output_root: args.output_root,
         allowed_roots,
@@ -328,6 +420,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         workers: args.workers,
         max_pending: args.max_pending,
         max_body: args.max_body,
+        vision_max,
     };
     let address: SocketAddr = args.listen.parse().context("--listen must be HOST:PORT")?;
     let runtime = tokio::runtime::Runtime::new()?;
@@ -366,6 +459,9 @@ fn request(args: RequestArgs) -> Result<()> {
         resume: args.resume,
         overwrite: args.overwrite,
         include_paths: None,
+        vision: Some(args.vision.as_str().to_string()),
+        ocr_opts: None,
+        vision_opts: None,
     };
     let response = client
         .post(format!("{base}/index"))
@@ -400,6 +496,9 @@ fn request(args: RequestArgs) -> Result<()> {
 }
 
 fn fetch_data(args: FetchDataArgs) -> Result<()> {
+    if args.vision {
+        return fetch_vision_models(&args);
+    }
     const RAW: &str = "https://raw.githubusercontent.com";
     let files = [
         (
@@ -464,6 +563,112 @@ fn fetch_data(args: FetchDataArgs) -> Result<()> {
         fs::write(&destination, &bytes)?;
         println!("{} {} bytes", destination.display(), bytes.len());
     }
+    Ok(())
+}
+
+/// Fetch the vision models listed in `VISION_MODELS` into `<data_dir>/vision`,
+/// verifying each against its pinned SHA-256 before writing. The tags-tier
+/// detector (RF-DETR-Nano) is pinned and downloaded here; the captions-tier
+/// Florence-2 files stay unpinned (`None`) while that tier is the v1 unsupported
+/// stub, so they are reported as not-yet-pinned and skipped. The
+/// verify-after-download path runs whenever a real hash is present.
+fn fetch_vision_models(args: &FetchDataArgs) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let directory = args.data_dir.join("vision");
+    let client = reqwest::blocking::Client::new();
+    for model in VISION_MODELS {
+        let destination = directory.join(model.relative);
+        // Re-verify an already-present pinned file rather than trusting mere
+        // existence. The atomic write below means an interrupted download never
+        // lands here, but a file corrupted/truncated/swapped by other means is
+        // caught and repaired by re-downloading. Unpinned files (the Florence
+        // stub) keep the skip-if-present behaviour.
+        if destination.exists() && !args.force {
+            match model.sha256 {
+                Some(expected) if file_sha256(&destination)?.eq_ignore_ascii_case(expected) => {
+                    continue;
+                }
+                Some(_) => eprintln!(
+                    "{} present but fails its pinned sha256 — re-fetching",
+                    model.relative
+                ),
+                None => continue,
+            }
+        }
+        let Some(url) = model.url else {
+            eprintln!(
+                "skipping {} — download URL not yet pinned (V3/V5 will pin it)",
+                model.relative
+            );
+            continue;
+        };
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?
+        }
+        let bytes = client.get(url).send()?.error_for_status()?.bytes()?;
+        match model.sha256 {
+            Some(expected) => {
+                let actual = format!("{:x}", Sha256::digest(&bytes));
+                if !actual.eq_ignore_ascii_case(expected) {
+                    anyhow::bail!(
+                        "sha256 mismatch for {}: expected {expected}, got {actual}",
+                        model.relative
+                    )
+                }
+            }
+            None => eprintln!(
+                "warning: {} has no pinned sha256 yet; skipping verification (V3/V5 will pin it)",
+                model.relative
+            ),
+        }
+        // Atomic: write a sibling temp file and rename in, so a crash mid-write
+        // never leaves a truncated file that a later run would accept as done.
+        write_atomic(&destination, &bytes)?;
+        println!(
+            "{} {} bytes ({})",
+            destination.display(),
+            bytes.len(),
+            model.license
+        );
+    }
+    // CLIP is served from fastembed's own cache (there is no single pinned file),
+    // so stage it here — the ONLY sanctioned network fetch of CLIP (VISION-SPEC
+    // §1) — so index-time tags jobs load it locally and the submit pre-flight can
+    // require it instead of fastembed silently downloading it mid-job.
+    println!("staging CLIP encoders under {} …", directory.display());
+    llm_indexing::vision::prefetch_clip(&directory)?;
+    println!("CLIP encoders staged under {}", directory.display());
+    Ok(())
+}
+
+/// Stream a file's lowercase-hex SHA-256 (chunked, so a ~100 MB ONNX blob is not
+/// loaded fully into memory).
+fn file_sha256(path: &Path) -> Result<String> {
+    use std::io::Read;
+
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1 << 16];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Write `bytes` to `destination` atomically via a sibling temp file + rename, so
+/// an interrupted write never leaves a partial file at `destination`.
+fn write_atomic(destination: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let directory = destination.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(directory)?;
+    temp.write_all(bytes)?;
+    temp.flush()?;
+    temp.persist(destination).map_err(|error| error.error)?;
     Ok(())
 }
 

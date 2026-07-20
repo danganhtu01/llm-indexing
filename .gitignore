@@ -4,6 +4,11 @@ target/
 # Downloaded data (fetched by llm-index fetch-data; not committed)
 data/dict/
 data/tessdata/
+data/vision/
+
+# Model caches (fastembed / prefetch-models / fetch-data --vision; provisioned
+# at docker build or by fetch-data, never committed)
+models/
 
 # Index outputs (generated; never commit indexed data)
 index_out/
