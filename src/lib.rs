@@ -6,6 +6,7 @@ pub mod model;
 pub mod normalize;
 pub mod ocr;
 pub mod pipeline;
+pub mod runtime;
 pub mod service;
 pub mod settings;
 pub mod store;

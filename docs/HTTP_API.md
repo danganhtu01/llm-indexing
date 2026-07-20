@@ -205,6 +205,57 @@ state becomes `cancelled`; that result carries the `output` name and reports the
 partial corpus as retained. Resubmit with `"resume": true` to continue from it.
 A job cancelled before it started leaves the output untouched.
 
+## Runtime stage tuning
+
+Concurrency knobs that can be changed **while a job is running**. Values are
+integers; out-of-range values are **clamped, not rejected**, and the response
+always reports what actually landed.
+
+### `GET /runtime`
+
+```json
+{"stages": {"extract": {"value": 8, "min": 1, "max": 64,
+                        "live": true, "unit": "threads"}}}
+```
+
+| stage | unit | live | what it controls |
+| --- | --- | --- | --- |
+| `extract` | threads | yes | Extraction workers admitted concurrently. The rayon pool is built once at the 64-worker ceiling and admission is gated per file, so raising or lowering this retunes a job already in flight. |
+| `embed` | instances | yes | Live `Embedder` instances. `fastembed`'s `embed` takes `&mut self`, so N concurrent embeds need N models — **each ~448 MB resident**. Default 2, grown lazily; shrinking drops instances as they are returned. |
+| `ocr` | threads | **no** | `OMP_THREAD_LIMIT` for each tesseract spawn. `applies: next-file` — the value is resolved when the process is spawned, once per file, so it cannot reach a scan already being recognised. Defaults to the CPU count, which is what OpenMP would pick anyway. |
+
+`live: true` means a change reaches work already in flight. When `live` is
+`false` the stage carries an `applies` field naming the boundary instead. This
+flag is meant to be trusted, which is why `ocr` reports `false`: turning it down
+while a 900-page PDF is being OCR'd changes nothing until the next file, and a
+`true` here would have a client render a control that looks like it did
+something it did not.
+
+`extract`, `embed` and `ocr` are the stage names shared with the other engine,
+and they are the complete set — this engine advertises no extras. ONNX intra-op
+width is a **config-only** setting (`embed_intra_threads` in the YAML config),
+deliberately not a runtime stage: ort bakes the thread count into a `Session` at
+construction, so it could never be live, and a name only this engine knows would
+render in the app's Settings UI as a control whose save is rejected — taking
+every other edit in the same request down with it.
+
+### `POST /runtime`
+
+Body `{"<stage>": <int>, ...}`. Sets the **process-wide default for future
+jobs** — it does not touch jobs already running, which hold their own snapshot.
+Returns `200` with the `GET /runtime` shape. An unknown stage name returns `400`
+listing the valid names and applies **nothing** (a body with one typo does not
+half-land).
+
+### `POST /jobs/{id}/runtime`
+
+Body `{"<stage>": <int>, ...}`. Applies to **that running job**, which is the
+point of the feature. `404` if the job is unknown, `409` if it is already
+terminal. Same response shape.
+
+A job's stage settings are snapshotted from the process-wide defaults at submit;
+an explicit `"workers"` on `POST /index` seeds that job's `extract` stage.
+
 ## Search moved out of this service
 
 `POST /search/fts` and `POST /search/vector` used to live here but were moved

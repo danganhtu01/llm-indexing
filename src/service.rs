@@ -14,13 +14,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, RwLock};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::config::{clamp_workers, Config, MAX_WORKERS};
 use crate::pipeline::{run_index, IndexRequest};
+use crate::runtime::RuntimeKnobs;
 use crate::settings::{
     installed_tessdata_langs, tessdata_sources, OcrSettings, VisionSettings, CAPTIONERS, DETECTORS,
     OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE, TAGGERS,
@@ -99,6 +100,14 @@ fn default_ocr() -> String {
 struct AppState {
     jobs: Arc<RwLock<HashMap<String, Value>>>,
     cancellations: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
+    /// Per-job live stage settings, keyed exactly like `cancellations` and
+    /// managed on the same lifecycle: inserted at submit, handed to the blocking
+    /// job, reachable by `POST /jobs/{id}/runtime` for as long as it runs.
+    runtimes: Arc<RwLock<HashMap<String, Arc<RuntimeKnobs>>>>,
+    /// Process-wide defaults every new job is snapshotted from. Never aliased
+    /// into a running job, so `POST /runtime` cannot retune work in flight —
+    /// that is what the per-job route is for.
+    defaults: Arc<RuntimeKnobs>,
     sender: mpsc::Sender<(String, JobRequest)>,
     output_root: PathBuf,
     /// Allowed input roots keyed by their directory name (e.g. `/input` ->
@@ -128,6 +137,32 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         .collect::<Result<Vec<_>>>()?;
     let jobs = Arc::new(RwLock::new(HashMap::new()));
     let cancellations = Arc::new(RwLock::new(HashMap::new()));
+    let runtimes = Arc::new(RwLock::new(HashMap::new()));
+    // Seed the process-wide stage defaults from the same config the jobs load,
+    // with `serve --workers` taking precedence for the extract stage exactly as
+    // it does in `run_job`.
+    //
+    // An unreadable config falls back to the built-in defaults rather than
+    // failing startup. Reporting it here would MOVE an existing failure: a bad
+    // config is already surfaced per job, by the job, which is what leaves the
+    // published corpus untouched when a job cannot run. Turning it into a
+    // startup panic would take the whole service down for a fault the job-level
+    // path already handles correctly.
+    let defaults = {
+        let mut config = match Config::load(normalized.config_path.as_deref()) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "config unreadable; runtime stage defaults fall back to built-ins \
+                     (jobs will still report the config error)"
+                );
+                Config::default()
+            }
+        };
+        config.workers = clamp_workers(normalized.workers);
+        Arc::new(RuntimeKnobs::from_config(&config))
+    };
     let (sender, receiver) = mpsc::channel(normalized.max_pending);
     let max_body = normalized.max_body;
     let mut roots = HashMap::with_capacity(normalized.allowed_roots.len());
@@ -141,11 +176,14 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         receiver,
         jobs.clone(),
         cancellations.clone(),
+        runtimes.clone(),
         normalized.clone(),
     ));
     let state = AppState {
         jobs,
         cancellations,
+        runtimes,
+        defaults,
         sender,
         output_root: normalized.output_root.clone(),
         roots: Arc::new(roots),
@@ -159,6 +197,8 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         .route("/index", post(submit))
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/runtime", get(runtime_defaults).post(set_runtime_defaults))
+        .route("/jobs/{id}/runtime", post(set_job_runtime))
         .route("/corpus/tree", get(corpus_tree))
         .route("/corpus/documents/{id}/text", get(corpus_document_text))
         .route("/corpus/status", get(corpus_status_handler))
@@ -465,6 +505,18 @@ async fn submit(State(state): State<AppState>, Json(mut request): Json<JobReques
         .write()
         .await
         .insert(id.clone(), Arc::new(AtomicBool::new(false)));
+    // A detached snapshot, not a share of the defaults: a later POST /runtime
+    // must not retune this job behind the caller's back.
+    let runtime = Arc::new(state.defaults.snapshot());
+    // An explicit per-job `workers` is the caller stating this job's extract
+    // width, so it outranks the process-wide default it was snapshotted from.
+    if let Some(workers) = request.workers {
+        let _ = runtime.apply(&Map::from_iter([(
+            crate::runtime::EXTRACT.to_string(),
+            json!(clamp_workers(workers)),
+        )]));
+    }
+    state.runtimes.write().await.insert(id.clone(), runtime);
     request.id = Some(id.clone());
     match state.sender.try_send((id.clone(), request)) {
         Ok(()) => (
@@ -475,6 +527,7 @@ async fn submit(State(state): State<AppState>, Json(mut request): Json<JobReques
         Err(_) => {
             state.jobs.write().await.remove(&id);
             state.cancellations.write().await.remove(&id);
+            state.runtimes.write().await.remove(&id);
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({"status":"error","error":"indexing queue is full"})),
@@ -532,10 +585,84 @@ async fn cancel_job(State(state): State<AppState>, AxumPath(id): AxumPath<String
     }
 }
 
+/// GET /runtime — the process-wide stage settings future jobs start from.
+async fn runtime_defaults(State(state): State<AppState>) -> Response {
+    Json(state.defaults.view()).into_response()
+}
+
+/// POST /runtime — set the process-wide defaults.
+///
+/// Affects FUTURE jobs only. Jobs already running hold their own snapshot, so a
+/// caller retuning the defaults cannot accidentally reach into work in flight;
+/// `POST /jobs/{id}/runtime` is the deliberate way to do that.
+async fn set_runtime_defaults(
+    State(state): State<AppState>,
+    Json(body): Json<Map<String, Value>>,
+) -> Response {
+    match state.defaults.apply(&body) {
+        Ok(view) => Json(view).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status":"error","error":error})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /jobs/{id}/runtime — retune a job that is running RIGHT NOW.
+///
+/// The settings this writes are the ones the job's extract admission gate and
+/// embedder pool re-read as they work, so the change lands on files already in
+/// flight rather than at the next job boundary.
+async fn set_job_runtime(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<Map<String, Value>>,
+) -> Response {
+    // Status first: a terminal job is a 409, and it must not read as a 404 just
+    // because its settings were already reaped.
+    let status = state
+        .jobs
+        .read()
+        .await
+        .get(&id)
+        .and_then(|job| job["status"].as_str().map(str::to_string));
+    let Some(status) = status else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"job not found"})),
+        )
+            .into_response();
+    };
+    if !matches!(status.as_str(), "queued" | "running" | "cancelling") {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"job is not active","status":status})),
+        )
+            .into_response();
+    }
+    let Some(runtime) = state.runtimes.read().await.get(&id).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"job not found"})),
+        )
+            .into_response();
+    };
+    match runtime.apply(&body) {
+        Ok(view) => Json(view).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status":"error","error":error})),
+        )
+            .into_response(),
+    }
+}
+
 async fn worker(
     mut receiver: mpsc::Receiver<(String, JobRequest)>,
     jobs: Arc<RwLock<HashMap<String, Value>>>,
     cancellations: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
+    runtimes: Arc<RwLock<HashMap<String, Arc<RuntimeKnobs>>>>,
     config: ServiceConfig,
 ) {
     while let Some((id, request)) = receiver.recv().await {
@@ -558,6 +685,15 @@ async fn worker(
             json!({"id":id,"status":"running","output":output,"processed":0,"total":0,
                    "started_at":now()}),
         );
+        // Same lookup shape as the cancellation above: the settings the HTTP
+        // route can reach must be the very ones this job runs with, so take the
+        // registered Arc rather than building a fresh one.
+        let runtime = runtimes
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(RuntimeKnobs::from_config(&Config::default())));
         let run_config = config.clone();
         let job_id = id.clone();
         let job_states = jobs.clone();
@@ -569,6 +705,7 @@ async fn worker(
                 &run_config,
                 job_states,
                 worker_cancellation,
+                runtime,
             )
         })
         .await;
@@ -615,6 +752,7 @@ fn run_job(
     service: &ServiceConfig,
     jobs: Arc<RwLock<HashMap<String, Value>>>,
     cancellation: Arc<AtomicBool>,
+    runtime: Arc<RuntimeKnobs>,
 ) -> Result<Value> {
     let paths = request
         .paths
@@ -714,6 +852,7 @@ fn run_job(
         artifacts: false,
         include_paths,
         cancellation: Some(cancellation),
+        runtime: Some(runtime),
         progress: Some(Arc::new(move |processed, total| {
             let mut jobs = jobs.blocking_write();
             if let Some(job) = jobs.get_mut(&progress_id) {
