@@ -58,6 +58,7 @@ fn indexes_and_searches_english_and_vietnamese() {
         artifacts: true,
         include_paths: None,
         cancellation: None,
+        runtime: None,
         progress: None,
     })
     .unwrap();
@@ -134,6 +135,7 @@ fn index(
         artifacts: false,
         include_paths,
         cancellation,
+        runtime: None,
         progress,
     })
 }
@@ -185,12 +187,26 @@ fn resume_continues_from_a_partially_written_corpus() {
 
 #[test]
 fn cancellation_keeps_committed_work_and_resume_finishes_it() {
-    const FILES: i64 = 24;
-    // Cancel late enough that the writer must already hold files: extraction can
-    // only run ahead of it by the channel depth (workers × 4) plus one in-flight
-    // send per worker, so 20 extracted files means at least ~10 were received,
-    // embedded and stored before the flag was seen.
-    const CANCEL_AFTER: usize = 20;
+    const FILES: i64 = 240;
+    // Cancel late enough that the writer must already hold files.
+    //
+    // `progress` counts EXTRACTED files, so this bound is arithmetic on how far
+    // extraction can run ahead of the writer. The pipeline buffers at most
+    // MAX_WORKERS (64, extract→embed channel) + MAX_WORKERS (64, extract threads
+    // blocked in `send`, already counted as processed) + EMBED_RANGE.1 (8, one
+    // per embed worker) + EMBED_RANGE.1 × 2 (16, embed→writer channel) = 152
+    // files it has not yet written. Cancelling at 200 therefore guarantees ~48
+    // reached the writer, while leaving 40 unstarted so the run is genuinely
+    // interrupted.
+    //
+    // These numbers grew with the pipeline: the channel is now sized for the
+    // MAX_WORKERS ceiling rather than for `config.workers`, because `extract` is
+    // retunable mid-job and a capacity cut to the starting value would throttle
+    // a job that was later widened. A 24-file corpus no longer outruns that
+    // buffer at all — every file would sit in the channel, the writer would see
+    // the flag before storing anything, and the assertion below would be
+    // vacuous rather than wrong.
+    const CANCEL_AFTER: usize = 200;
 
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("input");
@@ -226,4 +242,77 @@ fn cancellation_keeps_committed_work_and_resume_finishes_it() {
     assert_eq!(finished.skipped as i64, retained);
     assert_eq!(finished.files as i64, FILES - retained);
     assert_eq!(indexed_files(&destination), FILES);
+}
+
+fn indexed_chunks(destination: &Path) -> i64 {
+    connect(destination)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// Embedding moved OFF the single writer thread into a pool of `Embedder`
+/// instances that run concurrently. That is a correctness risk, not just a
+/// performance change: files now cross a second channel and are embedded out of
+/// order by whichever worker got a model, so a mistake there loses chunks,
+/// duplicates them, or attaches them to the wrong file.
+///
+/// Pinning it as an INVARIANT across pool sizes is what makes this meaningful —
+/// one pool size proves nothing, because a bug that drops work would drop it
+/// consistently. Widening the pool must change only how fast the work happens.
+#[test]
+fn pooled_embedding_is_invariant_to_the_embed_pool_size() {
+    use llm_indexing::runtime::RuntimeKnobs;
+    use serde_json::{json, Map, Value};
+
+    let _serialized = model_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    // Enough files to keep several embedders genuinely busy at once.
+    sample_tree(&input, 24);
+
+    let mut observed = Vec::new();
+    for embed in [1_u64, 3] {
+        let destination = temp.path().join(format!("corpus_{embed}.sqlite"));
+        let config = durability_config();
+        let runtime = Arc::new(RuntimeKnobs::from_config(&config));
+        let body: Map<String, Value> = json!({"embed": embed})
+            .as_object()
+            .expect("object")
+            .clone();
+        runtime.apply(&body).expect("embed is a valid stage");
+
+        let stats = run_index(IndexRequest {
+            paths: std::slice::from_ref(&input),
+            out: &destination,
+            config,
+            resume: false,
+            overwrite: false,
+            artifacts: false,
+            include_paths: None,
+            cancellation: None,
+            runtime: Some(runtime),
+            progress: None,
+        })
+        .unwrap();
+
+        assert_eq!(stats.files, 24, "embed={embed}");
+        assert!(
+            stats.embedded_chunks > 0,
+            "embed={embed}: the run must actually embed something, or the \
+             equality below would hold vacuously at zero"
+        );
+        // Every file is one short sentence, so each contributes exactly one chunk.
+        assert_eq!(stats.embedded_chunks, 24, "embed={embed}");
+        assert_eq!(
+            indexed_chunks(&destination),
+            stats.embedded_chunks as i64,
+            "embed={embed}: stored chunks must match reported chunks"
+        );
+        observed.push(stats.embedded_chunks);
+    }
+    assert_eq!(
+        observed[0], observed[1],
+        "pool size must not change what gets embedded, only how fast"
+    );
 }

@@ -32,6 +32,12 @@ fn default_sidecar() -> String {
 fn default_workers() -> usize {
     8
 }
+/// Live embedder instances a job starts with. Small on purpose — each instance
+/// holds ~448 MB of weights (see [`crate::runtime::EMBED_RANGE`]) — and the pool
+/// only ever builds one lazily unless documents actually overlap.
+fn default_embed_workers() -> usize {
+    crate::runtime::DEFAULT_EMBED
+}
 fn default_max_bytes() -> u64 {
     100 * 1024 * 1024
 }
@@ -436,8 +442,23 @@ pub struct Config {
     pub ocr: String,
     #[serde(default = "default_sidecar")]
     pub sidecar: String,
+    /// Extract-stage concurrency. Since the rayon pool is now built once at
+    /// [`MAX_WORKERS`] and gated by admission, this is the STARTING target for
+    /// the live `extract` stage rather than a fixed pool size.
     #[serde(default = "default_workers")]
     pub workers: usize,
+    /// Starting size of the embedder pool — the live `embed` stage.
+    #[serde(default = "default_embed_workers")]
+    pub embed_workers: usize,
+    /// ONNX intra-op threads for embedding. `None` derives it from
+    /// [`Config::workers`], which is exactly where this value used to come from
+    /// unconditionally, so leaving it unset preserves today's behaviour.
+    #[serde(default)]
+    pub embed_intra_threads: Option<usize>,
+    /// `OMP_THREAD_LIMIT` for each tesseract spawn — the live `ocr` stage.
+    /// `None` means "whatever OpenMP would have picked", i.e. today's behaviour.
+    #[serde(default)]
+    pub ocr_threads: Option<usize>,
     #[serde(default = "default_max_bytes")]
     pub max_bytes: u64,
     #[serde(default = "default_max_chars")]
@@ -496,6 +517,9 @@ impl Default for Config {
             ocr: default_ocr(),
             sidecar: default_sidecar(),
             workers: default_workers(),
+            embed_workers: default_embed_workers(),
+            embed_intra_threads: None,
+            ocr_threads: None,
             max_bytes: default_max_bytes(),
             max_chars: default_max_chars(),
             hash: false,
@@ -541,8 +565,21 @@ impl Config {
         Ok(config)
     }
 
+    /// ONNX intra-op width for a newly built embedder.
+    ///
+    /// Falls back to the `workers.clamp(1, 8)` expression this value was
+    /// hardcoded to before it became its own knob, so an operator who sets
+    /// nothing sees byte-identical behaviour.
+    pub fn resolved_embed_intra_threads(&self) -> usize {
+        self.embed_intra_threads
+            .unwrap_or_else(|| self.workers.clamp(1, 8))
+    }
+
     pub fn finalize(&mut self) {
         self.workers = clamp_workers(self.workers);
+        self.embed_workers = self
+            .embed_workers
+            .clamp(crate::runtime::EMBED_RANGE.0, crate::runtime::EMBED_RANGE.1);
         // Clamp the OCR/vision knobs to the settings-surface bounds (their single
         // definition in `settings.rs`). Only per-job overrides are validated at
         // submit; without this a mis-set config base would flow unvalidated into
