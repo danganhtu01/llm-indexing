@@ -118,35 +118,76 @@ fn default_skip_dirs() -> Vec<String> {
     dirs
 }
 
-/// Anchored, full-path directory exclusions — the OS locations that made a
-/// whole-drive index walk 800k files of Windows itself. Windows-only: a Linux
-/// build gets an EMPTY list, so `skip_paths` is inert there unless an operator
-/// sets it in their config YAML.
-#[cfg(windows)]
-fn default_skip_paths() -> Vec<String> {
-    [
-        r"?:\Windows",
-        r"?:\Program Files",
-        r"?:\Program Files (x86)",
-        r"?:\ProgramData",
-        // Only the AppData segment under a user is excluded. Everything else in
-        // a profile — Documents, Desktop, Downloads, ... — is still indexed.
-        r"?:\Users\*\AppData",
-        r"?:\$WinREAgent",
-        r"?:\Recovery",
-        r"?:\PerfLogs",
-        r"?:\System Volume Information",
-        r"?:\$Recycle.Bin",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
-}
+/// Anchored, full-path exclusions for Windows — the OS locations that made a
+/// whole-drive index walk 800k files of Windows itself.
+///
+/// A plain const rather than a `cfg`-gated function body so that BOTH platform
+/// lists compile and are testable on every platform. The previous shape put each
+/// list inside its own `cfg` arm, which meant the Linux rules could never be
+/// checked from a Windows machine — and an exclusion list that has never been
+/// compiled is exactly the kind of thing that silently skips someone's data.
+///
+/// Unused in a non-Windows non-test build by design; the tests exercise it on
+/// every platform, which is the entire point of it being a const.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const WINDOWS_SKIP_PATHS: &[&str] = &[
+    r"?:\Windows",
+    r"?:\Program Files",
+    r"?:\Program Files (x86)",
+    r"?:\ProgramData",
+    // Only the AppData segment under a user is excluded. Everything else in a
+    // profile — Documents, Desktop, Downloads, ... — is still indexed.
+    r"?:\Users\*\AppData",
+    r"?:\$WinREAgent",
+    r"?:\Recovery",
+    r"?:\PerfLogs",
+    r"?:\System Volume Information",
+    r"?:\$Recycle.Bin",
+];
 
-/// No default path exclusions off Windows — see the `cfg(windows)` twin.
-#[cfg(not(windows))]
+/// The Linux twin: kernel and pseudo-filesystems, plus the container stores
+/// nobody wants in a corpus.
+///
+/// `/proc` is not merely noise, it is actively hostile to a walker.
+/// `/proc/kcore` is a regular file reporting the machine's whole address space —
+/// around 128 TB apparent — and `/proc/<pid>/task/...` regenerates as processes
+/// come and go, so indexing `/` without this walks a tree with no fixed size and
+/// no end. `/sys` and `/dev` are the same class of hazard.
+///
+/// Deliberately NOT excluded: `/tmp`, `/var/log`, `/opt`, `/usr`. They hold real
+/// user-visible content often enough that excluding them by default would be the
+/// silent-skip failure this mechanism exists to prevent. Only the trees that
+/// cannot usefully be indexed at all are removed for the operator.
+///
+/// Unused in a non-Linux non-test build by design — see [`WINDOWS_SKIP_PATHS`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const LINUX_SKIP_PATHS: &[&str] = &[
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/snap",
+    "/var/lib/docker",
+    "/var/lib/containers",
+    "/lost+found",
+];
+
+/// The platform's default anchored exclusions.
+///
+/// Only the SELECTION is `cfg`-gated; both lists above always compile. Anything
+/// that is neither Windows nor Linux (macOS, the BSDs) gets an empty list — not
+/// an oversight. macOS has its own worthwhile set (`/System`, `/private/var`,
+/// `/Volumes` recursion), but nobody has run this there, and asserting
+/// exclusions for an untested platform is how a walker silently skips data. An
+/// empty list is the honest answer; `skip_paths` in a config file is the lever.
 fn default_skip_paths() -> Vec<String> {
-    Vec::new()
+    #[cfg(windows)]
+    let list = WINDOWS_SKIP_PATHS;
+    #[cfg(target_os = "linux")]
+    let list = LINUX_SKIP_PATHS;
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let list: &[&str] = &[];
+    list.iter().map(|s| (*s).to_string()).collect()
 }
 fn default_skip_exts() -> Vec<String> {
     [".sys", ".dll", ".exe", ".iso", ".vmdk", ".lock"]
@@ -900,13 +941,11 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn non_windows_defaults_are_unchanged() {
-        // Linux Docker deployments must see byte-identical defaults: no path
-        // exclusions at all, and "Windows" still a bare skip_dirs entry in its
-        // original position.
+    fn non_windows_skip_dirs_keep_their_original_shape() {
+        // `skip_dirs` is the half that must not drift off Windows: "Windows"
+        // stays a bare entry in its original position, because off Windows the
+        // anchored `?:\Windows` rule does not exist to replace it.
         let config = finalized();
-        assert!(super::default_skip_paths().is_empty());
-        assert!(config.skip_paths.is_empty());
         assert_eq!(
             config.skip_dirs,
             vec![
@@ -924,7 +963,99 @@ mod tests {
             ]
         );
         assert!(config.skip_dir("Windows"));
-        assert!(!config.skip_path(Path::new("/anything")));
+    }
+
+    /// The Linux kernel trees must be pruned, and user data must not be.
+    ///
+    /// Runs on EVERY platform by compiling the Linux list directly rather than
+    /// relying on this build having selected it. That is the whole reason the
+    /// lists are consts: a Windows machine can now prove the Linux rules are
+    /// right, instead of shipping an exclusion list nothing has ever compiled.
+    #[test]
+    fn the_linux_list_prunes_kernel_trees_but_keeps_user_data() {
+        let config = with_skip_paths(super::LINUX_SKIP_PATHS);
+        for pseudo in [
+            "/proc",
+            "/sys",
+            "/dev",
+            "/run",
+            "/snap",
+            "/var/lib/docker",
+            "/var/lib/containers",
+            "/lost+found",
+        ] {
+            assert!(
+                config.skip_path(Path::new(pseudo)),
+                "{pseudo} must be pruned on Linux"
+            );
+        }
+        // Anchored, so a user directory sharing a basename is still indexed —
+        // and the trees deliberately left in stay in.
+        for keep in [
+            "/home/danga/Documents",
+            "/home/danga/proc",
+            "/srv/data/sys",
+            "/mnt/backup/dev",
+            "/tmp",
+            "/opt",
+            "/usr/share",
+            "/var/log",
+            "/var/lib",
+        ] {
+            assert!(!config.skip_path(Path::new(keep)), "{keep} must be indexed");
+        }
+    }
+
+    /// Same treatment for the Windows list, so neither platform's rules depend
+    /// on which machine happens to run the suite.
+    #[test]
+    fn the_windows_list_prunes_os_locations_but_keeps_user_data() {
+        let config = with_skip_paths(super::WINDOWS_SKIP_PATHS);
+        for os in [
+            r"C:\Windows",
+            r"C:\Program Files",
+            r"D:\ProgramData",
+            r"C:\Users\danga\AppData",
+        ] {
+            assert!(config.skip_path(Path::new(os)), "{os} must be pruned");
+        }
+        for keep in [
+            r"C:\Users\danga\Documents",
+            r"C:\Users\danga",
+            r"D:\projects\Windows",
+            r"C:\Users",
+        ] {
+            assert!(!config.skip_path(Path::new(keep)), "{keep} must be indexed");
+        }
+    }
+
+    /// Whichever list this build selected must be the one for this platform.
+    #[test]
+    fn the_selected_defaults_match_the_platform() {
+        let selected = super::default_skip_paths();
+        if cfg!(windows) {
+            assert_eq!(selected, super::WINDOWS_SKIP_PATHS);
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(selected, super::LINUX_SKIP_PATHS);
+        } else {
+            assert!(selected.is_empty(), "untested platforms assert nothing");
+        }
+    }
+
+    /// Runs on every platform: the MATCHER handles rooted POSIX patterns
+    /// correctly, independent of which defaults this build happens to ship.
+    /// Without this the Linux rules would only ever be exercised on Linux.
+    #[test]
+    fn rooted_posix_patterns_are_anchored_like_the_windows_ones() {
+        let config = with_skip_paths(&["/proc", "/var/lib/docker"]);
+        assert!(config.skip_path(Path::new("/proc")));
+        assert!(config.skip_path(Path::new("/var/lib/docker")));
+        // Not a prefix match, and not a bare-name match.
+        assert!(!config.skip_path(Path::new("/home/danga/proc")));
+        assert!(!config.skip_path(Path::new("/var/lib")));
+        assert!(!config.skip_path(Path::new("/var/lib/docker-data")));
+        // A relative path can never satisfy a rooted pattern.
+        assert!(!config.skip_path(Path::new("proc")));
     }
 
     #[test]
