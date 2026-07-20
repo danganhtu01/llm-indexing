@@ -91,6 +91,209 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
         .contains("INDEX_ALLOWED_ROOTS"));
 }
 
+// ── Destination guards ───────────────────────────────────────────────────────
+//
+// Jobs write straight into the published database, so the guards deciding
+// whether an existing corpus may be touched are the whole safety contract.
+
+fn guard_router(output: &std::path::Path, input: &std::path::Path) -> axum::Router {
+    guard_router_with_config(output, input, None)
+}
+
+fn guard_router_with_config(
+    output: &std::path::Path,
+    input: &std::path::Path,
+    config_path: Option<std::path::PathBuf>,
+) -> axum::Router {
+    fs::create_dir_all(input).unwrap();
+    fs::create_dir_all(output).unwrap();
+    router(ServiceConfig {
+        output_root: output.to_path_buf(),
+        allowed_roots: vec![input.to_path_buf()],
+        default_paths: vec![input.to_path_buf()],
+        config_path,
+        ocr_langs: "vie+eng".into(),
+        workers: 1,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
+    })
+    .unwrap()
+}
+
+/// A corpus holding one row for a file that is not in the input tree, so an
+/// overwrite is visible as its disappearance.
+fn write_stale_corpus(destination: &std::path::Path) {
+    let connection = rusqlite::Connection::open(destination).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE files(
+                id INTEGER PRIMARY KEY, path TEXT UNIQUE, drive TEXT, dir TEXT,
+                name TEXT, ext TEXT, size INTEGER, mtime REAL, lang TEXT,
+                method TEXT, ocr_used INTEGER, pages INTEGER, chars INTEGER,
+                sha1 TEXT, indexed_at REAL
+             );
+             INSERT INTO files(id,path,name,ext,size,mtime,lang,method,ocr_used,pages,chars,indexed_at)
+             VALUES (1,'/gone/stale.txt','stale.txt','.txt',1,0.0,'en','text',0,0,1,0.0);",
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_existing_corpus_is_refused_without_resume_or_overwrite() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = guard_router(&output, &input);
+    fs::write(input.join("hello.txt"), "compliance report").unwrap();
+    write_stale_corpus(&output.join("corpus.sqlite"));
+
+    let (status, _) = submit_body(
+        &app,
+        json!({"id":"guard","paths":[input],"output":"corpus.sqlite","ocr":"off"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let job = wait_for_job(&app, "guard").await;
+    assert_eq!(job["status"], "error", "{job}");
+    assert!(
+        job["error"].as_str().unwrap().contains("already exists"),
+        "{job}"
+    );
+    // Refusing must not touch what is there.
+    let connection = rusqlite::Connection::open(output.join("corpus.sqlite")).unwrap();
+    let files: i64 = connection
+        .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(files, 1);
+}
+
+#[tokio::test]
+async fn overwrite_replaces_the_existing_corpus() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = guard_router(&output, &input);
+    fs::write(input.join("hello.txt"), "compliance report").unwrap();
+    let destination = output.join("corpus.sqlite");
+    write_stale_corpus(&destination);
+
+    let (status, _) = submit_body(
+        &app,
+        json!({"id":"over","paths":[input],"output":"corpus.sqlite","ocr":"off",
+               "workers":1,"overwrite":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let job = wait_for_job(&app, "over").await;
+    assert_eq!(job["status"], "complete", "{job}");
+
+    // Truncated up front: the stale row is gone, not merged into the new run.
+    let connection = rusqlite::Connection::open(&destination).unwrap();
+    let stale: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE path='/gone/stale.txt'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 0);
+    assert_eq!(job["files"], 1);
+    // Nothing but the published database is left behind.
+    assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_overwrite_leaves_the_existing_corpus_intact() {
+    // An overwrite job writes into the destination, so the previous corpus has
+    // to be deleted at some point — but only once everything that can
+    // predictably fail has succeeded. An unreadable config is the cheapest
+    // stand-in for that class (a missing vision model or a cold embedding
+    // cache fail the same way, earlier than any write): the job must fail with
+    // the old corpus untouched rather than destroy it and put nothing back.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let config = temp.path().join("broken.yaml");
+    fs::write(&config, "workers: [this is not a scalar\n").unwrap();
+    let app = guard_router_with_config(&output, &input, Some(config));
+    fs::write(input.join("hello.txt"), "compliance report").unwrap();
+    let destination = output.join("corpus.sqlite");
+    write_stale_corpus(&destination);
+
+    let (status, _) = submit_body(
+        &app,
+        json!({"id":"doomed","paths":[input],"output":"corpus.sqlite","ocr":"off",
+               "workers":1,"overwrite":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let job = wait_for_job(&app, "doomed").await;
+    assert_eq!(job["status"], "error", "{job}");
+    // Specifically the config load, i.e. a step that runs before any write and
+    // must therefore run before the deletion too.
+    assert!(
+        job["error"].as_str().unwrap().contains("YAML config"),
+        "{job}"
+    );
+
+    assert!(destination.is_file(), "the previous corpus was destroyed");
+    let connection = rusqlite::Connection::open(&destination).unwrap();
+    let stale: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE path='/gone/stale.txt'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 1, "a job that never indexed anything kept the corpus");
+}
+
+#[tokio::test]
+async fn an_unreadable_corpus_is_reported_rather_than_read_as_empty() {
+    // The failure mode this guards: a corpus that cannot be read answering
+    // `indexed_files: 0`. A consumer cannot tell that from a corpus that is
+    // genuinely empty, and "your documents are gone" is the wrong thing to
+    // show over a database whose rows are all still there.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = guard_router(&output, &input);
+    fs::write(output.join("corpus.sqlite"), b"this is not a sqlite database").unwrap();
+
+    let response = get(&app, "/corpus/status").await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"], "corpus database unreadable", "{body}");
+    assert!(body["indexed_files"].is_null(), "{body}");
+
+    // The tree and document routes answer the same way rather than presenting
+    // an empty corpus as a complete one.
+    let tree = get(&app, "/corpus/tree?root=input").await;
+    assert_eq!(tree.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let text = get(&app, "/corpus/documents/1/text").await;
+    assert_eq!(text.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn an_absent_corpus_still_reads_as_empty_rather_than_an_error() {
+    // The counterpart: "no job has written this output yet" is a normal state
+    // and must stay a zeroed 200, not get swept into the error above.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = guard_router(&output, &input);
+
+    let status = get_json(&app, "/corpus/status").await;
+    assert_eq!(status["indexed_files"], 0, "{status}");
+    assert_eq!(status["writing"], false, "{status}");
+    let tree = get(&app, "/corpus/tree?root=input").await;
+    assert_eq!(tree.status(), StatusCode::OK);
+    let text = get(&app, "/corpus/documents/1/text").await;
+    assert_eq!(text.status(), StatusCode::NOT_FOUND);
+}
+
 async fn wait_for_job(app: &axum::Router, id: &str) -> Value {
     // Budget generously: a real `/index` job loads the e5 embedding model
     // (several seconds of CPU init on a cold cache) before it can complete, so
