@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -17,7 +17,7 @@ use crate::media::Transcriber;
 use crate::model::{FileRec, IndexStats, ProcessedFile};
 use crate::normalize::Normalizer;
 use crate::ocr::TesseractOcr;
-use crate::store::{analyze, connect, IndexStore};
+use crate::store::{analyze, connect, database_path, remove_database, IndexStore};
 use crate::vision::{
     is_video_ext, is_vision_ext, needs_vision_reprocess, VisionAnalyzer, VisionMode, VisionResult,
 };
@@ -28,6 +28,12 @@ pub struct IndexRequest<'a> {
     pub out: &'a Path,
     pub config: Config,
     pub resume: bool,
+    /// Delete an existing database before indexing into it. Honoured here
+    /// rather than by the caller so the deletion happens after every
+    /// prerequisite this run needs has been loaded and checked — see
+    /// `run_index`. Ignored when `resume` is set, which exists to keep what is
+    /// there.
+    pub overwrite: bool,
     pub artifacts: bool,
     pub include_paths: Option<HashSet<String>>,
     pub cancellation: Option<Arc<AtomicBool>>,
@@ -42,6 +48,16 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     let transcriber = Arc::new(Transcriber::new(&request.config));
     let vision = Arc::new(VisionAnalyzer::new(&request.config)?);
     let mut embedder = Embedder::new(&request.config)?;
+    // The last possible moment to destroy the previous corpus. Everything that
+    // can predictably fail on an operator mistake — an unreadable config, a
+    // missing or corrupt vision model, an embedding model that has to be
+    // fetched into a cold cache — has already run above, so none of them can
+    // leave the destination deleted and nothing in its place. What remains
+    // between here and the first write is `IndexStore::open` itself: a failure
+    // there (unwritable directory, corrupt schema) still costs the old corpus.
+    if request.overwrite && !request.resume {
+        remove_database(request.out)?;
+    }
     let mut store = IndexStore::open(
         request.out,
         &request.config,
@@ -63,7 +79,15 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         .iter()
         .map(|record| record.path.clone())
         .collect::<HashSet<_>>();
-    let removed = if request.resume {
+    // Pruning deletes rows for sources that have disappeared. It used to run
+    // against a throwaway copy that a failed run discarded; now it lands in the
+    // published corpus and the next batch commit makes it permanent. An empty
+    // walk is therefore not treated as "every source was deleted" — over a
+    // mounted tree that is far more often a root that failed to mount or a
+    // mistyped path, and that reading would silently empty the whole corpus for
+    // a run that then reports success. Rebuilding from empty is what
+    // `overwrite` is for, and it is explicit.
+    let removed = if request.resume && !current.is_empty() {
         store.prune_missing(&current)?
     } else {
         0
@@ -118,65 +142,85 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     let completed = Arc::new(AtomicUsize::new(0));
     let cancellation = request.cancellation.clone();
     let progress = request.progress.clone();
-    let processed = pool.install(|| {
-        records
-            .par_iter()
-            .filter_map(|record| {
-                if cancellation
-                    .as_ref()
-                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
-                {
-                    return None;
-                }
-                let file = process(
-                    record.clone(),
-                    &config,
-                    &normalizer,
-                    &ocr,
-                    &transcriber,
-                    &vision,
-                );
-                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                if let Some(progress) = &progress {
-                    progress(count, total);
-                }
-                Some(file)
-            })
-            .collect::<Vec<_>>()
-    });
-    if request
-        .cancellation
-        .as_ref()
-        .is_some_and(|flag| flag.load(Ordering::Relaxed))
-    {
-        anyhow::bail!("indexing cancelled")
-    }
     let mut stats = IndexStats {
         skipped,
         removed,
         ..Default::default()
     };
-    for mut file in processed {
-        if request
-            .cancellation
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Relaxed))
-        {
-            anyhow::bail!("indexing cancelled")
+    // Extraction fans out over the rayon pool and hands each finished file to
+    // this thread, which owns the embedder and the (non-Sync) SQLite connection
+    // and is therefore the single writer. Streaming rather than collecting keeps
+    // committed work on disk as the run proceeds and bounds peak memory to the
+    // channel depth instead of the whole corpus: a large drive no longer has to
+    // fit every extracted document in RAM before a single row is written.
+    let (sender, receiver) = mpsc::sync_channel::<ProcessedFile>(config.workers.max(1) * 4);
+    let outcome = std::thread::scope(|scope| -> Result<bool> {
+        scope.spawn(move || {
+            let stopped = AtomicBool::new(false);
+            pool.install(|| {
+                records.par_iter().for_each(|record| {
+                    if stopped.load(Ordering::Relaxed)
+                        || cancellation
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                    {
+                        return;
+                    }
+                    let file = process(
+                        record.clone(),
+                        &config,
+                        &normalizer,
+                        &ocr,
+                        &transcriber,
+                        &vision,
+                    );
+                    let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(progress) = &progress {
+                        progress(count, total);
+                    }
+                    // The writer hangs up (error or cancellation) by dropping the
+                    // receiver, which also unblocks a full channel; the remaining
+                    // records then wind down without extracting anything.
+                    if sender.send(file).is_err() {
+                        stopped.store(true, Ordering::Relaxed);
+                    }
+                })
+            })
+        });
+        // Consumed by value: returning early here drops the receiver, so the
+        // extraction side is never left blocked on a send.
+        for mut file in receiver {
+            if request
+                .cancellation
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                return Ok(true);
+            }
+            if !incomplete_method(&file.method) && !file.method.starts_with("excluded:") {
+                file.chunks = embedder.embed_document(&file.content)?;
+            }
+            stats.files += 1;
+            stats.bytes += file.rec.size;
+            stats.ocr_files += usize::from(file.ocr_used);
+            stats.errors += usize::from(file.method.starts_with("error:"));
+            stats.incomplete += usize::from(incomplete_method(&file.method));
+            stats.embedded_chunks += file.chunks.len();
+            stats.vision_files += usize::from(file.vision.is_some());
+            store.add(&file, now())?;
         }
-        if !incomplete_method(&file.method) && !file.method.starts_with("excluded:") {
-            file.chunks = embedder.embed_document(&file.content)?;
-        }
-        stats.files += 1;
-        stats.bytes += file.rec.size;
-        stats.ocr_files += usize::from(file.ocr_used);
-        stats.errors += usize::from(file.method.starts_with("error:"));
-        stats.incomplete += usize::from(incomplete_method(&file.method));
-        stats.embedded_chunks += file.chunks.len();
-        stats.vision_files += usize::from(file.vision.is_some());
-        store.add(&file, now())?;
+        Ok(false)
+    });
+    // Commit before propagating anything: success, cancellation and a mid-run
+    // failure all leave their finished files in the destination corpus, which is
+    // what a later resume continues from. The run's own error still wins over a
+    // commit error, since it is the one that explains the outcome.
+    let committed = store.finish();
+    let cancelled = outcome?;
+    committed?;
+    if cancelled {
+        anyhow::bail!("indexing cancelled; {} file(s) committed", stats.files)
     }
-    store.finish()?;
     stats.elapsed_seconds = started.elapsed().as_secs_f64();
     if request.artifacts {
         write_analysis(request.out, request.paths)?;
@@ -318,9 +362,15 @@ fn now() -> f64 {
 }
 
 fn write_analysis(out: &Path, paths: &[PathBuf]) -> Result<()> {
-    let connection = connect(out)?;
+    // `out` may name the database itself rather than a directory, the shape
+    // service jobs use; reports belong beside it either way.
+    let database = database_path(out);
+    let connection = connect(&database)?;
     let report = analyze(&connection)?;
-    let reports = out.join("reports");
+    let reports = database
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("reports");
     fs::create_dir_all(&reports)?;
     fs::write(
         reports.join("analysis.json"),

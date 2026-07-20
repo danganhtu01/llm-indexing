@@ -118,6 +118,36 @@ When present, `include_paths` must contain existing relative files confined
 under an input root. Only those files are extracted; source deletion pruning
 still uses the complete mounted tree.
 
+`resume` and `overwrite` decide what may happen to an existing `output`, which
+the job writes into directly (there is no staged copy renamed in at the end):
+
+- neither set, and the database exists → the job fails with `output already
+  exists; set resume or overwrite`, touching nothing;
+- `resume` → the job opens the existing database and indexes only files that are
+  new, changed, incomplete or missing vectors. This is also how a crashed or
+  cancelled job is continued, since its committed files are already there;
+- `overwrite` → the database is **deleted and rebuilt from empty**. The deletion
+  happens only after the job has loaded its config and every model it needs, so
+  the ordinary failures — bad config, missing or corrupt vision models, an
+  embedding model that cannot be fetched — leave the existing corpus untouched.
+  Once indexing starts there is no going back: an overwrite interrupted after
+  that leaves a partial new corpus, not the one it replaced, so keep a copy
+  first if the previous corpus still matters;
+- both set → `resume` wins.
+
+A job that fails part-way leaves what it had committed, so a database now exists
+where a failed job used to publish nothing — including the empty one a job that
+failed before its first batch leaves behind. An `error` result carries `output`
+and a `partial_corpus` note saying so. Resubmit with `resume` (continue) or
+`overwrite` (start clean); submitting with neither is refused as above.
+
+Readers may hold the corpus open while a job writes into it, and a live corpus
+can be mid-run rather than complete. A read that arrives while the writer holds
+its commit lock waits briefly and then answers `503` with
+`{"error":"corpus database busy","retryable":true}` — retry it. That is
+deliberately distinct from an unreadable corpus (below): one is a healthy
+database under contention, the other is a fault.
+
 `vision` requests a tier (`off`|`meta`|`tags`|`captions`, default `off`),
 capped by the server's `serve --vision-max`; see
 [`docs/VISION.md`](VISION.md) for tier semantics.
@@ -169,9 +199,11 @@ source count, elapsed time and OCR languages.
 ## `POST /jobs/{id}/cancel`
 
 Requests cooperative cancellation of a queued or running job. The engine stops
-before the next extraction/embedding boundary, discards the temporary build and
-keeps the previously published SQLite corpus unchanged. Poll the job until its
-state becomes `cancelled`.
+before the next extraction/embedding boundary and commits the files it had
+already finished, which stay in the published corpus. Poll the job until its
+state becomes `cancelled`; that result carries the `output` name and reports the
+partial corpus as retained. Resubmit with `"resume": true` to continue from it.
+A job cancelled before it started leaves the output untouched.
 
 ## Search moved out of this service
 
@@ -190,8 +222,20 @@ listing or a document preview. These routes serve that instead, so no consumer
 needs to know the SQLite schema. Every route accepts an optional
 `output=NAME.sqlite` query param (default `corpus.sqlite`) naming which
 published database to read, validated the same way as `POST /index`'s
-`output` field. The database is absent until the first job completes; every
-route below then degrades to an empty/zeroed result rather than an error.
+`output` field.
+
+The database is absent until the first job writes it, and that is not an error:
+every route below answers an empty/zeroed result for a corpus that does not
+exist yet. A database that **does** exist but cannot be read is different, and
+answers `503` with `{"error":"corpus database unreadable","retryable":false}`
+rather than a zero — a consumer must be able to tell "nothing indexed yet" from
+"the rows are there but unreadable". A rollback journal left by a killed job is
+recovered automatically on the first read rather than reported this way, and a
+corpus merely locked by a running job answers the retryable `busy` error above,
+never this one.
+
+Because jobs write in place, these routes can be served from a corpus that is
+still being built. `GET /corpus/status` reports that as `writing`.
 
 ### `GET /corpus/tree?root=NAME`
 
@@ -231,7 +275,8 @@ matching the indexer's own default.
 
 Streams the extracted text for one document (`files.id`) as
 `text/plain; charset=utf-8`. `404` when the database is absent or holds no
-matching id.
+matching id; `503` when it exists but could not be read, so a read failure is
+never presented as a missing document.
 
 ### `GET /corpus/status`
 
@@ -244,6 +289,12 @@ Cheap corpus-wide aggregates:
   "total_bytes": 512300000,
   "ocr_files": 88,
   "languages": [["en", 900], ["vi", 304]],
-  "methods": [["text", 1000], ["pdf-ocr", 204]]
+  "methods": [["text", 1000], ["pdf-ocr", 204]],
+  "writing": false
 }
 ```
+
+`writing` is `true` while a queued, running or cancelling job targets this
+`output`: the counts are then a snapshot of a corpus still being built, and will
+grow. It is the replacement for the guarantee the old rename-on-success
+publication gave for free — that a corpus you could see was a finished one.
