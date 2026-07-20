@@ -24,11 +24,23 @@ embedding_cache: models/fastembed
 embedding_model: intfloat/multilingual-e5-small
 
 # Skip rules
+#
+# skip_dirs matches a bare directory BASENAME anywhere in the tree. Use it for
+# names that are junk wherever they appear (node_modules, __pycache__). Do NOT
+# use it for OS locations: "Windows" as a basename also drops a user folder
+# called Windows. Use skip_paths for those.
 skip_dirs:
   - "$RECYCLE.BIN"
   - "System Volume Information"
   - ".git"
   - "$WinREAgent"
+  # A WINDOWS build's compiled defaults leave this out, using the anchored
+  # "?:/Windows" rule below instead. It stays in this FILE because setting
+  # skip_dirs at all REPLACES the defaults on every platform: dropping it here
+  # would take away the only OS-tree exclusion a Linux operator copying this
+  # file has, since every skip_paths rule is "?:"-anchored to a drive letter and
+  # can never match a POSIX path. On Windows, prefer deleting this line and
+  # uncommenting skip_paths, which does not over-match a user folder.
   - "Windows"
   - "node_modules"
   - "index_out"        # never index our own output
@@ -36,6 +48,31 @@ skip_dirs:
   - "venv"
   - "site-packages"
   - "__pycache__"
+
+# skip_paths matches a directory's FULL PATH, case-insensitively, as a whole —
+# a hit prunes that directory and everything under it. "*" matches within one
+# segment and never crosses a separator; a leading "?:" matches any drive
+# letter; "/" and "\" are interchangeable.
+#
+# Left COMMENTED OUT on purpose. This list is already the compiled default on a
+# Windows build, so uncommenting it unchanged buys nothing; on Linux the default
+# is empty, and enabling ten "?:"-anchored patterns there only adds a per
+# directory match that can never hit. Uncomment when you want to CHANGE the set
+# — an explicit list replaces the defaults rather than extending them.
+#
+# Only the AppData segment of a user profile is excluded: Documents, Desktop and
+# the rest of C:\Users\<name> are still indexed.
+# skip_paths:
+#   - "?:/Windows"
+#   - "?:/Program Files"
+#   - "?:/Program Files (x86)"
+#   - "?:/ProgramData"
+#   - "?:/Users/*/AppData"
+#   - "?:/$WinREAgent"
+#   - "?:/Recovery"
+#   - "?:/PerfLogs"
+#   - "?:/System Volume Information"
+#   - "?:/$Recycle.Bin"
 skip_exts:                   # never open for content (still indexed by name)
   - ".sys"
   - ".dll"
