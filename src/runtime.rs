@@ -236,13 +236,13 @@ impl RuntimeKnobs {
     /// * `embed` — read by [`EmbedderPool`] on every checkout/checkin; shrink
     ///   drops instances as they come back, growth builds lazily.
     /// * `ocr` — NOT live. `OMP_THREAD_LIMIT` is resolved when tesseract is
-    ///   SPAWNED, which happens once per file, so a change cannot reach the page
-    ///   currently being recognised — a 900-page scan already running keeps the
-    ///   width it started with. "next-file" is one of the boundaries the shared
-    ///   contract enumerates for `live: false`, so that is what this reports.
-    ///   Per-file is a fine granularity and a genuinely useful knob; it is just
-    ///   not the promise `live: true` makes, and that flag is the one thing the
-    ///   contract asks callers to trust.
+    ///   SPAWNED, once per file, so a change cannot reach the page currently being
+    ///   recognised — hence "next-file", one of the `live: false` boundaries the
+    ///   contract enumerates. It is ALSO inert entirely on tesseract 5.x, which
+    ///   dropped OpenMP and runs ~one core per file (measured identical at limit
+    ///   1 vs 32); it only bites an OpenMP-enabled tesseract. The stage's `note`
+    ///   says so, and points OCR-throughput tuning at `extract` (concurrent files
+    ///   = concurrent tesseract processes), which is the real lever on 5.x.
     pub fn view(&self) -> Value {
         json!({"stages": {
             EXTRACT: {
@@ -256,6 +256,14 @@ impl RuntimeKnobs {
             OCR: {
                 "value": self.ocr(), "min": OCR_RANGE.0, "max": OCR_RANGE.1,
                 "live": false, "applies": "next-file", "unit": "threads",
+                "note": "Caps OpenMP threads inside each tesseract process \
+                         (OMP_THREAD_LIMIT). INERT on tesseract 5.x, which dropped \
+                         OpenMP and runs ~one core per file — verified identical \
+                         at limit 1 vs 32 — so on a 5.x build this has no effect. \
+                         It still caps OpenMP-enabled tesseract (some 4.x / Linux \
+                         builds). To actually scale OCR throughput, raise `extract`: \
+                         each file spawns its own tesseract, so OCR parallelism is \
+                         the number of files in flight, not threads per tesseract.",
             },
         }})
     }
