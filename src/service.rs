@@ -198,7 +198,10 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/cancel", post(cancel_job))
         .route("/runtime", get(runtime_defaults).post(set_runtime_defaults))
-        .route("/jobs/{id}/runtime", post(set_job_runtime))
+        .route(
+            "/jobs/{id}/runtime",
+            get(get_job_runtime).post(set_job_runtime),
+        )
         .route("/corpus/tree", get(corpus_tree))
         .route("/corpus/documents/{id}/text", get(corpus_document_text))
         .route("/corpus/status", get(corpus_status_handler))
@@ -614,6 +617,40 @@ async fn set_runtime_defaults(
 /// The settings this writes are the ones the job's extract admission gate and
 /// embedder pool re-read as they work, so the change lands on files already in
 /// flight rather than at the next job boundary.
+/// GET /jobs/{id}/runtime — a job's LIVE per-job stage values, without changing
+/// them.
+///
+/// The counterpart the mid-run POST was missing. `GET /runtime` reports the
+/// process-wide defaults, not what a running job was individually retuned to, so
+/// there was no way to read a job's true live values back — a caller could set
+/// extract=20 on a job, get a 200, and then only ever see the process default
+/// (12) on any later read, which reads exactly like the setting was lost. This
+/// closes that: it returns the same per-job `RuntimeKnobs.view()` the POST does.
+async fn get_job_runtime(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    let status = state
+        .jobs
+        .read()
+        .await
+        .get(&id)
+        .and_then(|job| job["status"].as_str().map(str::to_string));
+    let Some(status) = status else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error":"job not found"}))).into_response();
+    };
+    // A terminal job's per-job knobs are reaped, so there is nothing live to
+    // report — 409 rather than a 404 that would read as "never existed".
+    if !matches!(status.as_str(), "queued" | "running" | "cancelling") {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"job is not active","status":status})),
+        )
+            .into_response();
+    }
+    match state.runtimes.read().await.get(&id).cloned() {
+        Some(runtime) => Json(runtime.view()).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(json!({"error":"job not found"}))).into_response(),
+    }
+}
+
 async fn set_job_runtime(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
