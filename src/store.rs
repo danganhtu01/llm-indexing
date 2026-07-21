@@ -80,7 +80,9 @@ pub const READ_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
 /// and OCR work a crash throws away. 100 buys durability for one extra fsync per
 /// 100 files — invisible next to per-file extraction cost — where the previous
 /// 500 could discard several minutes of OCR.
-const COMMIT_FILES: usize = 100;
+/// The DEFAULT batch; `Config::commit_batch` overrides it per deployment, and
+/// `default_commit_batch()` must equal this so an unset config is unchanged.
+pub const COMMIT_FILES: usize = 100;
 
 /// Ceiling on how long work can sit uncommitted when files are slow. Exhaustive
 /// OCR of a large PDF runs into minutes per file, so the count alone would leave
@@ -134,6 +136,12 @@ pub struct IndexStore {
     catalog: Option<csv::Writer<File>>,
     pending: usize,
     committed: Instant,
+    /// Files per batched commit — the throughput/durability lever. A larger
+    /// batch amortises the commit's fsync over more work (faster), at the cost of
+    /// re-doing more files if the job is killed mid-batch (which resume handles).
+    /// Sourced from config so an operator can raise it; `COMMIT_FILES` is the
+    /// default.
+    commit_batch: usize,
     /// Set when a per-file rollback itself failed, leaving the open transaction
     /// in an unknown state. `finish` then discards it instead of committing.
     poisoned: bool,
@@ -157,6 +165,15 @@ impl IndexStore {
         // of failing: without this a reader's shared lock can abort the writer's
         // COMMIT and fail the whole job.
         connection.busy_timeout(BUSY_TIMEOUT)?;
+        // Write durability. The default stays FULL — safe against a power loss
+        // mid-commit. An operator can opt into NORMAL (`sync_normal: true`),
+        // which skips some fsyncs for throughput; in rollback-journal mode that
+        // carries a small database-corruption risk on a power loss / hard reset,
+        // acceptable only because the corpus is regenerable and resumable. Left
+        // at the default here means every existing deployment is byte-unchanged.
+        if config.sync_normal {
+            connection.pragma_update(None, "synchronous", "NORMAL")?;
+        }
         connection
             .execute_batch(SCHEMA)
             .context("creating SQLite FTS5 schema")?;
@@ -207,6 +224,7 @@ impl IndexStore {
             catalog,
             pending: 0,
             committed: Instant::now(),
+            commit_batch: config.commit_batch.max(1),
             poisoned: false,
         })
     }
@@ -297,7 +315,7 @@ impl IndexStore {
         // here stops the run without invalidating what was stored.
         self.write_artifacts(file)?;
         self.pending += 1;
-        if self.pending >= COMMIT_FILES || self.committed.elapsed() >= COMMIT_INTERVAL {
+        if self.pending >= self.commit_batch || self.committed.elapsed() >= COMMIT_INTERVAL {
             self.commit()?;
         }
         Ok(())
@@ -760,6 +778,44 @@ mod tests {
             database_path(Path::new("/out")),
             PathBuf::from("/out/index.sqlite")
         );
+    }
+
+    #[test]
+    fn the_config_default_batch_matches_the_store_constant() {
+        // An unset config must behave exactly as before commit_batch was tunable:
+        // Config::default().commit_batch is default_commit_batch(), which must
+        // equal the store's own COMMIT_FILES default.
+        assert_eq!(Config::default().commit_batch, COMMIT_FILES);
+    }
+
+    #[test]
+    fn a_smaller_commit_batch_commits_sooner() {
+        // commit_batch=2 must durably commit after the 2nd file: a reader opening
+        // the file mid-run (before finish) sees the committed rows. Proves the
+        // setting reaches the writer's commit boundary rather than being ignored.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut config = off_config();
+        config.commit_batch = 2;
+        let mut store = IndexStore::open(&destination, &config, false, false).unwrap();
+        store.add(&sample_file("/a/1.txt"), 0.0).unwrap();
+        store.add(&sample_file("/a/2.txt"), 0.0).unwrap(); // 2nd file -> batch commits
+        store.add(&sample_file("/a/3.txt"), 0.0).unwrap(); // opens a new batch
+
+        // A SEPARATE read-only connection sees exactly the committed batch (2),
+        // not the third file still in the open transaction.
+        let committed: i64 = connect(&destination)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(committed, 2, "commit_batch=2 must commit after the 2nd file");
+
+        store.finish().unwrap();
+        let all: i64 = connect(&destination)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(all, 3, "finish flushes the trailing partial batch");
     }
 
     #[test]

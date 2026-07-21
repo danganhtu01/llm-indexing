@@ -32,6 +32,11 @@ fn default_sidecar() -> String {
 fn default_workers() -> usize {
     8
 }
+/// Default files per batched commit. Mirrors `store::COMMIT_FILES`; both must
+/// agree so an unset config behaves exactly as before this became tunable.
+fn default_commit_batch() -> usize {
+    100
+}
 /// Live embedder instances a job starts with. Small on purpose — each instance
 /// holds ~448 MB of weights (see [`crate::runtime::EMBED_RANGE`]) — and the pool
 /// only ever builds one lazily unless documents actually overlap.
@@ -500,6 +505,22 @@ pub struct Config {
     /// `None` means "whatever OpenMP would have picked", i.e. today's behaviour.
     #[serde(default)]
     pub ocr_threads: Option<usize>,
+    /// Files per batched SQLite commit — the writer throughput lever. Larger
+    /// batches amortise each commit's fsync over more work; the cost is re-doing
+    /// up to this many files if the job is killed mid-batch, which resume
+    /// recovers. Default 100. This is the safe way to speed up the single writer
+    /// (SQLite serialises all writes to one file — parallel writers are not
+    /// possible without sharding into multiple files).
+    #[serde(default = "default_commit_batch")]
+    pub commit_batch: usize,
+    /// Opt into `PRAGMA synchronous=NORMAL` for the corpus writer. Skips some
+    /// fsyncs for throughput; in rollback-journal mode this carries a small
+    /// database-corruption risk on a power loss / hard reset, so it defaults OFF
+    /// (FULL) and is only reasonable because the corpus is regenerable. Bigger
+    /// `commit_batch` is the risk-free lever; reach for this only when fsync
+    /// latency dominates and the corpus is cheap to rebuild.
+    #[serde(default)]
+    pub sync_normal: bool,
     #[serde(default = "default_max_bytes")]
     pub max_bytes: u64,
     #[serde(default = "default_max_chars")]
@@ -561,6 +582,8 @@ impl Default for Config {
             embed_workers: default_embed_workers(),
             embed_intra_threads: None,
             ocr_threads: None,
+            commit_batch: default_commit_batch(),
+            sync_normal: false,
             max_bytes: default_max_bytes(),
             max_chars: default_max_chars(),
             hash: false,
