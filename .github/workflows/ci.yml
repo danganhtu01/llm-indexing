@@ -12,7 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      # Keep in step with `rust-version` in Cargo.toml and the builder image in
+      # the Dockerfile (both 1.88). Pinned below the MSRV, this job could not
+      # even resolve dependencies — built@0.8.1 requires 1.87 and the icu_*
+      # crates require 1.86 — so `main` was red without any code being wrong.
+      - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
