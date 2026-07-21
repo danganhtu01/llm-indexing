@@ -12,10 +12,9 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tempfile::Builder;
 use tokio::sync::{mpsc, RwLock};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -26,7 +25,7 @@ use crate::settings::{
     installed_tessdata_langs, tessdata_sources, OcrSettings, VisionSettings, CAPTIONERS, DETECTORS,
     OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE, TAGGERS,
 };
-use crate::store::grouped;
+use crate::store::{grouped, journal_path, BUSY_TIMEOUT, READ_BUSY_TIMEOUT};
 use crate::vision::{
     available_tiers, captioner_present, corrupt_models, detector_present, missing_vision_prereqs,
     tagger_present, VisionMode,
@@ -453,9 +452,12 @@ async fn submit(State(state): State<AppState>, Json(mut request): Json<JobReques
             )
                 .into_response();
         }
+        // `output` rides along from the first record onward: it is how
+        // `/corpus/status` tells a reader that the database it is querying is
+        // being written into right now.
         jobs.insert(
             id.clone(),
-            json!({"id":id,"status":"queued","submitted_at":now()}),
+            json!({"id":id,"status":"queued","output":request.output,"submitted_at":now()}),
         );
     }
     state
@@ -550,9 +552,11 @@ async fn worker(
             );
             continue;
         }
+        let output = request.output.clone();
         jobs.write().await.insert(
             id.clone(),
-            json!({"id":id,"status":"running","processed":0,"total":0,"started_at":now()}),
+            json!({"id":id,"status":"running","output":output,"processed":0,"total":0,
+                   "started_at":now()}),
         );
         let run_config = config.clone();
         let job_id = id.clone();
@@ -568,16 +572,36 @@ async fn worker(
             )
         })
         .await;
+        // A cancelled job keeps every file it had already committed to the
+        // published database — there is no temporary build to discard and no
+        // earlier corpus to fall back to. Resubmitting with `resume` continues
+        // from exactly that point.
         let value = if cancellation.load(Ordering::Relaxed) {
-            json!({"id":id,"status":"cancelled","message":"indexing cancelled; previous atomic corpus preserved","completed_at":now()})
+            let message = format!(
+                "indexing cancelled; partial corpus retained in {output}, \
+                 resubmit with resume to continue"
+            );
+            json!({"id":id,"status":"cancelled","output":output,"message":message,
+                   "completed_at":now()})
         } else {
+            // A failed job is no longer a job that published nothing: it wrote
+            // into the destination as it went, so whatever it had committed is
+            // still there. Say so, and say what to do about it — a caller that
+            // resubmits blind gets "output already exists" and no explanation.
+            let partial = format!(
+                "{output} may hold the files this job committed before it failed; \
+                 resubmit with resume to continue or overwrite to start clean"
+            );
             match result {
                 Ok(Ok(value)) => value,
                 Ok(Err(error)) => {
-                    json!({"id":id,"status":"error","error":format!("{error:#}"),"completed_at":now()})
+                    json!({"id":id,"status":"error","output":output,"error":format!("{error:#}"),
+                           "partial_corpus":partial,"completed_at":now()})
                 }
                 Err(error) => {
-                    json!({"id":id,"status":"error","error":format!("worker join: {error}"),"completed_at":now()})
+                    json!({"id":id,"status":"error","output":output,
+                           "error":format!("worker join: {error}"),
+                           "partial_corpus":partial,"completed_at":now()})
                 }
             }
         };
@@ -625,12 +649,19 @@ fn run_job(
     if destination.exists() && !request.resume && !request.overwrite {
         anyhow::bail!("output already exists; set resume or overwrite")
     }
-    let work = Builder::new()
-        .prefix(".indexing-")
-        .tempdir_in(&service.output_root)?;
-    if request.resume && destination.exists() {
-        fs::copy(&destination, work.path().join("index.sqlite"))?;
-    }
+    // The job writes straight into the published database so that work survives
+    // a crash and `resume` can continue from it. `overwrite` therefore deletes
+    // rather than swapping a finished build in at the end: the previous corpus
+    // cannot be held as a fallback while its replacement is written into the
+    // same file. `resume` wins when both are set — it exists precisely to keep
+    // what is there. An interrupted overwrite leaves a partial NEW corpus,
+    // resumable with `resume`, not the superseded one.
+    //
+    // The deletion itself is deferred to `run_index`, which performs it only
+    // once the config, the vision models and the embedding model have all
+    // loaded. A job that is going to fail on a missing model or a bad config
+    // must fail with the old corpus still on disk.
+    let overwrite = request.overwrite && !request.resume;
     let mut config = Config::load(service.config_path.as_deref())?;
     config.ocr = request.ocr;
     config.ocr_langs = request
@@ -676,9 +707,10 @@ fn run_job(
     let progress_id = id.to_owned();
     let stats = run_index(IndexRequest {
         paths: &paths,
-        out: work.path(),
+        out: &destination,
         config: config.clone(),
         resume: request.resume,
+        overwrite,
         artifacts: false,
         include_paths,
         cancellation: Some(cancellation),
@@ -690,10 +722,8 @@ fn run_job(
             }
         })),
     })?;
-    let database = work.path().join("index.sqlite");
-    fs::rename(database, &destination)?;
     Ok(json!({
-        "id":id,"status":"complete","database":destination,"files":stats.files,
+        "id":id,"status":"complete","output":request.output,"database":destination,"files":stats.files,
         "ocr_files":stats.ocr_files,"errors":stats.errors,"skipped":stats.skipped,
         "incomplete":stats.incomplete,"embedded_chunks":stats.embedded_chunks,"removed":stats.removed,
         "vision_files":stats.vision_files,"vision":config.vision.max.as_str(),
@@ -748,11 +778,12 @@ fn valid_output_name(name: &str) -> bool {
 
 // ── Corpus read surface (GET /corpus/tree, /corpus/documents/{id}/text, /corpus/status) ──
 //
-// READ-ONLY over whatever `corpus.sqlite` the most recent job published.
-// Consumer apps used to open the SQLite file directly; this surface lets them
-// stop decoding the schema themselves. The database is absent until the first
-// job completes — every route below degrades to an empty/zeroed result rather
-// than an error.
+// READ-ONLY over whatever `corpus.sqlite` the most recent job wrote. Consumer
+// apps used to open the SQLite file directly; this surface lets them stop
+// decoding the schema themselves. The database is absent until the first job
+// writes it — every route below degrades to an empty/zeroed result rather than
+// an error — and, since jobs write in place, it can be read mid-run and answer
+// from the rows committed so far.
 
 #[derive(Debug, Deserialize)]
 struct TreeQuery {
@@ -785,12 +816,142 @@ fn resolve_output(
     Ok(state.output_root.join(name))
 }
 
-/// Open a corpus database read-only; `None` when it is absent or unreadable.
-fn open_ro(path: &Path) -> Option<Connection> {
+/// The three states a corpus can be in when a read arrives. `Absent` and
+/// `Unreadable` must never collapse into each other: "no job has written this
+/// output yet" and "the database is there but its rows cannot be read" look
+/// identical to a consumer that is handed a zero either way, and the second is
+/// a fault it needs to see rather than act on.
+enum Corpus {
+    Absent,
+    Ready(Connection),
+    /// A writer holds the database. Distinct from `Unreadable`: the corpus is
+    /// healthy and the caller should retry, not treat this as a fault.
+    Busy,
+    Unreadable(String),
+}
+
+/// Open a corpus database read-only.
+///
+/// Two failure modes look alike here and must not be conflated. A writer
+/// spilling its page cache escalates to an EXCLUSIVE lock and holds it until
+/// the batch commit, which surfaces as `SQLITE_BUSY` — the database is fine.
+/// A writer *killed* mid-transaction leaves a hot rollback journal, which a
+/// read-only connection cannot replay (SQLite refuses the database rather than
+/// serve pages the journal is about to undo) — only that one needs recovery.
+/// Reporting a locked corpus as unreadable would signal corruption during
+/// ordinary indexing, i.e. exactly the read-while-writing case that writing in
+/// place exists to enable.
+fn open_ro(path: &Path) -> Corpus {
     if !path.exists() {
-        return None;
+        return Corpus::Absent;
     }
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
+    match read_only(path) {
+        Ok(connection) => Corpus::Ready(connection),
+        Err(error) if is_busy(&error) => Corpus::Busy,
+        // Only a read-write open can roll a hot journal back, so do that here
+        // and retry, rather than leaving the corpus unreadable until the next
+        // job happens to run. A retry that is merely locked is still Busy.
+        Err(_) => match recover_journal(path).and_then(|()| read_only(path)) {
+            Ok(connection) => Corpus::Ready(connection),
+            Err(error) if is_busy(&error) => Corpus::Busy,
+            Err(error) => Corpus::Unreadable(error.to_string()),
+        },
+    }
+}
+
+/// Whether a failure means "someone else holds the lock" rather than "this
+/// database cannot be read".
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy) | Some(rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Open read-only and touch the schema. The probe is the point: SQLite defers
+/// real access until the first statement, so a database that cannot be read —
+/// hot journal, corruption, bad permissions — would otherwise open cleanly here
+/// and fail later where the failure is easier to swallow.
+///
+/// Reads take a much shorter busy timeout than the writer's: something polling
+/// `/corpus/status` during a long index wants a prompt "busy, retry" far more
+/// than it wants to block for the writer's whole commit window.
+fn read_only(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(READ_BUSY_TIMEOUT)?;
+    connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    Ok(connection)
+}
+
+/// Roll back a journal left behind by an interrupted writer, by opening
+/// read-write long enough for SQLite to notice it. Recovery is what the writer
+/// itself would have done on its next open; doing it here means a killed job
+/// does not leave the corpus unreadable to every consumer in the meantime.
+fn recover_journal(path: &Path) -> Result<(), rusqlite::Error> {
+    if !journal_path(path).exists() {
+        return Ok(());
+    }
+    let connection = Connection::open(path)?;
+    connection.busy_timeout(BUSY_TIMEOUT)?;
+    connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    Ok(())
+}
+
+/// Why a corpus read could not be served. Kept apart from a plain string so a
+/// contended database is never reported as a damaged one.
+enum ReadError {
+    /// A writer holds the lock. Healthy corpus, retryable.
+    Busy,
+    Unreadable(String),
+}
+
+impl From<rusqlite::Error> for ReadError {
+    fn from(error: rusqlite::Error) -> Self {
+        if is_busy(&error) {
+            ReadError::Busy
+        } else {
+            ReadError::Unreadable(error.to_string())
+        }
+    }
+}
+
+impl From<anyhow::Error> for ReadError {
+    /// Store helpers return anyhow; downcast so a lock contention arriving
+    /// through one of them is still classified as busy rather than damaged.
+    fn from(error: anyhow::Error) -> Self {
+        match error.downcast_ref::<rusqlite::Error>() {
+            Some(sqlite) if is_busy(sqlite) => ReadError::Busy,
+            _ => ReadError::Unreadable(error.to_string()),
+        }
+    }
+}
+
+/// A corpus that exists but cannot be read is a fault to report, not an empty
+/// result to return — but a corpus someone is *writing* is neither. Both are
+/// 503, and the body is the difference: one says retry, the other says broken.
+fn read_error(error: &ReadError) -> Response {
+    let body = match error {
+        ReadError::Busy => json!({
+            "error": "corpus database busy",
+            "detail": "a job is writing this corpus; retry shortly",
+            "retryable": true,
+        }),
+        ReadError::Unreadable(detail) => json!({
+            "error": "corpus database unreadable",
+            "detail": detail,
+            "retryable": false,
+        }),
+    };
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+}
+
+/// A read task that failed to run at all (join error) is a service fault.
+fn unreadable(detail: &str) -> Response {
+    read_error(&ReadError::Unreadable(detail.to_string()))
 }
 
 struct DocMeta {
@@ -804,32 +965,38 @@ struct DocMeta {
 /// One row per indexed file, keyed by its absolute path (`files.path`), which
 /// is exactly how the tree walk below reconstructs each entry's path — an
 /// exact join, unlike a by-name join that can collide across directories.
-fn corpus_index(path: &Path) -> HashMap<String, DocMeta> {
-    let Some(connection) = open_ro(path) else {
-        return HashMap::new();
+/// `Ok` of an empty map means the corpus holds no documents (or none has been
+/// written yet); a query that genuinely failed is an `Err`, never an empty map.
+fn corpus_index(path: &Path) -> Result<HashMap<String, DocMeta>, ReadError> {
+    let connection = match open_ro(path) {
+        Corpus::Absent => return Ok(HashMap::new()),
+        Corpus::Ready(connection) => connection,
+        Corpus::Busy => return Err(ReadError::Busy),
+        Corpus::Unreadable(error) => return Err(ReadError::Unreadable(error)),
     };
-    let Ok(mut statement) = connection.prepare(
-        "SELECT f.path, f.id, COALESCE(f.chars,0), COALESCE(f.method,''), COALESCE(f.lang,''), \
-                COALESCE(substr(fts.content,1,400),'') \
-         FROM files f JOIN fts ON fts.rowid = f.id",
-    ) else {
-        return HashMap::new();
-    };
-    let Ok(rows) = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            DocMeta {
-                id: row.get(1)?,
-                character_count: row.get(2)?,
-                method: row.get(3)?,
-                lang: row.get(4)?,
-                snippet: row.get(5)?,
-            },
-        ))
-    }) else {
-        return HashMap::new();
-    };
-    rows.flatten().collect()
+    let mut statement = connection
+        .prepare(
+            "SELECT f.path, f.id, COALESCE(f.chars,0), COALESCE(f.method,''), COALESCE(f.lang,''), \
+                    COALESCE(substr(fts.content,1,400),'') \
+             FROM files f JOIN fts ON fts.rowid = f.id",
+        )
+        ?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                DocMeta {
+                    id: row.get(1)?,
+                    character_count: row.get(2)?,
+                    method: row.get(3)?,
+                    lang: row.get(4)?,
+                    snippet: row.get(5)?,
+                },
+            ))
+        })
+        ?;
+    rows.collect::<Result<HashMap<_, _>, _>>()
+        .map_err(ReadError::from)
 }
 
 /// GET /corpus/tree?root=NAME[&output=corpus.sqlite]
@@ -851,19 +1018,20 @@ async fn corpus_tree(State(state): State<AppState>, Query(query): Query<TreeQuer
         Ok(path) => path,
         Err(response) => return response.into_response(),
     };
-    let entries = tokio::task::spawn_blocking(move || tree_entries(&root, &output))
-        .await
-        .unwrap_or_default();
-    Json(entries).into_response()
+    match tokio::task::spawn_blocking(move || tree_entries(&root, &output)).await {
+        Ok(Ok(entries)) => Json(entries).into_response(),
+        Ok(Err(error)) => read_error(&error),
+        Err(error) => unreadable(&format!("read task failed: {error}")),
+    }
 }
 
-fn tree_entries(root: &Path, corpus_db: &Path) -> Vec<Value> {
-    let index = corpus_index(corpus_db);
+fn tree_entries(root: &Path, corpus_db: &Path) -> Result<Vec<Value>, ReadError> {
+    let index = corpus_index(corpus_db)?;
     let mut rows = Vec::new();
     if root.is_dir() {
         let _ = collect_tree(root, root, 0, &index, &mut rows);
     }
-    rows
+    Ok(rows)
 }
 
 fn collect_tree(
@@ -944,13 +1112,18 @@ async fn corpus_document_text(
         Ok(path) => path,
         Err(response) => return response.into_response(),
     };
-    let text = tokio::task::spawn_blocking(move || document_text(&output, id)).await;
-    let Ok(Some(content)) = text else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error":"document not found"})),
-        )
-            .into_response();
+    let content = match tokio::task::spawn_blocking(move || document_text(&output, id)).await {
+        Ok(Ok(Some(content))) => content,
+        // Only a corpus that was actually readable can say "no such document".
+        Ok(Ok(None)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"document not found"})),
+            )
+                .into_response()
+        }
+        Ok(Err(error)) => return read_error(&error),
+        Err(error) => return unreadable(&format!("read task failed: {error}")),
     };
     Response::builder()
         .status(StatusCode::OK)
@@ -965,15 +1138,21 @@ async fn corpus_document_text(
         })
 }
 
-fn document_text(corpus_db: &Path, id: i64) -> Option<String> {
-    let connection = open_ro(corpus_db)?;
+fn document_text(corpus_db: &Path, id: i64) -> Result<Option<String>, ReadError> {
+    let connection = match open_ro(corpus_db) {
+        Corpus::Absent => return Ok(None),
+        Corpus::Ready(connection) => connection,
+        Corpus::Busy => return Err(ReadError::Busy),
+        Corpus::Unreadable(error) => return Err(ReadError::Unreadable(error)),
+    };
     connection
         .query_row(
             "SELECT fts.content FROM files f JOIN fts ON fts.rowid = f.id WHERE f.id = ?1",
             params![id],
             |row| row.get(0),
         )
-        .ok()
+        .optional()
+        .map_err(ReadError::from)
 }
 
 /// GET /corpus/status[?output=corpus.sqlite]
@@ -988,38 +1167,58 @@ async fn corpus_status_handler(
         Ok(path) => path,
         Err(response) => return response.into_response(),
     };
-    let value = tokio::task::spawn_blocking(move || corpus_status(&output))
-        .await
-        .unwrap_or_else(|_| empty_status());
-    Json(value).into_response()
+    // Jobs write into the published database as they go, so a corpus can be
+    // read while it is still being built. Nothing about the rows themselves
+    // says so, and the atomic-publish guarantee that used to make a visible
+    // corpus a finished one is gone, so report it explicitly.
+    let writing = writing_output(&state, &output).await;
+    match tokio::task::spawn_blocking(move || corpus_status(&output)).await {
+        Ok(Ok(mut value)) => {
+            value["writing"] = json!(writing);
+            Json(value).into_response()
+        }
+        Ok(Err(error)) => read_error(&error),
+        Err(error) => unreadable(&format!("read task failed: {error}")),
+    }
 }
 
-fn corpus_status(path: &Path) -> Value {
-    let Some(connection) = open_ro(path) else {
-        return empty_status();
+/// Whether a queued, running or cancelling job is targeting this database.
+async fn writing_output(state: &AppState, output: &Path) -> bool {
+    let Some(name) = output.file_name().and_then(|name| name.to_str()) else {
+        return false;
     };
-    let indexed_files: i64 = connection
-        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-        .unwrap_or(0);
-    let total_characters: i64 = connection
-        .query_row("SELECT COALESCE(SUM(chars),0) FROM files", [], |r| r.get(0))
-        .unwrap_or(0);
-    let total_bytes: i64 = connection
-        .query_row("SELECT COALESCE(SUM(size),0) FROM files", [], |r| r.get(0))
-        .unwrap_or(0);
-    let ocr_files: i64 = connection
-        .query_row("SELECT COALESCE(SUM(ocr_used),0) FROM files", [], |r| {
-            r.get(0)
-        })
-        .unwrap_or(0);
-    json!({
-        "indexed_files": indexed_files,
-        "total_characters": total_characters,
-        "total_bytes": total_bytes,
-        "ocr_files": ocr_files,
-        "languages": grouped(&connection, "lang", 10).unwrap_or_default(),
-        "methods": grouped(&connection, "method", 20).unwrap_or_default(),
+    state.jobs.read().await.values().any(|job| {
+        job["output"].as_str() == Some(name)
+            && matches!(
+                job["status"].as_str(),
+                Some("queued" | "running" | "cancelling")
+            )
     })
+}
+
+/// Aggregates over one corpus. Every count is read or the whole call fails:
+/// `unwrap_or(0)` here would answer "0 files" over a database holding every row
+/// a consumer has, which reads as an empty corpus rather than a failed read.
+fn corpus_status(path: &Path) -> Result<Value, ReadError> {
+    let connection = match open_ro(path) {
+        Corpus::Absent => return Ok(empty_status()),
+        Corpus::Ready(connection) => connection,
+        Corpus::Busy => return Err(ReadError::Busy),
+        Corpus::Unreadable(error) => return Err(ReadError::Unreadable(error)),
+    };
+    let count = |sql: &str| -> Result<i64, ReadError> {
+        connection
+            .query_row(sql, [], |row| row.get(0))
+            .map_err(ReadError::from)
+    };
+    Ok(json!({
+        "indexed_files": count("SELECT COUNT(*) FROM files")?,
+        "total_characters": count("SELECT COALESCE(SUM(chars),0) FROM files")?,
+        "total_bytes": count("SELECT COALESCE(SUM(size),0) FROM files")?,
+        "ocr_files": count("SELECT COALESCE(SUM(ocr_used),0) FROM files")?,
+        "languages": grouped(&connection, "lang", 10)?,
+        "methods": grouped(&connection, "method", 20)?,
+    }))
 }
 
 fn empty_status() -> Value {
@@ -1063,7 +1262,9 @@ fn now() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_settings, requested_paths, root_name, valid_output_name};
+    use super::{
+        build_settings, read_only, requested_paths, root_name, valid_output_name, Corpus,
+    };
     use crate::config::{Config, MAX_WORKERS};
     use crate::settings::{
         OcrSettings, VisionSettings, OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE,
@@ -1077,6 +1278,127 @@ mod tests {
         let path = dir.join("config.yaml");
         std::fs::write(&path, "data_dir: .\n").unwrap();
         path
+    }
+
+    /// Reproduce what a writer killed mid-transaction leaves on disk: a
+    /// database plus the rollback journal describing the transaction that never
+    /// finished. Copying both out from under a live transaction gives a pair no
+    /// connection holds locks on, which is exactly the state SQLite calls hot.
+    fn corpus_with_hot_journal(directory: &Path) -> std::path::PathBuf {
+        let source = directory.join("source.sqlite");
+        let connection = rusqlite::Connection::open(&source).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT);
+                 INSERT INTO files(id,path) VALUES (1,'/a/committed.txt');",
+            )
+            .unwrap();
+        // A tiny page cache forces the open transaction to spill to disk, which
+        // is what actually writes the journal header and dirties the database.
+        // Without a spill nothing has left the cache, the journal is inert, and
+        // the pair copied below would not be the hot state this test is about.
+        connection.execute_batch("PRAGMA cache_size = 10").unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for id in 2..400 {
+            connection
+                .execute(
+                    "INSERT INTO files(id,path) VALUES (?1,?2)",
+                    rusqlite::params![id, format!("/a/mid_{id}_{}", "x".repeat(600))],
+                )
+                .unwrap();
+        }
+
+        let killed = directory.join("killed.sqlite");
+        std::fs::copy(&source, &killed).unwrap();
+        std::fs::copy(
+            crate::store::journal_path(&source),
+            crate::store::journal_path(&killed),
+        )
+        .unwrap();
+        drop(connection);
+        killed
+    }
+
+    #[test]
+    fn a_hot_journal_is_recovered_rather_than_served_as_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let killed = corpus_with_hot_journal(temp.path());
+        // The premise: a read-only connection cannot replay a journal, so this
+        // is the state in which the corpus routes used to answer "0 files".
+        assert!(
+            read_only(&killed).is_err(),
+            "a hot journal must defeat a plain read-only open"
+        );
+
+        let Corpus::Ready(connection) = super::open_ro(&killed) else {
+            panic!("a hot journal should be recovered on open")
+        };
+        // Recovery rolls the unfinished transaction back: what was committed
+        // before the writer died is there, what it was mid-way through is not.
+        let paths: Vec<String> = connection
+            .prepare("SELECT path FROM files ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(paths, vec!["/a/committed.txt".to_string()]);
+        assert!(
+            !crate::store::journal_path(&killed).exists(),
+            "recovery clears the journal"
+        );
+    }
+
+    /// The read-while-writing case in-place writing exists to enable: a healthy
+    /// corpus under an active writer must read as BUSY (retry), never as
+    /// unreadable, which would signal corruption during ordinary indexing.
+    #[test]
+    fn a_locked_corpus_reads_as_busy_not_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("locked.sqlite");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch("CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT);")
+            .unwrap();
+        // Hold the lock the way a batch commit does, forcing the page cache to
+        // spill so the lock escalates past RESERVED to EXCLUSIVE.
+        writer.execute_batch("PRAGMA cache_size = 10").unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for id in 1..400 {
+            writer
+                .execute(
+                    "INSERT INTO files(id,path) VALUES (?1,?2)",
+                    rusqlite::params![id, format!("/a/f_{id}_{}", "x".repeat(600))],
+                )
+                .unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let state = super::open_ro(&path);
+        let elapsed = started.elapsed();
+        match state {
+            Corpus::Busy => {}
+            Corpus::Unreadable(error) => {
+                panic!("a writer's lock must not be reported as damage: {error}")
+            }
+            Corpus::Ready(_) => panic!("the writer holds an exclusive lock"),
+            Corpus::Absent => panic!("the database exists"),
+        }
+        // Classifying it correctly is only half the fix. Falling through to
+        // journal recovery — a read-write open the same writer also blocks —
+        // costs a second full timeout, so a status poll during indexing hangs
+        // for a minute before answering. Busy must be recognised on the FIRST
+        // probe, bounding this by READ_BUSY_TIMEOUT rather than two
+        // writer-length waits. Without that, this takes ~47s.
+        assert!(
+            elapsed < crate::store::BUSY_TIMEOUT,
+            "a locked corpus must be reported promptly, took {elapsed:?}"
+        );
+
+        // The same corpus reads normally once the writer is done.
+        writer.execute_batch("COMMIT").unwrap();
+        drop(writer);
+        assert!(matches!(super::open_ro(&path), Corpus::Ready(_)));
     }
 
     #[test]

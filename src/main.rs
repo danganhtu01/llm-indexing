@@ -312,6 +312,7 @@ fn index(args: IndexArgs) -> Result<()> {
         out: &args.out,
         config,
         resume: args.resume,
+        overwrite: false,
         artifacts: true,
         include_paths: None,
         cancellation: None,

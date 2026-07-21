@@ -22,8 +22,9 @@ this component.
 - English stemming, Vietnamese segmentation, abbreviation expansion and
   diacritic-insensitive FTS5 search
 - 384-dimensional `multilingual-e5-small` embeddings and cosine vector search
-- Resume/change detection, removal pruning, authentic incomplete/error counts,
-  folder aggregation, manifests, reports and optional sidecars
+- Crash-safe batched writes, resume/change detection, removal pruning, authentic
+  incomplete/error counts, folder aggregation, manifests, reports and optional
+  sidecars
 - Bounded HTTP job queue with input/output path confinement, live per-file
   counters and cooperative cancellation
 - Optional local vision analysis of photos/video (EXIF, perceptual hash,
@@ -133,13 +134,25 @@ compatibility notes and performance/security details:
 
 Native mode writes `index.sqlite`, `manifest.jsonl`, `catalog.csv`, analysis
 reports and optional sidecars. Service mode publishes only the requested SQLite
-database after a successful job.
+database.
+
+Both write into that database as they go, committing every 100 files or 30
+seconds, so a crashed, killed or cancelled run keeps everything it finished and
+`resume` continues from there instead of restarting. Each file is written under
+its own savepoint, so a partially written file is rolled back rather than
+published half-indexed. The corollary of writing in place: an interrupted job
+leaves a partial corpus rather than the previous one, and `overwrite` deletes
+the existing database — after loading its config and models, so a job that is
+going to fail on a missing model or a bad config fails with the old corpus still
+intact, but irreversibly once indexing has begun.
 
 Resume uses path, size and mtime and also repairs records missing vectors or
 marked partial/error. It reprocesses older PDF methods when exhaustive OCR is
 requested. Source files removed from the mounted tree are pruned from `files`,
-FTS and vector chunks. The job result reports `incomplete`, `embedded_chunks`
-and `removed`, allowing callers to show authentic state.
+FTS and vector chunks — unless the walk found no files at all, which is treated
+as an unmounted or mistyped root rather than an instruction to empty the corpus.
+The job result reports `incomplete`, `embedded_chunks` and `removed`, allowing
+callers to show authentic state.
 
 Service callers may additionally provide a confined `include_paths` list of
 relative file paths. The engine still scans the mounted tree to prune deletions,
