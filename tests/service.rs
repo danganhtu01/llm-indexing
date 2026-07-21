@@ -374,6 +374,16 @@ async fn get_json(app: &axum::Router, uri: &str) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// A GET that keeps the status code, for the error-path assertions.
+async fn get_json_status(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
+    let response = get(app, uri).await;
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
 #[tokio::test]
 async fn corpus_tree_rejects_an_unknown_root() {
     let temp = tempfile::tempdir().unwrap();
@@ -914,9 +924,45 @@ async fn retuning_a_running_job_hits_that_job_and_leaves_the_defaults_alone() {
         "a per-job retune must not leak into the process-wide defaults"
     );
 
+    // GET /jobs/{id}/runtime reads back the job's OWN live value (4), while the
+    // process-wide GET still reports the default (1). Without this readback a
+    // caller had no way to confirm a retune stuck — every later read showed the
+    // default, which is indistinguishable from the setting being lost.
+    let per_job = get_json(&app, "/jobs/live/runtime").await;
+    assert_eq!(
+        per_job["stages"]["extract"]["value"],
+        json!(4),
+        "the per-job GET must report the job's retuned value, not the default"
+    );
+
     let job = wait_for_job(&app, "live").await;
     assert_eq!(job["status"], "complete", "{job}");
     assert_eq!(job["files"], json!(40), "retuning must not lose files");
+}
+
+/// GET on a job that never existed is 404; on a finished one it is 409 (its
+/// per-job knobs are reaped), never a 404 that would read as "never ran".
+#[tokio::test]
+async fn per_job_runtime_get_rejects_unknown_and_terminal_jobs() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    sample_corpus(&input, 4);
+    let app = runtime_app(&input, &temp.path().join("output"));
+
+    let (status, _) = get_json_status(&app, "/jobs/nope/runtime").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = post_json(
+        &app,
+        "/index",
+        json!({"id":"done","paths":[input],"output":"corpus.sqlite","ocr":"off"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let job = wait_for_job(&app, "done").await;
+    assert_eq!(job["status"], "complete", "{job}");
+    let (status, _) = get_json_status(&app, "/jobs/done/runtime").await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 #[tokio::test]

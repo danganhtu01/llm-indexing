@@ -5,6 +5,16 @@ languages: [vi, en]          # languages to index/normalize for
 ocr: auto                    # auto | on | off | exhaustive
 sidecar: mirror              # mirror | inplace | none
 workers: 8                   # parallel extraction threads
+# SQLite writer throughput. All writes go through ONE writer (SQLite serialises
+# writes to a single file — parallel writers need sharding into multiple files,
+# which this engine does not do). The safe lever is the commit batch: more files
+# per commit amortises the fsync, at the cost of re-doing up to that many files
+# if the job is killed mid-batch (resume recovers them).
+commit_batch: 100            # files per batched commit (higher = fewer fsyncs = faster)
+# Opt into PRAGMA synchronous=NORMAL: skips some fsyncs for throughput, but in
+# rollback-journal mode risks corruption on a power loss / hard reset. OFF (FULL)
+# by default; only reasonable because the corpus is regenerable and resumable.
+sync_normal: false
 max_bytes: 104857600         # 100 MB: files larger than this are indexed by name only
 max_chars: 1000000           # cap extracted characters per file
 hash: false                  # compute sha1 (slower); false = use size+mtime as change key
