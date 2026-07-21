@@ -32,7 +32,20 @@ pub struct Embedder {
 }
 
 impl Embedder {
+    /// Build with the config's own intra-op width — see
+    /// [`Config::resolved_embed_intra_threads`].
     pub fn new(config: &Config) -> Result<Self> {
+        Self::with_intra_threads(config, config.resolved_embed_intra_threads())
+    }
+
+    /// Build with an explicit ONNX intra-op thread count.
+    ///
+    /// This is where the `embed_intra_threads` knob stops being live: ort bakes
+    /// `intra_threads` into the `Session` here, at construction. Changing the
+    /// setting therefore affects only instances built AFTER the change, which is
+    /// what `GET /runtime` reports (`live: false`, `applies:
+    /// next-embedder-instance`) rather than pretending otherwise.
+    pub fn with_intra_threads(config: &Config, intra_threads: usize) -> Result<Self> {
         if config.embedding_model != EMBEDDING_MODEL {
             anyhow::bail!("unsupported embedding model {}", config.embedding_model)
         }
@@ -40,7 +53,7 @@ impl Embedder {
             TextInitOptions::new(EmbeddingModel::MultilingualE5Small)
                 .with_cache_dir(config.embedding_cache.clone())
                 .with_show_download_progress(false)
-                .with_intra_threads(config.workers.clamp(1, 8)),
+                .with_intra_threads(intra_threads.clamp(1, 8)),
         )
         .context("loading multilingual embedding model")?;
         Ok(Self { model })

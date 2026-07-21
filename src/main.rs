@@ -316,6 +316,7 @@ fn index(args: IndexArgs) -> Result<()> {
         artifacts: true,
         include_paths: None,
         cancellation: None,
+        runtime: None,
         progress: None,
     })?;
     println!("{}", serde_json::to_string_pretty(&stats)?);
