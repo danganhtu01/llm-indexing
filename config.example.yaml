@@ -24,11 +24,23 @@ embedding_cache: models/fastembed
 embedding_model: intfloat/multilingual-e5-small
 
 # Skip rules
+#
+# skip_dirs matches a bare directory BASENAME anywhere in the tree. Use it for
+# names that are junk wherever they appear (node_modules, __pycache__). Do NOT
+# use it for OS locations: "Windows" as a basename also drops a user folder
+# called Windows. Use skip_paths for those.
 skip_dirs:
   - "$RECYCLE.BIN"
   - "System Volume Information"
   - ".git"
   - "$WinREAgent"
+  # A WINDOWS build's compiled defaults leave this out, using the anchored
+  # "?:/Windows" rule below instead. It stays in this FILE because setting
+  # skip_dirs at all REPLACES the defaults on every platform: dropping it here
+  # would take away the only OS-tree exclusion a Linux operator copying this
+  # file has, since every skip_paths rule is "?:"-anchored to a drive letter and
+  # can never match a POSIX path. On Windows, prefer deleting this line and
+  # uncommenting skip_paths, which does not over-match a user folder.
   - "Windows"
   - "node_modules"
   - "index_out"        # never index our own output
@@ -36,6 +48,49 @@ skip_dirs:
   - "venv"
   - "site-packages"
   - "__pycache__"
+
+# skip_paths matches a directory's FULL PATH, case-insensitively, as a whole —
+# a hit prunes that directory and everything under it. "*" matches within one
+# segment and never crosses a separator; a leading "?:" matches any drive
+# letter; "/" and "\" are interchangeable.
+#
+# Left COMMENTED OUT on purpose: the right list for the platform is already the
+# compiled default, so uncommenting either block unchanged buys nothing.
+# Uncomment only to CHANGE the set — an explicit list REPLACES the defaults
+# rather than extending them, and it replaces them on every platform, so a list
+# written for one OS silently disarms the other.
+#
+# Windows defaults. Only the AppData segment of a profile is excluded —
+# Documents, Desktop and the rest of C:\Users\<name> are still indexed.
+# skip_paths:
+#   - "?:/Windows"
+#   - "?:/Program Files"
+#   - "?:/Program Files (x86)"
+#   - "?:/ProgramData"
+#   - "?:/Users/*/AppData"
+#   - "?:/$WinREAgent"
+#   - "?:/Recovery"
+#   - "?:/PerfLogs"
+#   - "?:/System Volume Information"
+#   - "?:/$Recycle.Bin"
+#
+# Linux defaults. These are not just noise: /proc/kcore is a regular file
+# reporting the machine's entire address space (~128 TB apparent) and
+# /proc/<pid> regenerates as processes come and go, so indexing / without them
+# walks a tree with no fixed size and no end.
+#
+# /tmp, /var/log, /opt and /usr are deliberately NOT excluded — they hold real
+# content often enough that excluding them by default would be worse than the
+# noise. Add them here if your deployment wants them gone.
+# skip_paths:
+#   - "/proc"
+#   - "/sys"
+#   - "/dev"
+#   - "/run"
+#   - "/snap"
+#   - "/var/lib/docker"
+#   - "/var/lib/containers"
+#   - "/lost+found"
 skip_exts:                   # never open for content (still indexed by name)
   - ".sys"
   - ".dll"

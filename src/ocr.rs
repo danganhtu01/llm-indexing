@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use tempfile::TempDir;
 
 use crate::config::Config;
+use crate::runtime::RuntimeKnobs;
 
 /// Tesseract driver. Prefers the bundled `tessdata_best` LSTM models (fetched
 /// into `<data_dir>/tessdata` at image build) over the distribution's fast
@@ -17,6 +19,11 @@ pub struct TesseractOcr {
     psm: String,
     tessdata: Option<PathBuf>,
     preprocess_cmd: Option<String>,
+    /// Live stage settings, consulted at SPAWN TIME rather than captured here,
+    /// so retuning `ocr` mid-job lands on the next file. `None` (the CLI and
+    /// probe paths) keeps the pre-existing behaviour of not setting
+    /// `OMP_THREAD_LIMIT` at all.
+    runtime: Option<Arc<RuntimeKnobs>>,
 }
 
 impl TesseractOcr {
@@ -83,7 +90,15 @@ impl TesseractOcr {
             psm: config.ocr_psm.clone(),
             tessdata,
             preprocess_cmd,
+            runtime: None,
         }
+    }
+
+    /// Attach live stage settings. The handle keeps the [`Arc`], not the value,
+    /// so every spawn re-reads the current `ocr` setting.
+    pub fn with_runtime(mut self, runtime: Arc<RuntimeKnobs>) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 
     /// The page-segmentation mode this handle drives tesseract with. Per-job
@@ -108,6 +123,20 @@ impl TesseractOcr {
         self.run_tesseract(input, "6")
     }
 
+    /// `OMP_THREAD_LIMIT` for the NEXT tesseract spawn, or `None` to leave the
+    /// environment alone.
+    ///
+    /// Resolved per call rather than cached on the handle, which is precisely
+    /// what makes the `ocr` stage live: tesseract is spawned once per file, so
+    /// re-reading here means a change applies to the next file with no restart
+    /// of the job, the pool, or the process. Caching it at construction — the
+    /// obvious simplification — would silently demote this to a next-job knob.
+    fn omp_thread_limit(&self) -> Option<String> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.ocr().to_string())
+    }
+
     fn run_tesseract(&self, path: &Path, psm: &str) -> String {
         let mut command = Command::new(&self.command);
         command
@@ -116,6 +145,9 @@ impl TesseractOcr {
             .args(["-l", &self.langs, "--oem", "1", "--psm", psm]);
         if let Some(dir) = &self.tessdata {
             command.env("TESSDATA_PREFIX", dir);
+        }
+        if let Some(limit) = self.omp_thread_limit() {
+            command.env("OMP_THREAD_LIMIT", limit);
         }
         match command.output() {
             Ok(output) if output.status.success() => {
@@ -135,6 +167,11 @@ impl TesseractOcr {
                 String::new()
             }
         }
+    }
+
+    #[cfg(test)]
+    fn thread_limit_for_test(&self) -> Option<String> {
+        self.omp_thread_limit()
     }
 
     /// Grayscale + deskew + contrast-stretch into a temp PNG. Failures fall
@@ -166,5 +203,69 @@ impl TesseractOcr {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::RuntimeKnobs;
+    use serde_json::{json, Map, Value};
+
+    fn apply(runtime: &RuntimeKnobs, body: Value) {
+        let map: Map<String, Value> = body.as_object().expect("object").clone();
+        runtime.apply(&map).expect("valid stage");
+    }
+
+    #[test]
+    fn without_runtime_the_ocr_environment_is_untouched() {
+        // The CLI and the `GET /settings` probe build handles this way. Setting
+        // OMP_THREAD_LIMIT unconditionally would silently change how every
+        // existing deployment's tesseract parallelises.
+        let ocr = TesseractOcr::new(&Config::default());
+        assert_eq!(ocr.thread_limit_for_test(), None);
+    }
+
+    #[test]
+    fn the_ocr_thread_limit_is_re_read_for_every_spawn() {
+        // The liveness claim for the `ocr` stage, pinned. tesseract is spawned
+        // per file, so re-reading per spawn is what makes a change land on the
+        // NEXT FILE. If this value were captured when the handle was built, the
+        // second assertion would still see 3 and the stage would be a next-job
+        // knob wearing a `live: true` label.
+        let runtime = Arc::new(RuntimeKnobs::from_config(&Config::default()));
+        apply(&runtime, json!({"ocr": 3}));
+        let ocr = TesseractOcr::new(&Config::default()).with_runtime(runtime.clone());
+        assert_eq!(ocr.thread_limit_for_test().as_deref(), Some("3"));
+
+        // Retune WITHOUT rebuilding the handle — exactly what a mid-job
+        // POST /jobs/{id}/runtime does.
+        apply(&runtime, json!({"ocr": 7}));
+        assert_eq!(
+            ocr.thread_limit_for_test().as_deref(),
+            Some("7"),
+            "the handle must not have cached the old limit"
+        );
+    }
+
+    #[test]
+    fn the_ocr_default_matches_what_openmp_would_have_chosen() {
+        // Defaulting to 1 would have been a silent, unrequested slowdown for
+        // every single-worker deployment; defaulting to what OpenMP would have
+        // picked makes setting the variable a no-op relative to leaving it
+        // unset. An operator's own OMP_THREAD_LIMIT wins over the CPU count,
+        // because this stage OVERWRITES that variable on the child process and
+        // must not quietly raise a limit someone deliberately lowered.
+        let expected = std::env::var("OMP_THREAD_LIMIT")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            });
+        let runtime = RuntimeKnobs::from_config(&Config::default());
+        assert_eq!(runtime.ocr(), expected.clamp(1, 64));
     }
 }
