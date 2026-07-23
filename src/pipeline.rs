@@ -313,6 +313,25 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
             stats.incomplete += usize::from(incomplete_method(&file.method));
             stats.embedded_chunks += file.chunks.len();
             stats.vision_files += usize::from(file.vision.is_some());
+            // Keep-on-failure: a pure UPGRADE that turned into an error must not
+            // REPLACE a still-valid lower-quality row. When the reprocess failed
+            // but the file is byte-for-byte unchanged and the stored row is already
+            // complete, drop the incoming error and keep the old row — "only remove
+            // old entries when the new job is confirmed successful". The failure
+            // still counts in `stats.errors` above (the reprocess genuinely
+            // failed); it simply does not overwrite the corpus.
+            if keep_old_on_error(
+                &file.method,
+                file.rec.size,
+                file.rec.mtime as i64,
+                existing.get(&file.rec.path),
+            ) {
+                eprintln!(
+                    "keeping the existing complete row for {} — reprocess failed ({})",
+                    file.rec.path, file.method
+                );
+                continue;
+            }
             store.add(&file, now())?;
         }
         // Not a bare `Ok(false)`. Now that the embed workers drain on
@@ -543,6 +562,41 @@ fn incomplete_method(method: &str) -> bool {
     method == "name-only" || method.starts_with("error:") || method.ends_with("-partial")
 }
 
+/// Whether an incoming `error:` row must be DROPPED to keep a still-valid stored
+/// row instead of replacing it.
+///
+/// The resume predicate re-processes files for pure UPGRADES (exhaustive PDF OCR,
+/// a higher vision tier, an embed-model change) even when size+mtime are
+/// unchanged. When such a reprocess then FAILS, `store.add` would REPLACE a
+/// perfectly good lower-quality row with the error row — violating "only remove
+/// old entries when the new job is confirmed successful". This keeps the old row
+/// exactly when all of:
+///   - the new outcome is an error (`error:` method);
+///   - the file is byte-for-byte unchanged — same size and same truncated mtime,
+///     the identical comparison the retain predicate uses (`mtime as i64`);
+///   - the stored row is COMPLETE — it has chunks and a non-incomplete method,
+///     i.e. a row worth preserving rather than itself a stub to redo.
+///
+/// Everything else replaces (returns false): a CHANGED file's old row is stale
+/// and must yield to the reprocess result; an INCOMPLETE old row is no better
+/// than the error, so let the error through so a later resume retries it; and a
+/// successful (non-`error:`) new outcome always writes.
+fn keep_old_on_error(
+    new_method: &str,
+    new_size: u64,
+    new_mtime: i64,
+    existing: Option<&(u64, i64, String, bool)>,
+) -> bool {
+    let Some((size, mtime, method, has_chunks)) = existing else {
+        return false;
+    };
+    new_method.starts_with("error:")
+        && *size == new_size
+        && *mtime == new_mtime
+        && *has_chunks
+        && !incomplete_method(method)
+}
+
 /// The `method` recorded for a file whose EMBEDDING failed (extraction
 /// succeeded). Bounded and single-line: `method` is a short token column that
 /// the UI renders inline, not an error log.
@@ -714,5 +768,88 @@ mod tests {
     fn nfc_leaves_precomposed_unchanged() {
         let precomposed = "tiếng Việt".to_string();
         assert_eq!(nfc(precomposed.clone()), precomposed);
+    }
+
+    /// The keep-old-on-error truth table. The stored entry is the same shape
+    /// `store.existing_keys()` yields — `(size, mtime, method, has_chunks)`.
+    mod keep_old {
+        use super::super::keep_old_on_error;
+
+        /// A COMPLETE stored row for a 12-byte file at mtime 100.
+        fn complete() -> (u64, i64, String, bool) {
+            (12, 100, "text".to_string(), true)
+        }
+
+        #[test]
+        fn error_on_an_unchanged_complete_row_keeps_the_old_row() {
+            assert!(keep_old_on_error(
+                "error:embed:oom",
+                12,
+                100,
+                Some(&complete())
+            ));
+        }
+
+        #[test]
+        fn a_changed_file_replaces_even_a_complete_row() {
+            // Size changed …
+            assert!(!keep_old_on_error(
+                "error:embed:oom",
+                13,
+                100,
+                Some(&complete())
+            ));
+            // … or mtime changed: either way the old row is stale.
+            assert!(!keep_old_on_error(
+                "error:embed:oom",
+                12,
+                101,
+                Some(&complete())
+            ));
+        }
+
+        #[test]
+        fn an_incomplete_old_row_is_replaced_by_the_error() {
+            // No chunks: the stored row is itself a stub, so the error may pass.
+            assert!(!keep_old_on_error(
+                "error:extract:pdf",
+                12,
+                100,
+                Some(&(12, 100, "text".to_string(), false))
+            ));
+            // A complete-looking method but still incomplete by `incomplete_method`
+            // (partial / name-only / a prior error) never counts as worth keeping.
+            for method in ["text-partial", "name-only", "error:extract:zip"] {
+                assert!(
+                    !keep_old_on_error(
+                        "error:embed:oom",
+                        12,
+                        100,
+                        Some(&(12, 100, method.to_string(), true))
+                    ),
+                    "incomplete stored method {method:?} must be replaceable"
+                );
+            }
+        }
+
+        #[test]
+        fn a_successful_new_outcome_never_keeps_the_old_row() {
+            // Even byte-for-byte unchanged against a complete row: a non-error
+            // result is an upgrade to WRITE, never a keep.
+            assert!(!keep_old_on_error("text", 12, 100, Some(&complete())));
+            assert!(!keep_old_on_error(
+                "pdf-exhaustive",
+                12,
+                100,
+                Some(&complete())
+            ));
+        }
+
+        #[test]
+        fn a_first_seen_file_has_nothing_to_keep() {
+            // No stored row at this path (a genuinely new file): an error is just
+            // recorded, there being no old row to preserve.
+            assert!(!keep_old_on_error("error:extract:pdf", 12, 100, None));
+        }
     }
 }
