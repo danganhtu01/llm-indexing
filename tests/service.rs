@@ -246,7 +246,10 @@ async fn a_failed_overwrite_leaves_the_existing_corpus_intact() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(stale, 1, "a job that never indexed anything kept the corpus");
+    assert_eq!(
+        stale, 1,
+        "a job that never indexed anything kept the corpus"
+    );
 }
 
 #[tokio::test]
@@ -259,7 +262,11 @@ async fn an_unreadable_corpus_is_reported_rather_than_read_as_empty() {
     let input = temp.path().join("input");
     let output = temp.path().join("output");
     let app = guard_router(&output, &input);
-    fs::write(output.join("corpus.sqlite"), b"this is not a sqlite database").unwrap();
+    fs::write(
+        output.join("corpus.sqlite"),
+        b"this is not a sqlite database",
+    )
+    .unwrap();
 
     let response = get(&app, "/corpus/status").await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
