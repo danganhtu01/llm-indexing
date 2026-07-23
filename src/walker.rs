@@ -80,9 +80,22 @@ pub fn walk(paths: &[PathBuf], config: &Config) -> Vec<FileRec> {
 fn drive_label(path: &Path) -> String {
     #[cfg(windows)]
     {
-        use std::path::Component;
+        use std::path::{Component, Prefix};
         if let Some(Component::Prefix(prefix)) = path.components().next() {
-            return prefix.as_os_str().to_string_lossy().to_string();
+            // Read the drive letter off the PARSED prefix kind, never the raw
+            // prefix string: production paths arrive `canonicalize`d, i.e.
+            // `\\?\`-verbatim (`Prefix::VerbatimDisk`), whose literal prefix is
+            // `\\?\I:` — so `as_os_str()` stored the verbatim form instead of the
+            // bare `I:` the rest of the codebase keys on (config `skip_path`, the
+            // drives-analytics grouping). Disk and VerbatimDisk both normalize to
+            // `X:`; a prefix with no disk letter (a UNC share) keeps its literal
+            // string, there being no bare-drive form to reduce it to.
+            return match prefix.kind() {
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                    format!("{}:", letter as char)
+                }
+                _ => prefix.as_os_str().to_string_lossy().to_string(),
+            };
         }
     }
     path.components()
@@ -97,6 +110,24 @@ mod tests {
     use crate::config::Config;
     use std::fs;
     use std::path::PathBuf;
+
+    /// The drive label is the bare disk prefix (`I:`), never the `\\?\`-verbatim
+    /// form. The verbatim cases are the ones production actually stores, since the
+    /// walker canonicalizes every root before descending — the old `as_os_str()`
+    /// path wrote `\\?\I:` into `files.drive`, which no consumer keying on the bare
+    /// `X:` form (config `skip_path`, drive analytics) would match. Windows-only:
+    /// off Windows there is no disk prefix to read.
+    #[cfg(windows)]
+    #[test]
+    fn drive_label_normalizes_the_disk_prefix() {
+        use super::drive_label;
+        use std::path::Path;
+        assert_eq!(drive_label(Path::new(r"I:\photos\a.jpg")), "I:");
+        assert_eq!(drive_label(Path::new(r"C:\x.txt")), "C:");
+        // Verbatim (`\\?\`) form from `canonicalize` must reduce to the bare disk.
+        assert_eq!(drive_label(Path::new(r"\\?\I:\photos\a.jpg")), "I:");
+        assert_eq!(drive_label(Path::new(r"\\?\C:\x.txt")), "C:");
+    }
 
     /// Defaults as `--config`-less startup produces them, with `skip_paths`
     /// swapped and recompiled.

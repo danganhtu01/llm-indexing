@@ -444,3 +444,194 @@ fn pooled_embedding_is_invariant_to_the_embed_pool_size() {
         "pool size must not change what gets embedded, only how fast"
     );
 }
+
+/// Write a minimal but VALID `.docx` (a zip carrying `word/document.xml`) whose
+/// `<w:t>` run holds `text`, so extraction yields a complete, embeddable row.
+fn write_docx(path: &Path, text: &str) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::CompressionMethod;
+
+    let file = fs::File::create(path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    // `Stored` needs no compression feature and keeps the fixture trivial.
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    zip.start_file("word/document.xml", options).unwrap();
+    let xml = format!(
+        "<?xml version=\"1.0\"?><w:document xmlns:w=\"urn:x\"><w:body><w:p><w:r>\
+         <w:t>{text}</w:t></w:r></w:p></w:body></w:document>"
+    );
+    zip.write_all(xml.as_bytes()).unwrap();
+    zip.finish().unwrap();
+}
+
+/// The single corpus row's `(method, size)` — every test here indexes exactly one
+/// file, so no path predicate is needed (paths are stored canonicalized).
+fn only_file_row(destination: &Path) -> (String, i64) {
+    connect(destination)
+        .unwrap()
+        .query_row("SELECT method, size FROM files", [], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap()
+}
+
+/// keep-on-failure protects a complete row ONLY when the file is unchanged. This
+/// is the companion guard: when the file has CHANGED and the reprocess fails, the
+/// error row must still REPLACE the old complete row (the ordinary contract the
+/// feature must not weaken). Uses a `.docx` because it extracts real text when a
+/// valid zip (complete row) yet errors outright once the bytes are no longer a
+/// zip — a deterministic, tool-free way to turn a good row into a failing one.
+#[test]
+fn a_changed_file_whose_reprocess_fails_still_replaces_the_old_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let destination = temp.path().join("corpus.sqlite");
+    let doc = input.join("report.docx");
+
+    // A valid docx -> a COMPLETE row with chunks (exactly the row keep-on-failure
+    // would preserve if the file were UNCHANGED).
+    write_docx(
+        &doc,
+        "Suspicious activity compliance report for the bank review team.",
+    );
+    let first = index(&input, &destination, false, None, None, None).unwrap();
+    assert_eq!(first.files, 1);
+    assert_eq!(first.errors, 0, "the valid docx extracts cleanly");
+    let (method, _) = only_file_row(&destination);
+    assert!(
+        !method.starts_with("error:"),
+        "stored a complete row: {method}"
+    );
+
+    // The bytes CHANGE to non-zip garbage: reprocessing now fails. Because the
+    // file changed, the error must replace the old row rather than be kept.
+    fs::write(
+        &doc,
+        b"not a zip archive at all -- just some plain garbage bytes",
+    )
+    .unwrap();
+    let resumed = index(&input, &destination, true, None, None, None).unwrap();
+    assert_eq!(resumed.files, 1, "the changed file is reprocessed");
+    assert_eq!(resumed.errors, 1, "the reprocess fails");
+
+    let (method, size) = only_file_row(&destination);
+    assert!(
+        method.starts_with("error:"),
+        "a changed file's error must REPLACE the old complete row, got {method}"
+    );
+    let on_disk = fs::metadata(&doc).unwrap().len() as i64;
+    assert_eq!(
+        size, on_disk,
+        "the replaced row carries the changed file's size, proving it was rewritten"
+    );
+}
+
+/// The interaction keep-on-failure must NOT break: a pure EMBED-MODEL upgrade
+/// re-embeds the whole corpus, and when an unchanged file's reprocess fails,
+/// keep-on-failure preserves its old (old-model) row. That file is therefore
+/// still un-migrated, so the corpus `embed_model` marker must NOT advance — or
+/// `embed_model_changed` would read false forever after and no resume would ever
+/// revisit the stranded file. The upgrade gate stays OPEN until the migration
+/// truly lands. (Before the fix the marker flipped up front, closing the gate and
+/// stranding the file with no signal.)
+///
+/// The file is made to FAIL its reprocess while staying byte-for-byte "unchanged"
+/// to the retain predicate — garbage bytes of the original length, with the
+/// original mtime restored — the exact shape keep-on-failure preserves.
+#[test]
+fn a_model_change_that_keeps_an_old_row_leaves_the_upgrade_gate_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let destination = temp.path().join("corpus.sqlite");
+    let doc = input.join("report.docx");
+    let text = "Suspicious activity compliance report for the bank review team.";
+
+    // A valid docx -> a COMPLETE row with chunks, recorded under the current model.
+    write_docx(&doc, text);
+    let first = index(&input, &destination, false, None, None, None).unwrap();
+    assert_eq!(first.files, 1);
+    assert_eq!(first.errors, 0, "the valid docx extracts cleanly");
+    let (good_method, good_size) = only_file_row(&destination);
+    assert!(
+        !good_method.starts_with("error:"),
+        "stored a complete row: {good_method}"
+    );
+
+    let marker = |dest: &Path| -> String {
+        connect(dest)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key='embed_model'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    let current = marker(&destination);
+
+    // Corrupt the bytes so a reprocess FAILS, but keep the file "unchanged" as the
+    // retain predicate sees it: same length, and the ORIGINAL mtime restored.
+    // keep-on-failure must therefore preserve the old row on the upgrade run.
+    let original_mtime = fs::metadata(&doc).unwrap().modified().unwrap();
+    fs::write(&doc, vec![b'x'; good_size as usize]).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&doc)
+        .unwrap()
+        .set_modified(original_mtime)
+        .unwrap();
+
+    // Force a pure embed-model upgrade: the recorded model differs from the loaded
+    // one, so resume bypasses the retain predicate and re-embeds the whole corpus.
+    {
+        let connection = connect(&destination).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value='some/older-model' WHERE key='embed_model'",
+                [],
+            )
+            .unwrap();
+    }
+
+    let upgraded = index(&input, &destination, true, None, None, None).unwrap();
+    assert_eq!(
+        upgraded.files, 1,
+        "the unchanged file is reprocessed by the model upgrade"
+    );
+    assert_eq!(upgraded.errors, 1, "its reprocess fails");
+
+    // keep-on-failure kept the OLD complete row rather than the error.
+    let (kept_method, kept_size) = only_file_row(&destination);
+    assert_eq!(
+        kept_method, good_method,
+        "the old complete row was kept, not replaced by the error"
+    );
+    assert_eq!(kept_size, good_size);
+
+    // The crux: the marker did NOT advance, because that file is still on
+    // old-model vectors. A closed gate here would strand it permanently.
+    assert_eq!(
+        marker(&destination),
+        "some/older-model",
+        "a kept old-model row must leave the upgrade gate OPEN for the next resume"
+    );
+
+    // Repair the file; the still-open gate lets the next resume finally migrate it,
+    // and only once the whole corpus is on the new model does the marker advance.
+    write_docx(&doc, text);
+    let healed = index(&input, &destination, true, None, None, None).unwrap();
+    assert_eq!(healed.errors, 0, "the repaired file re-embeds cleanly");
+    let (healed_method, _) = only_file_row(&destination);
+    assert!(
+        !healed_method.starts_with("error:"),
+        "healed to a complete row: {healed_method}"
+    );
+    assert_eq!(
+        marker(&destination),
+        current,
+        "once every file is migrated the marker finally advances to the current model"
+    );
+}
