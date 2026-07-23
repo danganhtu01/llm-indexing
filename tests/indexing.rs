@@ -444,3 +444,86 @@ fn pooled_embedding_is_invariant_to_the_embed_pool_size() {
         "pool size must not change what gets embedded, only how fast"
     );
 }
+
+/// Write a minimal but VALID `.docx` (a zip carrying `word/document.xml`) whose
+/// `<w:t>` run holds `text`, so extraction yields a complete, embeddable row.
+fn write_docx(path: &Path, text: &str) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::CompressionMethod;
+
+    let file = fs::File::create(path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    // `Stored` needs no compression feature and keeps the fixture trivial.
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    zip.start_file("word/document.xml", options).unwrap();
+    let xml = format!(
+        "<?xml version=\"1.0\"?><w:document xmlns:w=\"urn:x\"><w:body><w:p><w:r>\
+         <w:t>{text}</w:t></w:r></w:p></w:body></w:document>"
+    );
+    zip.write_all(xml.as_bytes()).unwrap();
+    zip.finish().unwrap();
+}
+
+/// The single corpus row's `(method, size)` — every test here indexes exactly one
+/// file, so no path predicate is needed (paths are stored canonicalized).
+fn only_file_row(destination: &Path) -> (String, i64) {
+    connect(destination)
+        .unwrap()
+        .query_row("SELECT method, size FROM files", [], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap()
+}
+
+/// keep-on-failure protects a complete row ONLY when the file is unchanged. This
+/// is the companion guard: when the file has CHANGED and the reprocess fails, the
+/// error row must still REPLACE the old complete row (the ordinary contract the
+/// feature must not weaken). Uses a `.docx` because it extracts real text when a
+/// valid zip (complete row) yet errors outright once the bytes are no longer a
+/// zip — a deterministic, tool-free way to turn a good row into a failing one.
+#[test]
+fn a_changed_file_whose_reprocess_fails_still_replaces_the_old_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let destination = temp.path().join("corpus.sqlite");
+    let doc = input.join("report.docx");
+
+    // A valid docx -> a COMPLETE row with chunks (exactly the row keep-on-failure
+    // would preserve if the file were UNCHANGED).
+    write_docx(
+        &doc,
+        "Suspicious activity compliance report for the bank review team.",
+    );
+    let first = index(&input, &destination, false, None, None, None).unwrap();
+    assert_eq!(first.files, 1);
+    assert_eq!(first.errors, 0, "the valid docx extracts cleanly");
+    let (method, _) = only_file_row(&destination);
+    assert!(
+        !method.starts_with("error:"),
+        "stored a complete row: {method}"
+    );
+
+    // The bytes CHANGE to non-zip garbage: reprocessing now fails. Because the
+    // file changed, the error must replace the old row rather than be kept.
+    fs::write(
+        &doc,
+        b"not a zip archive at all -- just some plain garbage bytes",
+    )
+    .unwrap();
+    let resumed = index(&input, &destination, true, None, None, None).unwrap();
+    assert_eq!(resumed.files, 1, "the changed file is reprocessed");
+    assert_eq!(resumed.errors, 1, "the reprocess fails");
+
+    let (method, size) = only_file_row(&destination);
+    assert!(
+        method.starts_with("error:"),
+        "a changed file's error must REPLACE the old complete row, got {method}"
+    );
+    let on_disk = fs::metadata(&doc).unwrap().len() as i64;
+    assert_eq!(
+        size, on_disk,
+        "the replaced row carries the changed file's size, proving it was rewritten"
+    );
+}
