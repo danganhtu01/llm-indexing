@@ -97,7 +97,13 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
             request.config.embedding_model
         );
     }
-    store.set_meta("embed_model", &request.config.embedding_model)?;
+    // The `embed_model` marker itself is written at the END of the run, not
+    // here — see `may_record_embed_model` at the tail. Advancing it before a
+    // single file has been reprocessed permanently CLOSES this gate: a file
+    // whose re-embed then fails and is preserved by keep-on-failure keeps a
+    // complete OLD-model row that never re-triggers per-file, so with the marker
+    // already flipped no future resume would ever revisit it. `last_job_started_at`
+    // is a plain timestamp with no such hazard and belongs up front.
     store.set_meta("last_job_started_at", &format!("{:.0}", now()))?;
     let existing = if request.resume {
         store.existing_keys()?
@@ -191,6 +197,13 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         skipped,
         ..Default::default()
     };
+    // Old rows KEPT by keep-on-failure — the file's reprocess errored but the
+    // byte-for-byte-unchanged file already had a complete row, so the error was
+    // dropped. Deliberately NOT part of `IndexStats` (a kept row counts nowhere
+    // in the DTO), but a model-change migration must know one happened: a kept
+    // row is a file still carrying OLD-model vectors, so the corpus `embed_model`
+    // marker must not advance and re-close the upgrade gate on it.
+    let mut kept_complete_rows: usize = 0;
     // Three stages, not two. Extraction fans out over the rayon pool; a pool of
     // embed workers turns extracted text into vectors; this thread owns the
     // (non-Sync) SQLite connection and does nothing but write. Embedding used to
@@ -330,6 +343,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
                     "keeping the existing complete row for {} — reprocess failed ({})",
                     file.rec.path, file.method
                 );
+                kept_complete_rows += 1;
                 continue;
             }
             store.add(&file, now())?;
@@ -364,6 +378,26 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     } else {
         Ok(())
     };
+    // Advance the corpus `embed_model` marker only now, and only when it is safe
+    // to CLOSE the upgrade gate — see `may_record_embed_model`. Writing it up
+    // front (as an earlier version did) closed the gate the instant the run
+    // began, so a file whose re-embed then failed and was KEPT by keep-on-failure
+    // stayed on old-model vectors with `embed_model_changed` reading false on
+    // every subsequent resume — no signal, no revisit, permanently stranded.
+    // Held back here whenever a model-change migration did not fully land (the
+    // run was cancelled or failed, or a clean run kept an old row), the gate
+    // stays open and the next resume re-embeds the stragglers. When the model
+    // did not change this simply re-records the current one (the fresh-index,
+    // unchanged, and grandfathered-`None` cases), which is always safe.
+    let recorded = if may_record_embed_model(
+        embed_model_changed,
+        matches!(&outcome, Ok(false)),
+        kept_complete_rows,
+    ) {
+        store.set_meta("embed_model", &request.config.embedding_model)
+    } else {
+        Ok(())
+    };
     // Commit before propagating anything: success, cancellation and a mid-run
     // failure all leave their finished files in the destination corpus, which is
     // what a later resume continues from. The run's own error still wins over a
@@ -373,6 +407,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     committed?;
     stats.removed = pruned?;
     stamped?;
+    recorded?;
     if cancelled {
         anyhow::bail!("indexing cancelled; {} file(s) committed", stats.files)
     }
@@ -595,6 +630,31 @@ fn keep_old_on_error(
         && *mtime == new_mtime
         && *has_chunks
         && !incomplete_method(method)
+}
+
+/// Whether the corpus-level `embed_model` marker may be advanced to the current
+/// model at the END of a run.
+///
+/// That marker is the sole thing `embed_model_changed` reads to decide,
+/// corpus-wide, that a model upgrade must re-embed EVERYTHING (the retain
+/// predicate is bypassed for the whole walk). Unlike the per-file OCR-exhaustive
+/// and vision-tier upgrades — which are re-evaluated each run from data
+/// `SELECT`ed fresh, so a file that keeps its old row keeps re-triggering until
+/// it succeeds — the embed-model upgrade has no per-file signal. So advancing
+/// this marker too eagerly strands any file that has NOT actually been migrated:
+/// an `error:` row would self-heal via `incomplete_method`, but a row KEPT by
+/// keep-on-failure is complete and never re-triggers, and once the marker moves
+/// no resume revisits it. The marker therefore advances during a model change
+/// only once the migration has fully landed — the run completed cleanly AND not
+/// one old row was kept. When the model did not change (`!embed_model_changed`)
+/// it merely re-records the current model, which is always safe whatever the
+/// run's outcome, since nothing was scheduled for a model reason.
+fn may_record_embed_model(
+    embed_model_changed: bool,
+    clean_run: bool,
+    kept_complete_rows: usize,
+) -> bool {
+    !embed_model_changed || (clean_run && kept_complete_rows == 0)
 }
 
 /// The `method` recorded for a file whose EMBEDDING failed (extraction
@@ -850,6 +910,53 @@ mod tests {
             // No stored row at this path (a genuinely new file): an error is just
             // recorded, there being no old row to preserve.
             assert!(!keep_old_on_error("error:extract:pdf", 12, 100, None));
+        }
+    }
+
+    /// The end-of-run `embed_model` marker gate. A model-change migration must
+    /// not close its own upgrade gate until every file has actually been migrated
+    /// — the exact interaction keep-on-failure would otherwise break.
+    mod record_embed_model {
+        use super::super::may_record_embed_model;
+
+        #[test]
+        fn a_non_model_change_always_re_records_the_current_model() {
+            // Fresh index, unchanged model, or a grandfathered `None` corpus: the
+            // marker merely records the current model and is always safe to write,
+            // whatever the run's outcome or however many old rows it kept.
+            for clean in [true, false] {
+                for kept in [0, 3] {
+                    assert!(
+                        may_record_embed_model(false, clean, kept),
+                        "not a model change: clean={clean} kept={kept} must record"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_completed_migration_with_no_kept_rows_advances_the_marker() {
+            // Clean run, nothing kept: every file now carries new-model vectors, so
+            // the gate may finally close.
+            assert!(may_record_embed_model(true, true, 0));
+        }
+
+        #[test]
+        fn a_kept_old_row_holds_the_gate_open_even_on_a_clean_run() {
+            // The regression this fix pins: a clean model-change run that KEPT an
+            // old row left that file on old-model vectors with no per-file signal.
+            // Advancing the marker would strand it forever, so the gate stays open
+            // for the next resume.
+            assert!(!may_record_embed_model(true, true, 1));
+            assert!(!may_record_embed_model(true, true, 7));
+        }
+
+        #[test]
+        fn an_interrupted_migration_holds_the_gate_open() {
+            // Cancelled or failed: files the run never reached still carry old-model
+            // vectors, so the marker must not advance regardless of kept rows.
+            assert!(!may_record_embed_model(true, false, 0));
+            assert!(!may_record_embed_model(true, false, 4));
         }
     }
 }
