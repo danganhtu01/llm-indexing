@@ -62,12 +62,21 @@ CREATE TABLE IF NOT EXISTS vision(
   elapsed_ms INTEGER, error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_vision_phash ON vision(phash);
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
 
 /// How long a WRITER waits for a lock before giving up. An indexing job now
 /// writes into the same file readers open, and a batch commit holds an exclusive
 /// lock for the duration of one flush, so both sides must wait rather than fail.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Unix seconds, for the corpus meta timestamps.
+fn now_unix() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or_default()
+}
 
 /// How long a READER waits. Deliberately far shorter than the writer's: a
 /// consumer polling `/corpus/*` while a job indexes wants a prompt, honest
@@ -119,8 +128,7 @@ pub fn remove_database(out: &Path) -> Result<()> {
     if !database.exists() {
         return Ok(());
     }
-    fs::remove_file(&database)
-        .with_context(|| format!("replacing {}", database.display()))?;
+    fs::remove_file(&database).with_context(|| format!("replacing {}", database.display()))?;
     // Best effort: an orphaned journal with no database is inert, and SQLite
     // discards one whose header does not match the database it opens.
     let _ = fs::remove_file(journal_path(&database));
@@ -130,7 +138,6 @@ pub fn remove_database(out: &Path) -> Result<()> {
 pub struct IndexStore {
     out: PathBuf,
     connection: Connection,
-    resume: bool,
     sidecar: String,
     jsonl: Option<BufWriter<File>>,
     catalog: Option<csv::Writer<File>>,
@@ -177,6 +184,15 @@ impl IndexStore {
         connection
             .execute_batch(SCHEMA)
             .context("creating SQLite FTS5 schema")?;
+        // Self-description (previously the corpus was anonymous — after a
+        // restart nothing recorded what produced it): created_at once, plus
+        // per-job values the pipeline stamps via `set_meta`. `IF NOT EXISTS`
+        // in the schema means old corpora gain the table on their next open.
+        connection.execute(
+            "INSERT INTO meta(key,value) VALUES('created_at', ?1) \
+             ON CONFLICT(key) DO NOTHING",
+            [format!("{:.0}", now_unix())],
+        )?;
         let jsonl = if artifacts {
             let file = OpenOptions::new()
                 .create(true)
@@ -218,7 +234,6 @@ impl IndexStore {
         Ok(Self {
             out: root,
             connection,
-            resume,
             sidecar: config.sidecar.clone(),
             jsonl,
             catalog,
@@ -306,6 +321,28 @@ impl IndexStore {
         Ok(stale.len())
     }
 
+    /// Upsert one self-description key (job metadata, model identity,
+    /// lifecycle timestamps). Rides the store's open transaction, so meta
+    /// changes commit atomically with the file batches around them.
+    pub fn set_meta(&mut self, key: &str, value: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .connection
+            .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
     pub fn add(&mut self, file: &ProcessedFile, indexed_at: f64) -> Result<()> {
         // Every row a file needs goes in under its own savepoint. Without one, a
         // failure part-way — a chunk insert that fails once the files and fts
@@ -342,26 +379,28 @@ impl IndexStore {
     /// Every database row one file contributes, run inside the caller's
     /// savepoint so the set lands whole or not at all.
     fn write_rows(&mut self, file: &ProcessedFile, indexed_at: f64) -> Result<()> {
-        // On resume the file row is INSERT OR REPLACE'd, which mints a new rowid
-        // on the UNIQUE(path) conflict, so the previous id's chunks/fts are
-        // deleted here and its vision row is reconciled after the re-insert.
-        let old = if self.resume {
-            self.connection
-                .query_row(
-                    "SELECT id,size,mtime FROM files WHERE path=?1",
-                    [&file.rec.path],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, f64>(2)?,
-                        ))
-                    },
-                )
-                .ok()
-        } else {
-            None
-        };
+        // The file row is INSERT OR REPLACE'd, which mints a new rowid on the
+        // UNIQUE(path) conflict, so the previous id's chunks/fts are deleted
+        // here and its vision row is reconciled after the re-insert.
+        // UNCONDITIONAL (previously resume-only): any path re-add through any
+        // flow — including a non-resume run pointed at an existing corpus —
+        // would otherwise strand the old rowid's fts text in the index, and
+        // stale FTS rows surface as ghost search hits that nothing ever
+        // cleans up.
+        let old = self
+            .connection
+            .query_row(
+                "SELECT id,size,mtime FROM files WHERE path=?1",
+                [&file.rec.path],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
+                },
+            )
+            .ok();
         let old_id = old.map(|(id, _, _)| id);
         // Capture the old vision row BEFORE the INSERT OR REPLACE below: the
         // bundled SQLite runs with foreign_keys ON, so replacing the files row
@@ -826,7 +865,10 @@ mod tests {
             .unwrap()
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(committed, 2, "commit_batch=2 must commit after the 2nd file");
+        assert_eq!(
+            committed, 2,
+            "commit_batch=2 must commit after the 2nd file"
+        );
 
         store.finish().unwrap();
         let all: i64 = connect(&destination)

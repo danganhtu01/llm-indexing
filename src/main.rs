@@ -307,6 +307,17 @@ fn index(args: IndexArgs) -> Result<()> {
         .validate()
         .map_err(|error| anyhow::anyhow!(error))?;
     VisionSettings::resolve(&config, Some(&vision_over)).apply_to(&mut config);
+    // Mirror the service's refusal: without --resume, indexing into an
+    // existing corpus INSERT-OR-REPLACEs rows under new rowids, and stale FTS
+    // text lingered as ghost search hits nothing ever cleaned up. (The vlm
+    // CLI refuses the same way.)
+    let database = llm_indexing::store::database_path(&args.out);
+    if database.exists() && !args.resume {
+        anyhow::bail!(
+            "output {} already exists; pass --resume to continue it (or delete it first)",
+            database.display()
+        );
+    }
     let stats = run_index(IndexRequest {
         paths: &args.paths,
         out: &args.out,
