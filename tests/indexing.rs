@@ -185,6 +185,64 @@ fn resume_continues_from_a_partially_written_corpus() {
     );
 }
 
+/// A sub-path resume must prune only its OWN stale rows. Rows outside the
+/// resumed root belong to the rest of a whole-drive corpus — the sub-path
+/// job's walk never saw them, so their absence from it is not evidence of
+/// deletion, and pruning them (the old behavior) let a targeted re-index of
+/// one folder silently destroy every other folder's rows.
+#[test]
+fn a_sub_path_resume_prunes_only_under_its_own_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let docs = input.join("docs");
+    let photos = input.join("photos");
+    fs::create_dir_all(&docs).unwrap();
+    fs::create_dir_all(&photos).unwrap();
+    fs::write(docs.join("keep.txt"), "Docs report that stays on disk.").unwrap();
+    fs::write(docs.join("gone.txt"), "Docs report deleted before the resume.").unwrap();
+    fs::write(
+        photos.join("outside.txt"),
+        "Photos report outside the resumed root.",
+    )
+    .unwrap();
+    let destination = temp.path().join("corpus.sqlite");
+
+    // Whole-tree first: all three rows land in the per-drive corpus.
+    let whole = index(&input, &destination, false, None, None, None).unwrap();
+    assert_eq!(whole.files, 3);
+    assert_eq!(indexed_files(&destination), 3);
+
+    // One docs file vanishes; resume ONLY the docs subtree.
+    fs::remove_file(docs.join("gone.txt")).unwrap();
+    let scoped = index(&docs, &destination, true, None, None, None).unwrap();
+    assert_eq!(scoped.removed, 1, "the vanished in-root file is pruned");
+    assert_eq!(scoped.skipped, 1, "the unchanged in-root file is reused");
+    assert_eq!(scoped.files, 0);
+
+    let connection = connect(&destination).unwrap();
+    let mut remaining = connection
+        .prepare("SELECT path FROM files ORDER BY path")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .flatten()
+        .collect::<Vec<_>>();
+    remaining.sort();
+    assert_eq!(remaining.len(), 2, "photos row must survive: {remaining:?}");
+    assert!(
+        remaining.iter().any(|p| p.ends_with("keep.txt")),
+        "in-root unchanged row kept: {remaining:?}"
+    );
+    assert!(
+        remaining.iter().any(|p| p.ends_with("outside.txt")),
+        "out-of-root row NOT this job's to delete: {remaining:?}"
+    );
+    assert!(
+        !remaining.iter().any(|p| p.ends_with("gone.txt")),
+        "vanished in-root row pruned: {remaining:?}"
+    );
+}
+
 #[test]
 fn cancellation_keeps_committed_work_and_resume_finishes_it() {
     const FILES: i64 = 240;
