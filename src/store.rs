@@ -265,14 +265,32 @@ impl IndexStore {
         Ok(rows.flatten().collect())
     }
 
-    pub fn prune_missing(&mut self, current: &HashSet<String>) -> Result<usize> {
+    /// Delete rows for files that have disappeared — but ONLY under the job's
+    /// own roots. A row outside every walked root was never visible to this
+    /// job's walk, so its absence from `current` says nothing about the file:
+    /// pruning it would let a sub-path resume silently destroy the rest of a
+    /// whole-drive corpus (the walk of `I:\Docs` does not contain `I:\Photos\a`,
+    /// and before this scoping that absence deleted it).
+    ///
+    /// `roots` are the walker's canonical root strings ([`crate::walker::canonical_root`]),
+    /// matched against row paths by exact-prefix-plus-separator (or equality),
+    /// the same string forms the walker wrote.
+    pub fn prune_missing(&mut self, roots: &[String], current: &HashSet<String>) -> Result<usize> {
+        let under_a_root = |path: &str| {
+            roots.iter().any(|root| {
+                let trimmed = root.trim_end_matches(std::path::MAIN_SEPARATOR);
+                path == trimmed
+                    || (path.starts_with(trimmed)
+                        && path[trimmed.len()..].starts_with(std::path::MAIN_SEPARATOR))
+            })
+        };
         let mut statement = self.connection.prepare("SELECT id,path FROM files")?;
         let stale = statement
             .query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })?
             .flatten()
-            .filter(|(_, path)| !current.contains(path))
+            .filter(|(_, path)| under_a_root(path) && !current.contains(path))
             .collect::<Vec<_>>();
         drop(statement);
         for (id, _) in &stale {
