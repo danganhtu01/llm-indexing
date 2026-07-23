@@ -5,12 +5,20 @@ use std::time::UNIX_EPOCH;
 use crate::config::Config;
 use crate::model::FileRec;
 
+/// The canonical form of a requested root — the SAME resolution [`walk`]
+/// applies to every root before descending, kept as one function so path
+/// strings derived from a root elsewhere (the resume prune's root scoping)
+/// can never drift from what the walker actually wrote into the corpus.
+pub fn canonical_root(requested: &Path) -> PathBuf {
+    requested
+        .canonicalize()
+        .unwrap_or_else(|_| requested.to_path_buf())
+}
+
 pub fn walk(paths: &[PathBuf], config: &Config) -> Vec<FileRec> {
     let mut files = Vec::new();
     for requested in paths {
-        let root = requested
-            .canonicalize()
-            .unwrap_or_else(|_| requested.clone());
+        let root = canonical_root(requested);
         let drive = drive_label(&root);
         let mut stack = vec![root];
         while let Some(dir) = stack.pop() {

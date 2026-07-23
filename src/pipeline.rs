@@ -94,19 +94,19 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         .iter()
         .map(|record| record.path.clone())
         .collect::<HashSet<_>>();
-    // Pruning deletes rows for sources that have disappeared. It used to run
-    // against a throwaway copy that a failed run discarded; now it lands in the
-    // published corpus and the next batch commit makes it permanent. An empty
-    // walk is therefore not treated as "every source was deleted" — over a
-    // mounted tree that is far more often a root that failed to mount or a
-    // mistyped path, and that reading would silently empty the whole corpus for
-    // a run that then reports success. Rebuilding from empty is what
-    // `overwrite` is for, and it is explicit.
-    let removed = if request.resume && !current.is_empty() {
-        store.prune_missing(&current)?
-    } else {
-        0
-    };
+    // The canonical root strings, resolved EXACTLY as the walker resolves them,
+    // for scoping the end-of-run prune: only rows under these roots are this
+    // job's to delete. (Pruning itself moved to after the processing loop —
+    // see the comment at the call site.)
+    let roots = request
+        .paths
+        .iter()
+        .map(|requested| {
+            crate::walker::canonical_root(requested)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
     if let Some(include_paths) = &request.include_paths {
         records.retain(|record| include_paths.contains(&record.path));
     }
@@ -169,7 +169,6 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     let progress = request.progress.clone();
     let mut stats = IndexStats {
         skipped,
-        removed,
         ..Default::default()
     };
     // Three stages, not two. Extraction fans out over the rayon pool; a pool of
@@ -302,6 +301,24 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         // cancelled run as a clean success to the CLI.
         Ok(job_cancelled())
     });
+    // Pruning deletes rows for sources that have disappeared, and it runs LAST,
+    // only for a run that completed its walk cleanly (not cancelled, not
+    // failed) — an interrupted job must never delete anything, because its
+    // "absence" evidence is incomplete. It is also scoped to the job's own
+    // roots (see `prune_missing`): a sub-path resume prunes stale rows under
+    // that sub-path only, leaving the rest of a whole-drive corpus untouched.
+    // An empty walk is still not treated as "every source was deleted" — over a
+    // mounted tree that is far more often a root that failed to mount or a
+    // mistyped path, and that reading would silently empty the corpus for a run
+    // that then reports success; rebuilding from empty is what `overwrite` is
+    // for. The deletes join the store's open transaction, so `finish` commits
+    // them atomically with the final batch of indexed files.
+    let pruned = match &outcome {
+        Ok(false) if request.resume && !current.is_empty() => {
+            store.prune_missing(&roots, &current)
+        }
+        _ => Ok(0),
+    };
     // Commit before propagating anything: success, cancellation and a mid-run
     // failure all leave their finished files in the destination corpus, which is
     // what a later resume continues from. The run's own error still wins over a
@@ -309,6 +326,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     let committed = store.finish();
     let cancelled = outcome?;
     committed?;
+    stats.removed = pruned?;
     if cancelled {
         anyhow::bail!("indexing cancelled; {} file(s) committed", stats.files)
     }
