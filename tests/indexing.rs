@@ -18,7 +18,9 @@ use llm_indexing::store::{connect, search, top_folders};
 static MODEL: Mutex<()> = Mutex::new(());
 
 fn model_lock() -> MutexGuard<'static, ()> {
-    MODEL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    MODEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[test]
@@ -199,7 +201,11 @@ fn a_sub_path_resume_prunes_only_under_its_own_root() {
     fs::create_dir_all(&docs).unwrap();
     fs::create_dir_all(&photos).unwrap();
     fs::write(docs.join("keep.txt"), "Docs report that stays on disk.").unwrap();
-    fs::write(docs.join("gone.txt"), "Docs report deleted before the resume.").unwrap();
+    fs::write(
+        docs.join("gone.txt"),
+        "Docs report deleted before the resume.",
+    )
+    .unwrap();
     fs::write(
         photos.join("outside.txt"),
         "Photos report outside the resumed root.",
@@ -240,6 +246,70 @@ fn a_sub_path_resume_prunes_only_under_its_own_root() {
     assert!(
         !remaining.iter().any(|p| p.ends_with("gone.txt")),
         "vanished in-root row pruned: {remaining:?}"
+    );
+}
+
+/// The corpus self-describes (meta table) and the embedding-model identity
+/// gates resume: an unchanged model skips unchanged files as before, but a
+/// recorded model different from the current one forces a full re-embed —
+/// previously a model upgrade silently left a mixed-vector corpus.
+#[test]
+fn a_changed_embedding_model_reprocesses_the_whole_corpus() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let destination = temp.path().join("corpus.sqlite");
+    sample_tree(&input, 2);
+
+    let first = index(&input, &destination, false, None, None, None).unwrap();
+    assert_eq!(first.files, 2);
+
+    let connection = connect(&destination).unwrap();
+    let meta = |key: &str| {
+        connection
+            .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()
+    };
+    assert_eq!(
+        meta("embed_model").as_deref(),
+        Some("intfloat/multilingual-e5-small"),
+        "the corpus records which embedding model produced it"
+    );
+    let started = meta("last_job_started_at").expect("started_at stamped");
+    let finished = meta("last_job_finished_at").expect("finished_at stamped on completion");
+    assert!(
+        finished.parse::<f64>().unwrap() >= started.parse::<f64>().unwrap(),
+        "finished_at >= started_at on a completed run"
+    );
+
+    // Same model: resume skips everything.
+    let same = index(&input, &destination, true, None, None, None).unwrap();
+    assert_eq!(same.skipped, 2);
+    assert_eq!(same.files, 0);
+
+    // Recorded model differs from the loaded one: everything is re-embedded.
+    connection
+        .execute(
+            "UPDATE meta SET value='some/older-model' WHERE key='embed_model'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let upgraded = index(&input, &destination, true, None, None, None).unwrap();
+    assert_eq!(upgraded.files, 2, "a model change must re-embed every file");
+    assert_eq!(upgraded.skipped, 0);
+    let connection = connect(&destination).unwrap();
+    let recorded: String = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key='embed_model'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        recorded, "intfloat/multilingual-e5-small",
+        "the current model is re-recorded after the re-embed"
     );
 }
 
@@ -293,7 +363,10 @@ fn cancellation_keeps_committed_work_and_resume_finishes_it() {
     assert!(destination.is_file(), "the partial corpus survives");
     let retained = indexed_files(&destination);
     assert!(retained > 0, "committed work must survive cancellation");
-    assert!(retained < FILES, "the run really was interrupted: {retained}");
+    assert!(
+        retained < FILES,
+        "the run really was interrupted: {retained}"
+    );
 
     // Resume skips precisely what was kept and finishes the rest.
     let finished = index(&input, &destination, true, None, None, None).unwrap();
@@ -334,10 +407,7 @@ fn pooled_embedding_is_invariant_to_the_embed_pool_size() {
         let destination = temp.path().join(format!("corpus_{embed}.sqlite"));
         let config = durability_config();
         let runtime = Arc::new(RuntimeKnobs::from_config(&config));
-        let body: Map<String, Value> = json!({"embed": embed})
-            .as_object()
-            .expect("object")
-            .clone();
+        let body: Map<String, Value> = json!({"embed": embed}).as_object().expect("object").clone();
         runtime.apply(&body).expect("embed is a valid stage");
 
         let stats = run_index(IndexRequest {

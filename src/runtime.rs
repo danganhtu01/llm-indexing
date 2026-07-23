@@ -218,7 +218,9 @@ impl RuntimeKnobs {
                 EMBED => self
                     .embed
                     .store(clamp(requested, EMBED_RANGE), Ordering::Relaxed),
-                OCR => self.ocr.store(clamp(requested, OCR_RANGE), Ordering::Relaxed),
+                OCR => self
+                    .ocr
+                    .store(clamp(requested, OCR_RANGE), Ordering::Relaxed),
                 _ => unreachable!("stage names were validated above"),
             }
         }
@@ -275,13 +277,17 @@ fn as_count(value: &Value) -> Option<usize> {
     if let Some(unsigned) = value.as_u64() {
         return Some(usize::try_from(unsigned).unwrap_or(usize::MAX));
     }
-    value.as_i64().map(|signed| usize::try_from(signed).unwrap_or(0))
+    value
+        .as_i64()
+        .map(|signed| usize::try_from(signed).unwrap_or(0))
 }
 
 /// Take a lock, recovering rather than propagating a poisoned mutex. A worker
 /// that panicked mid-file must not wedge the admission gate for the whole job.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // ── extract admission ────────────────────────────────────────────────────────
@@ -722,7 +728,9 @@ mod tests {
         use std::sync::atomic::AtomicBool;
 
         let runtime = knobs();
-        runtime.apply(&body(json!({"extract": 2}))).expect("applied");
+        runtime
+            .apply(&body(json!({"extract": 2})))
+            .expect("applied");
         let admission = Admission::new(runtime.clone());
         let never = AtomicBool::new(false);
         let cancelled = || never.load(Ordering::Relaxed);
@@ -763,7 +771,9 @@ mod tests {
             assert_eq!(admission.in_flight(), 2);
 
             // Raising the target admits the waiter without restarting anything.
-            runtime.apply(&body(json!({"extract": 3}))).expect("applied");
+            runtime
+                .apply(&body(json!({"extract": 3})))
+                .expect("applied");
             let mut woke = false;
             for _ in 0..200 {
                 if admitted.load(Ordering::SeqCst) {
@@ -787,7 +797,9 @@ mod tests {
         use std::sync::atomic::AtomicBool;
 
         let runtime = knobs();
-        runtime.apply(&body(json!({"extract": 1}))).expect("applied");
+        runtime
+            .apply(&body(json!({"extract": 1})))
+            .expect("applied");
         let admission = Admission::new(runtime);
         let cancel = AtomicBool::new(false);
         let cancelled = || cancel.load(Ordering::Relaxed);
