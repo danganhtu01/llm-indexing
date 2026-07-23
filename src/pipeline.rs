@@ -97,7 +97,13 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
             request.config.embedding_model
         );
     }
-    store.set_meta("embed_model", &request.config.embedding_model)?;
+    // The `embed_model` marker itself is written at the END of the run, not
+    // here — see `may_record_embed_model` at the tail. Advancing it before a
+    // single file has been reprocessed permanently CLOSES this gate: a file
+    // whose re-embed then fails and is preserved by keep-on-failure keeps a
+    // complete OLD-model row that never re-triggers per-file, so with the marker
+    // already flipped no future resume would ever revisit it. `last_job_started_at`
+    // is a plain timestamp with no such hazard and belongs up front.
     store.set_meta("last_job_started_at", &format!("{:.0}", now()))?;
     let existing = if request.resume {
         store.existing_keys()?
@@ -191,6 +197,13 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         skipped,
         ..Default::default()
     };
+    // Old rows KEPT by keep-on-failure — the file's reprocess errored but the
+    // byte-for-byte-unchanged file already had a complete row, so the error was
+    // dropped. Deliberately NOT part of `IndexStats` (a kept row counts nowhere
+    // in the DTO), but a model-change migration must know one happened: a kept
+    // row is a file still carrying OLD-model vectors, so the corpus `embed_model`
+    // marker must not advance and re-close the upgrade gate on it.
+    let mut kept_complete_rows: usize = 0;
     // Three stages, not two. Extraction fans out over the rayon pool; a pool of
     // embed workers turns extracted text into vectors; this thread owns the
     // (non-Sync) SQLite connection and does nothing but write. Embedding used to
@@ -313,6 +326,26 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
             stats.incomplete += usize::from(incomplete_method(&file.method));
             stats.embedded_chunks += file.chunks.len();
             stats.vision_files += usize::from(file.vision.is_some());
+            // Keep-on-failure: a pure UPGRADE that turned into an error must not
+            // REPLACE a still-valid lower-quality row. When the reprocess failed
+            // but the file is byte-for-byte unchanged and the stored row is already
+            // complete, drop the incoming error and keep the old row — "only remove
+            // old entries when the new job is confirmed successful". The failure
+            // still counts in `stats.errors` above (the reprocess genuinely
+            // failed); it simply does not overwrite the corpus.
+            if keep_old_on_error(
+                &file.method,
+                file.rec.size,
+                file.rec.mtime as i64,
+                existing.get(&file.rec.path),
+            ) {
+                eprintln!(
+                    "keeping the existing complete row for {} — reprocess failed ({})",
+                    file.rec.path, file.method
+                );
+                kept_complete_rows += 1;
+                continue;
+            }
             store.add(&file, now())?;
         }
         // Not a bare `Ok(false)`. Now that the embed workers drain on
@@ -345,6 +378,26 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     } else {
         Ok(())
     };
+    // Advance the corpus `embed_model` marker only now, and only when it is safe
+    // to CLOSE the upgrade gate — see `may_record_embed_model`. Writing it up
+    // front (as an earlier version did) closed the gate the instant the run
+    // began, so a file whose re-embed then failed and was KEPT by keep-on-failure
+    // stayed on old-model vectors with `embed_model_changed` reading false on
+    // every subsequent resume — no signal, no revisit, permanently stranded.
+    // Held back here whenever a model-change migration did not fully land (the
+    // run was cancelled or failed, or a clean run kept an old row), the gate
+    // stays open and the next resume re-embeds the stragglers. When the model
+    // did not change this simply re-records the current one (the fresh-index,
+    // unchanged, and grandfathered-`None` cases), which is always safe.
+    let recorded = if may_record_embed_model(
+        embed_model_changed,
+        matches!(&outcome, Ok(false)),
+        kept_complete_rows,
+    ) {
+        store.set_meta("embed_model", &request.config.embedding_model)
+    } else {
+        Ok(())
+    };
     // Commit before propagating anything: success, cancellation and a mid-run
     // failure all leave their finished files in the destination corpus, which is
     // what a later resume continues from. The run's own error still wins over a
@@ -354,6 +407,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     committed?;
     stats.removed = pruned?;
     stamped?;
+    recorded?;
     if cancelled {
         anyhow::bail!("indexing cancelled; {} file(s) committed", stats.files)
     }
@@ -543,6 +597,66 @@ fn incomplete_method(method: &str) -> bool {
     method == "name-only" || method.starts_with("error:") || method.ends_with("-partial")
 }
 
+/// Whether an incoming `error:` row must be DROPPED to keep a still-valid stored
+/// row instead of replacing it.
+///
+/// The resume predicate re-processes files for pure UPGRADES (exhaustive PDF OCR,
+/// a higher vision tier, an embed-model change) even when size+mtime are
+/// unchanged. When such a reprocess then FAILS, `store.add` would REPLACE a
+/// perfectly good lower-quality row with the error row — violating "only remove
+/// old entries when the new job is confirmed successful". This keeps the old row
+/// exactly when all of:
+///   - the new outcome is an error (`error:` method);
+///   - the file is byte-for-byte unchanged — same size and same truncated mtime,
+///     the identical comparison the retain predicate uses (`mtime as i64`);
+///   - the stored row is COMPLETE — it has chunks and a non-incomplete method,
+///     i.e. a row worth preserving rather than itself a stub to redo.
+///
+/// Everything else replaces (returns false): a CHANGED file's old row is stale
+/// and must yield to the reprocess result; an INCOMPLETE old row is no better
+/// than the error, so let the error through so a later resume retries it; and a
+/// successful (non-`error:`) new outcome always writes.
+fn keep_old_on_error(
+    new_method: &str,
+    new_size: u64,
+    new_mtime: i64,
+    existing: Option<&(u64, i64, String, bool)>,
+) -> bool {
+    let Some((size, mtime, method, has_chunks)) = existing else {
+        return false;
+    };
+    new_method.starts_with("error:")
+        && *size == new_size
+        && *mtime == new_mtime
+        && *has_chunks
+        && !incomplete_method(method)
+}
+
+/// Whether the corpus-level `embed_model` marker may be advanced to the current
+/// model at the END of a run.
+///
+/// That marker is the sole thing `embed_model_changed` reads to decide,
+/// corpus-wide, that a model upgrade must re-embed EVERYTHING (the retain
+/// predicate is bypassed for the whole walk). Unlike the per-file OCR-exhaustive
+/// and vision-tier upgrades — which are re-evaluated each run from data
+/// `SELECT`ed fresh, so a file that keeps its old row keeps re-triggering until
+/// it succeeds — the embed-model upgrade has no per-file signal. So advancing
+/// this marker too eagerly strands any file that has NOT actually been migrated:
+/// an `error:` row would self-heal via `incomplete_method`, but a row KEPT by
+/// keep-on-failure is complete and never re-triggers, and once the marker moves
+/// no resume revisits it. The marker therefore advances during a model change
+/// only once the migration has fully landed — the run completed cleanly AND not
+/// one old row was kept. When the model did not change (`!embed_model_changed`)
+/// it merely re-records the current model, which is always safe whatever the
+/// run's outcome, since nothing was scheduled for a model reason.
+fn may_record_embed_model(
+    embed_model_changed: bool,
+    clean_run: bool,
+    kept_complete_rows: usize,
+) -> bool {
+    !embed_model_changed || (clean_run && kept_complete_rows == 0)
+}
+
 /// The `method` recorded for a file whose EMBEDDING failed (extraction
 /// succeeded). Bounded and single-line: `method` is a short token column that
 /// the UI renders inline, not an error log.
@@ -714,5 +828,135 @@ mod tests {
     fn nfc_leaves_precomposed_unchanged() {
         let precomposed = "tiếng Việt".to_string();
         assert_eq!(nfc(precomposed.clone()), precomposed);
+    }
+
+    /// The keep-old-on-error truth table. The stored entry is the same shape
+    /// `store.existing_keys()` yields — `(size, mtime, method, has_chunks)`.
+    mod keep_old {
+        use super::super::keep_old_on_error;
+
+        /// A COMPLETE stored row for a 12-byte file at mtime 100.
+        fn complete() -> (u64, i64, String, bool) {
+            (12, 100, "text".to_string(), true)
+        }
+
+        #[test]
+        fn error_on_an_unchanged_complete_row_keeps_the_old_row() {
+            assert!(keep_old_on_error(
+                "error:embed:oom",
+                12,
+                100,
+                Some(&complete())
+            ));
+        }
+
+        #[test]
+        fn a_changed_file_replaces_even_a_complete_row() {
+            // Size changed …
+            assert!(!keep_old_on_error(
+                "error:embed:oom",
+                13,
+                100,
+                Some(&complete())
+            ));
+            // … or mtime changed: either way the old row is stale.
+            assert!(!keep_old_on_error(
+                "error:embed:oom",
+                12,
+                101,
+                Some(&complete())
+            ));
+        }
+
+        #[test]
+        fn an_incomplete_old_row_is_replaced_by_the_error() {
+            // No chunks: the stored row is itself a stub, so the error may pass.
+            assert!(!keep_old_on_error(
+                "error:extract:pdf",
+                12,
+                100,
+                Some(&(12, 100, "text".to_string(), false))
+            ));
+            // A complete-looking method but still incomplete by `incomplete_method`
+            // (partial / name-only / a prior error) never counts as worth keeping.
+            for method in ["text-partial", "name-only", "error:extract:zip"] {
+                assert!(
+                    !keep_old_on_error(
+                        "error:embed:oom",
+                        12,
+                        100,
+                        Some(&(12, 100, method.to_string(), true))
+                    ),
+                    "incomplete stored method {method:?} must be replaceable"
+                );
+            }
+        }
+
+        #[test]
+        fn a_successful_new_outcome_never_keeps_the_old_row() {
+            // Even byte-for-byte unchanged against a complete row: a non-error
+            // result is an upgrade to WRITE, never a keep.
+            assert!(!keep_old_on_error("text", 12, 100, Some(&complete())));
+            assert!(!keep_old_on_error(
+                "pdf-exhaustive",
+                12,
+                100,
+                Some(&complete())
+            ));
+        }
+
+        #[test]
+        fn a_first_seen_file_has_nothing_to_keep() {
+            // No stored row at this path (a genuinely new file): an error is just
+            // recorded, there being no old row to preserve.
+            assert!(!keep_old_on_error("error:extract:pdf", 12, 100, None));
+        }
+    }
+
+    /// The end-of-run `embed_model` marker gate. A model-change migration must
+    /// not close its own upgrade gate until every file has actually been migrated
+    /// — the exact interaction keep-on-failure would otherwise break.
+    mod record_embed_model {
+        use super::super::may_record_embed_model;
+
+        #[test]
+        fn a_non_model_change_always_re_records_the_current_model() {
+            // Fresh index, unchanged model, or a grandfathered `None` corpus: the
+            // marker merely records the current model and is always safe to write,
+            // whatever the run's outcome or however many old rows it kept.
+            for clean in [true, false] {
+                for kept in [0, 3] {
+                    assert!(
+                        may_record_embed_model(false, clean, kept),
+                        "not a model change: clean={clean} kept={kept} must record"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_completed_migration_with_no_kept_rows_advances_the_marker() {
+            // Clean run, nothing kept: every file now carries new-model vectors, so
+            // the gate may finally close.
+            assert!(may_record_embed_model(true, true, 0));
+        }
+
+        #[test]
+        fn a_kept_old_row_holds_the_gate_open_even_on_a_clean_run() {
+            // The regression this fix pins: a clean model-change run that KEPT an
+            // old row left that file on old-model vectors with no per-file signal.
+            // Advancing the marker would strand it forever, so the gate stays open
+            // for the next resume.
+            assert!(!may_record_embed_model(true, true, 1));
+            assert!(!may_record_embed_model(true, true, 7));
+        }
+
+        #[test]
+        fn an_interrupted_migration_holds_the_gate_open() {
+            // Cancelled or failed: files the run never reached still carry old-model
+            // vectors, so the marker must not advance regardless of kept rows.
+            assert!(!may_record_embed_model(true, false, 0));
+            assert!(!may_record_embed_model(true, false, 4));
+        }
     }
 }
