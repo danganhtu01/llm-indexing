@@ -626,7 +626,10 @@ async fn set_runtime_defaults(
 /// extract=20 on a job, get a 200, and then only ever see the process default
 /// (12) on any later read, which reads exactly like the setting was lost. This
 /// closes that: it returns the same per-job `RuntimeKnobs.view()` the POST does.
-async fn get_job_runtime(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+async fn get_job_runtime(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
     let status = state
         .jobs
         .read()
@@ -634,7 +637,11 @@ async fn get_job_runtime(State(state): State<AppState>, AxumPath(id): AxumPath<S
         .get(&id)
         .and_then(|job| job["status"].as_str().map(str::to_string));
     let Some(status) = status else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error":"job not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"job not found"})),
+        )
+            .into_response();
     };
     // A terminal job's per-job knobs are reaped, so there is nothing live to
     // report — 409 rather than a 404 that would read as "never existed".
@@ -647,7 +654,11 @@ async fn get_job_runtime(State(state): State<AppState>, AxumPath(id): AxumPath<S
     }
     match state.runtimes.read().await.get(&id).cloned() {
         Some(runtime) => Json(runtime.view()).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(json!({"error":"job not found"}))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"job not found"})),
+        )
+            .into_response(),
     }
 }
 
@@ -1150,27 +1161,23 @@ fn corpus_index(path: &Path) -> Result<HashMap<String, DocMeta>, ReadError> {
         Corpus::Busy => return Err(ReadError::Busy),
         Corpus::Unreadable(error) => return Err(ReadError::Unreadable(error)),
     };
-    let mut statement = connection
-        .prepare(
-            "SELECT f.path, f.id, COALESCE(f.chars,0), COALESCE(f.method,''), COALESCE(f.lang,''), \
+    let mut statement = connection.prepare(
+        "SELECT f.path, f.id, COALESCE(f.chars,0), COALESCE(f.method,''), COALESCE(f.lang,''), \
                     COALESCE(substr(fts.content,1,400),'') \
              FROM files f JOIN fts ON fts.rowid = f.id",
-        )
-        ?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                DocMeta {
-                    id: row.get(1)?,
-                    character_count: row.get(2)?,
-                    method: row.get(3)?,
-                    lang: row.get(4)?,
-                    snippet: row.get(5)?,
-                },
-            ))
-        })
-        ?;
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            DocMeta {
+                id: row.get(1)?,
+                character_count: row.get(2)?,
+                method: row.get(3)?,
+                lang: row.get(4)?,
+                snippet: row.get(5)?,
+            },
+        ))
+    })?;
     rows.collect::<Result<HashMap<_, _>, _>>()
         .map_err(ReadError::from)
 }
@@ -1438,9 +1445,7 @@ fn now() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_settings, read_only, requested_paths, root_name, valid_output_name, Corpus,
-    };
+    use super::{build_settings, read_only, requested_paths, root_name, valid_output_name, Corpus};
     use crate::config::{Config, MAX_WORKERS};
     use crate::settings::{
         OcrSettings, VisionSettings, OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE,

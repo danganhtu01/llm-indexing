@@ -62,7 +62,8 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     // there: a cold model cache is fetched over the network and that failure must
     // not land after the previous corpus has been deleted. The embedder pool is
     // seeded with this instance and grows lazily from it.
-    let first_embedder = Embedder::with_intra_threads(&request.config, runtime.embed_intra_threads())?;
+    let first_embedder =
+        Embedder::with_intra_threads(&request.config, runtime.embed_intra_threads())?;
     // The last possible moment to destroy the previous corpus. Everything that
     // can predictably fail on an operator mistake — an unreadable config, a
     // missing or corrupt vision model, an embedding model that has to be
@@ -79,6 +80,25 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         request.resume,
         request.artifacts,
     )?;
+    // Embedding-model identity gate: the resume skip predicate compares
+    // size/mtime/completeness, but none of those change when the EMBEDDING
+    // MODEL does — an upgraded model would silently leave unchanged files
+    // carrying old-model vectors, degrading semantic search with no signal.
+    // A recorded model different from the current one forces a full
+    // re-process; a corpus from before this key existed (None) is left as-is
+    // and gains the key going forward.
+    let embed_model_changed = request.resume
+        && store
+            .get_meta("embed_model")?
+            .is_some_and(|recorded| recorded != request.config.embedding_model);
+    if embed_model_changed {
+        eprintln!(
+            "embedding model changed to {} — re-embedding the whole corpus",
+            request.config.embedding_model
+        );
+    }
+    store.set_meta("embed_model", &request.config.embedding_model)?;
+    store.set_meta("last_job_started_at", &format!("{:.0}", now()))?;
     let existing = if request.resume {
         store.existing_keys()?
     } else {
@@ -111,7 +131,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         records.retain(|record| include_paths.contains(&record.path));
     }
     let before = records.len();
-    if request.resume {
+    if request.resume && !embed_model_changed {
         records.retain(|record| {
             existing
                 .get(&record.path)
@@ -314,10 +334,16 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     // for. The deletes join the store's open transaction, so `finish` commits
     // them atomically with the final batch of indexed files.
     let pruned = match &outcome {
-        Ok(false) if request.resume && !current.is_empty() => {
-            store.prune_missing(&roots, &current)
-        }
+        Ok(false) if request.resume && !current.is_empty() => store.prune_missing(&roots, &current),
         _ => Ok(0),
+    };
+    // `last_job_finished_at` only for a run that completed cleanly — a corpus
+    // whose finished_at predates started_at is a corpus whose last job was
+    // interrupted. Captured (not propagated) so `finish` still runs first.
+    let stamped = if matches!(&outcome, Ok(false)) {
+        store.set_meta("last_job_finished_at", &format!("{:.0}", now()))
+    } else {
+        Ok(())
     };
     // Commit before propagating anything: success, cancellation and a mid-run
     // failure all leave their finished files in the destination corpus, which is
@@ -327,6 +353,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     let cancelled = outcome?;
     committed?;
     stats.removed = pruned?;
+    stamped?;
     if cancelled {
         anyhow::bail!("indexing cancelled; {} file(s) committed", stats.files)
     }
@@ -397,9 +424,27 @@ fn embed_worker(
                             file.chunks = chunks;
                             Ok(file)
                         }
-                        Err(error) => Err(error),
+                        // A per-file embedding failure becomes an `error:` ROW,
+                        // not a job failure: one flaky inference used to kill a
+                        // whole run, where the vlm engine's equivalent records
+                        // and continues. The row has no chunks and an error
+                        // method, so the next resume re-attempts it
+                        // (`!has_chunks || incomplete_method`); its extracted
+                        // text still lands in FTS, so keyword search works
+                        // even while vectors are missing.
+                        Err(error) => {
+                            eprintln!(
+                                "embedding failed for {}: {error:#} (recorded as an error row)",
+                                file.rec.path
+                            );
+                            file.method = embed_error_method(&error);
+                            file.chunks.clear();
+                            Ok(file)
+                        }
                     }
                 }
+                // Checkout failure = the pool itself is broken (not one file);
+                // this remains fatal for the run.
                 Err(error) => Err(error),
             }
         };
@@ -498,6 +543,21 @@ fn incomplete_method(method: &str) -> bool {
     method == "name-only" || method.starts_with("error:") || method.ends_with("-partial")
 }
 
+/// The `method` recorded for a file whose EMBEDDING failed (extraction
+/// succeeded). Bounded and single-line: `method` is a short token column that
+/// the UI renders inline, not an error log.
+fn embed_error_method(error: &anyhow::Error) -> String {
+    let mut message = format!("{error:#}").replace(['\r', '\n'], " ");
+    if message.len() > 120 {
+        let mut end = 120;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    format!("error:embed:{message}")
+}
+
 /// Normalize content to Unicode NFC at the storage boundary. OCR (Tesseract)
 /// emits Vietnamese diacritics as decomposed sequences (base letter + combining
 /// marks); stored and displayed content must be precomposed NFC so search and
@@ -548,10 +608,7 @@ fn write_analysis(out: &Path, paths: &[PathBuf]) -> Result<()> {
     let database = database_path(out);
     let connection = connect(&database)?;
     let report = analyze(&connection)?;
-    let reports = database
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("reports");
+    let reports = database.parent().unwrap_or(Path::new(".")).join("reports");
     fs::create_dir_all(&reports)?;
     fs::write(
         reports.join("analysis.json"),
