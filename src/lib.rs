@@ -1,6 +1,7 @@
 pub mod config;
 pub mod embedding;
 pub mod extract;
+pub mod failure;
 pub mod jobs_store;
 pub mod media;
 pub mod model;

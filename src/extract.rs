@@ -14,6 +14,7 @@ use tempfile::tempdir;
 use zip::ZipArchive;
 
 use crate::config::Config;
+use crate::failure::CapabilityUnavailable;
 use crate::media::Transcriber;
 use crate::ocr::TesseractOcr;
 
@@ -134,6 +135,7 @@ impl Extracted {
             method: "excluded:unsupported".into(),
             ocr_used: false,
             pages: 0,
+            page_segments: Vec::new(),
         }
     }
 }
@@ -416,7 +418,9 @@ fn media(
     transcriber: &Transcriber,
 ) -> Result<Extracted> {
     if !transcriber.available() {
-        anyhow::bail!("local Whisper transcription model is unavailable")
+        return Err(
+            CapabilityUnavailable("local Whisper transcription model is unavailable").into(),
+        );
     }
     let transcript = transcriber.transcribe(path)?;
     let mut sections = vec![format!("[Audio transcript]\n{transcript}")];
@@ -646,7 +650,12 @@ fn xml_text(xml: &[u8]) -> Vec<String> {
 
 fn pdf_exhaustive(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
     if !ocr.available {
-        anyhow::bail!("Tesseract is unavailable for exhaustive PDF OCR")
+        // A typed error, not `anyhow::bail!`, so `crate::failure::classify`
+        // recognizes this as `Unsupported` by downcasting rather than parsing
+        // the message — see `failure.rs`.
+        return Err(
+            CapabilityUnavailable("Tesseract is unavailable for exhaustive PDF OCR").into(),
+        );
     }
     let pages = pdf_pages(path);
     if pages == 0 {
