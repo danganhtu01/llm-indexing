@@ -236,6 +236,7 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         .route("/corpus/tree", get(corpus_tree))
         .route("/corpus/documents/{id}/text", get(corpus_document_text))
         .route("/corpus/status", get(corpus_status_handler))
+        .route("/export/corpus", get(export_corpus))
         .layer(DefaultBodyLimit::max(max_body))
         .layer(TraceLayer::new_for_http())
         .with_state(state))
@@ -1505,6 +1506,101 @@ fn document_text(corpus_db: &Path, id: i64) -> Result<Option<String>, ReadError>
         )
         .optional()
         .map_err(ReadError::from)
+}
+
+/// GET /export/corpus?output=<artifact>
+///
+/// A consistent point-in-time copy of the published corpus database, streamed
+/// back whole as `application/vnd.sqlite3`. A raw `fs::copy` of a database that
+/// jobs write to in place can capture a torn page mid-write; `VACUUM INTO`
+/// rebuilds the entire file from a single read transaction, which is the only
+/// primitive that is safe to run against a live rollback-journal SQLite file —
+/// the same guarantee the backup API gives, without needing one. `output` goes
+/// through the exact same confinement as every other corpus route
+/// (`resolve_output`/`valid_output_name`): a plain filename under
+/// `output_root`, never a path. The vacuum target is a scratch temp directory
+/// that is removed — file included — the moment this call returns, win or
+/// lose, so a crashed or slow export never leaves a copy behind.
+async fn export_corpus(
+    State(state): State<AppState>,
+    Query(query): Query<OutputQuery>,
+) -> Response {
+    let output = match resolve_output(&state, query.output.as_deref()) {
+        Ok(path) => path,
+        Err(response) => return response.into_response(),
+    };
+    let filename = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("corpus.sqlite")
+        .to_string();
+    match tokio::task::spawn_blocking(move || vacuum_export(&output)).await {
+        Ok(Ok(bytes)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/vnd.sqlite3")
+            .header(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            )
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":"response error"})),
+                )
+                    .into_response()
+            }),
+        Ok(Err(ExportError::Absent)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"no corpus to export; run an index job first"})),
+        )
+            .into_response(),
+        Ok(Err(ExportError::Busy)) => read_error(&ReadError::Busy),
+        Ok(Err(ExportError::Unreadable(detail))) => read_error(&ReadError::Unreadable(detail)),
+        Err(error) => unreadable(&format!("export task failed: {error}")),
+    }
+}
+
+/// Why an export could not be produced. Distinct from [`ReadError`] because
+/// "no corpus has been published yet" is a real, expected outcome here (unlike
+/// every other corpus route, there is no zeroed/empty value to hand back for
+/// an export) and must 404, not join `Unreadable`'s 503.
+enum ExportError {
+    /// No job has ever written this output; nothing exists to export.
+    Absent,
+    /// A writer holds the lock; the corpus is healthy, retry shortly.
+    Busy,
+    Unreadable(String),
+}
+
+/// `VACUUM INTO` the corpus database at `path` into a scratch temp file, read
+/// the whole copy back into memory, then let `scratch` (a [`tempfile::TempDir`])
+/// remove the directory — and the file inside it — on drop. That drop runs on
+/// every return path out of this function, including the two error returns
+/// below, so a failed vacuum or a failed read is never the reason a scratch
+/// copy is left on disk.
+fn vacuum_export(path: &Path) -> Result<Vec<u8>, ExportError> {
+    let connection = match open_ro(path) {
+        Corpus::Absent => return Err(ExportError::Absent),
+        Corpus::Ready(connection) => connection,
+        Corpus::Busy => return Err(ExportError::Busy),
+        Corpus::Unreadable(error) => return Err(ExportError::Unreadable(error)),
+    };
+    let scratch = tempfile::tempdir()
+        .map_err(|error| ExportError::Unreadable(format!("scratch directory: {error}")))?;
+    let target = scratch.path().join("export.sqlite");
+    connection
+        .execute(
+            "VACUUM INTO ?1",
+            params![target.to_string_lossy().into_owned()],
+        )
+        .map_err(|error| ExportError::Unreadable(format!("VACUUM INTO failed: {error}")))?;
+    // The read lock this connection holds is no longer needed once the vacuum
+    // has committed its own read transaction; drop it before the (potentially
+    // large) file read below so a writer waiting on it is not held up by that.
+    drop(connection);
+    fs::read(&target)
+        .map_err(|error| ExportError::Unreadable(format!("reading export copy: {error}")))
 }
 
 /// GET /corpus/status[?output=corpus.sqlite]
