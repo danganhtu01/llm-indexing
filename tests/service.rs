@@ -66,7 +66,10 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
     assert_eq!(job["status"], "complete", "{job}");
     // Only the published corpus plus P0-11's persisted job store
     // (`jobs.sqlite`) live under `output_root` — nothing else.
-    assert_eq!(output_dir_names(&output), vec!["corpus.sqlite", "jobs.sqlite"]);
+    assert_eq!(
+        output_dir_names(&output),
+        vec!["corpus.sqlite", "jobs.sqlite"]
+    );
     assert!(output.join("corpus.sqlite").is_file());
 
     let response = app
@@ -216,7 +219,10 @@ async fn overwrite_replaces_the_existing_corpus() {
     assert_eq!(job["files"], 1);
     // Nothing but the published database and the persisted job store are left
     // behind.
-    assert_eq!(output_dir_names(&output), vec!["corpus.sqlite", "jobs.sqlite"]);
+    assert_eq!(
+        output_dir_names(&output),
+        vec!["corpus.sqlite", "jobs.sqlite"]
+    );
 }
 
 #[tokio::test]
@@ -370,6 +376,121 @@ async fn a_startup_sweep_rewrites_jobs_left_non_terminal_by_a_prior_instance_to_
     assert_eq!(status, StatusCode::OK, "{done}");
     assert_eq!(done["status"], "complete", "{done}");
     assert_eq!(done["files"], 2);
+}
+
+// ── Cancellation ─────────────────────────────────────────────────────────
+//
+// A job's cancellation flag lives only in this process's memory (see
+// `AppState::cancellations`), never in `jobs.sqlite` — so an id this process
+// has no live flag for (aged out, or genuinely from a prior instance) must
+// still get an honest answer instead of a bare 404, and cancelling it must
+// never flip a persisted terminal row to "cancelled".
+
+#[tokio::test]
+async fn cancelling_a_truly_unknown_job_id_404s() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+    let app = guard_router(&output, &input);
+
+    let (status, body) = post_json(&app, "/jobs/never-existed/cancel", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn cancelling_a_job_this_process_only_knows_from_jobs_sqlite_reports_conflict_not_404() {
+    // Reproduces the P0-11-era gap: a job this process has no in-memory
+    // cancellation flag for (aged out of `cancellations`, or — the far more
+    // common case — swept to a terminal `error` by `sweep_interrupted` at
+    // startup, exactly as `a_startup_sweep_rewrites_...` above sets up) must
+    // not 404 just because `GET /jobs/{id}` would happily answer for it from
+    // `jobs.sqlite`. And crucially: this call must not be the thing that
+    // marks a completed/errored run "cancelled" — there is no live worker
+    // behind it to cancel.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+    {
+        let store = JobsStore::open(&output).unwrap();
+        store
+            .record(
+                "was-running",
+                &json!({"id":"was-running","status":"running","processed":3,"total":10}),
+            )
+            .unwrap();
+        store
+            .record(
+                "already-done",
+                &json!({"id":"already-done","status":"complete","files":2}),
+            )
+            .unwrap();
+    }
+    // `router(...)` (via `guard_router`) runs the startup sweep, so
+    // "was-running" is now a terminal `error` row before this process ever
+    // saw a cancellation request for it — the same state a real restart
+    // leaves.
+    let app = guard_router(&output, &input);
+
+    for id in ["was-running", "already-done", "unknown-but-plausible"] {
+        let plausible_but_unknown = id == "unknown-but-plausible";
+        let (status, body) = post_json(&app, &format!("/jobs/{id}/cancel"), json!({})).await;
+        if plausible_but_unknown {
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+            continue;
+        }
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{id}: expected \"not active\", not a bare 404: {body}"
+        );
+    }
+
+    // Neither persisted row was mutated by the cancel attempt.
+    let (_, was_running) = get_json_status(&app, "/jobs/was-running").await;
+    assert_eq!(was_running["status"], "error", "{was_running}");
+    assert_eq!(was_running["error"], INTERRUPTED_ERROR, "{was_running}");
+    let (_, already_done) = get_json_status(&app, "/jobs/already-done").await;
+    assert_eq!(already_done["status"], "complete", "{already_done}");
+}
+
+#[tokio::test]
+async fn cancelling_a_genuinely_running_job_still_accepts_and_marks_it_cancelling() {
+    // The live path (a cancellation flag this process itself created via
+    // `submit`) must keep working exactly as before.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    sample_corpus(&input, 40);
+    let app = guard_router(&output, &input);
+
+    let (status, _) = post_json(
+        &app,
+        "/index",
+        json!({"id":"job-cancel-me","paths":[input],"output":"corpus.sqlite","ocr":"off"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    wait_until_running(&app, "job-cancel-me").await;
+
+    let (status, body) = post_json(&app, "/jobs/job-cancel-me/cancel", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["status"], "cancelling", "{body}");
+
+    // `wait_for_job` only recognises "complete"/"error" as terminal, so a
+    // cancelled run needs its own poll here.
+    let mut job = json!({});
+    for _ in 0..1500 {
+        job = get_json(&app, "/jobs/job-cancel-me").await;
+        if job["status"] == "cancelled" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(job["status"], "cancelled", "{job}");
 }
 
 #[tokio::test]

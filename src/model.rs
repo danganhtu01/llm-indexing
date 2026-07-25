@@ -28,6 +28,12 @@ pub struct ProcessedFile {
     /// Vision analysis for image/video files when a job opts in; `None` for the
     /// off-path and non-vision files.
     pub vision: Option<VisionResult>,
+    /// Carried straight from `Extracted::page_segments` (see `extract.rs`):
+    /// `(page_number, text)` pairs for the extraction paths that can
+    /// attribute text to a page. Empty for everything else. The embedder
+    /// chunks these directly when present so `EmbeddedChunk::page_start`/
+    /// `page_end` — and from there `VectorHit`'s — are populated (P0-8).
+    pub page_segments: Vec<(usize, String)>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
