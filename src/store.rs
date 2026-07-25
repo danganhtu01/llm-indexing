@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::model::{ProcessedFile, SearchHit};
 use crate::normalize::{fold, words, Normalizer};
 use crate::pipeline::{row_complete, MAX_ATTEMPTS};
-use crate::vision::VisionResult;
+use crate::vision::{FaceDetection, VisionResult};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS files(
@@ -63,9 +63,22 @@ CREATE TABLE IF NOT EXISTS vision(
   caption TEXT,
   embedding BLOB, embedding_model TEXT, dimensions INTEGER,
   frames INTEGER,
-  elapsed_ms INTEGER, error TEXT
+  elapsed_ms INTEGER, error TEXT,
+  faces_model TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_vision_phash ON vision(phash);
+CREATE TABLE IF NOT EXISTS faces(
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  face_index INTEGER NOT NULL,
+  x INTEGER NOT NULL, y INTEGER NOT NULL,
+  width INTEGER NOT NULL, height INTEGER NOT NULL,
+  quality REAL NOT NULL,
+  embedding BLOB, dimensions INTEGER,
+  model TEXT NOT NULL,
+  frame INTEGER,
+  PRIMARY KEY(file_id, face_index)
+);
+CREATE INDEX IF NOT EXISTS idx_faces_file ON faces(file_id);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
 
@@ -85,6 +98,14 @@ const ADDED_FILE_COLUMNS: &[(&str, &str)] = &[
     ("last_attempt_at", "REAL"),
     ("elapsed_ms", "INTEGER"),
 ];
+
+/// The same story for the `vision` table: [`SCHEMA`] created it once and never
+/// revisits it, so a column added later has to be re-added per corpus at open.
+///
+/// `faces_model` needs no backfill and must not get one. NULL is already the
+/// truthful value for every pre-existing row — nothing scanned those files for
+/// faces — and it is exactly what makes the first faces job pick them up.
+const ADDED_VISION_COLUMNS: &[(&str, &str)] = &[("faces_model", "TEXT")];
 
 /// How long a WRITER waits for a lock before giving up. An indexing job now
 /// writes into the same file readers open, and a batch commit holds an exclusive
@@ -173,12 +194,7 @@ pub fn remove_database(out: &Path) -> Result<()> {
 ///
 /// See [`attempts_backfill`] for what the stamped value means.
 fn migrate_files_table(connection: &Connection) -> Result<()> {
-    let mut statement = connection.prepare("PRAGMA table_info(files)")?;
-    let present = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .flatten()
-        .collect::<HashSet<_>>();
-    drop(statement);
+    let present = existing_columns(connection, "files")?;
     let missing = ADDED_FILE_COLUMNS
         .iter()
         .filter(|(name, _)| !present.contains(*name))
@@ -199,6 +215,51 @@ fn migrate_files_table(connection: &Connection) -> Result<()> {
     connection
         .execute_batch(&script)
         .context("migrating the files table")?;
+    Ok(())
+}
+
+/// The column names an existing table already has, by `PRAGMA table_info`. The
+/// one source both migrations ask, so neither can drift into believing a column
+/// is there because a `CREATE TABLE IF NOT EXISTS` mentions it.
+fn existing_columns(connection: &Connection, table: &str) -> Result<HashSet<String>> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let present = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .flatten()
+        .collect::<HashSet<_>>();
+    Ok(present)
+}
+
+/// Bring an existing `vision` table up to the current column set — the same
+/// no-op-when-current, additive `ALTER TABLE ADD COLUMN` shape as
+/// [`migrate_files_table`], with no backfill to do (see
+/// [`ADDED_VISION_COLUMNS`]).
+///
+/// A corpus that predates the vision table has no `vision` table to migrate;
+/// [`SCHEMA`] has just created it with the current columns, so `present` already
+/// contains them and this returns immediately.
+fn migrate_vision_table(connection: &Connection) -> Result<()> {
+    let present = existing_columns(connection, "vision")?;
+    if present.is_empty() {
+        return Ok(());
+    }
+    let missing = ADDED_VISION_COLUMNS
+        .iter()
+        .filter(|(name, _)| !present.contains(*name))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut script = String::from("BEGIN IMMEDIATE;\n");
+    for (name, declaration) in &missing {
+        script.push_str(&format!(
+            "ALTER TABLE vision ADD COLUMN {name} {declaration};\n"
+        ));
+    }
+    script.push_str("COMMIT;");
+    connection
+        .execute_batch(&script)
+        .context("migrating the vision table")?;
     Ok(())
 }
 
@@ -319,6 +380,8 @@ impl IndexStore {
         // Only ever a no-op for a corpus this build created; the live ones were
         // created by builds whose `files` table stops at `indexed_at`.
         migrate_files_table(&connection)?;
+        // Likewise for `vision`, whose column set grew after the tiers shipped.
+        migrate_vision_table(&connection)?;
         // Self-description (previously the corpus was anonymous — after a
         // restart nothing recorded what produced it): created_at once, plus
         // per-job values the pipeline stamps via `set_meta`. `IF NOT EXISTS`
@@ -425,6 +488,25 @@ impl IndexStore {
         Ok(rows.flatten().collect())
     }
 
+    /// The face model recorded per file path, for the faces change-detection
+    /// rule. A path present with `None` was scanned by a build that wrote no
+    /// model id; a path ABSENT from the map has no vision row at all. Both mean
+    /// "not scanned by the pair this job runs", which is what the rule needs.
+    ///
+    /// A sibling of [`existing_vision_modes`](Self::existing_vision_modes)
+    /// rather than a widening of it: the pipeline only asks when a job has faces
+    /// enabled AND staged, so a corpus that never uses the feature never pays
+    /// for the scan.
+    pub fn existing_face_models(&self) -> Result<HashMap<String, Option<String>>> {
+        let mut statement = self.connection.prepare(
+            "SELECT f.path, v.faces_model FROM vision v JOIN files f ON f.id = v.file_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
     /// Delete rows for files that have disappeared — but ONLY under the job's
     /// own roots. A row outside every walked root was never visible to this
     /// job's walk, so its absence from `current` says nothing about the file:
@@ -459,6 +541,8 @@ impl IndexStore {
                 .execute("DELETE FROM chunks WHERE file_id=?1", [id])?;
             self.connection
                 .execute("DELETE FROM vision WHERE file_id=?1", [id])?;
+            self.connection
+                .execute("DELETE FROM faces WHERE file_id=?1", [id])?;
             self.connection
                 .execute("DELETE FROM fts WHERE rowid=?1", [id])?;
             self.connection
@@ -694,12 +778,33 @@ impl IndexStore {
                 .connection
                 .query_row(
                     "SELECT mode,width,height,phash,exif_json,quality_json,objects_json,\
-                     tags_json,caption,embedding,embedding_model,dimensions,frames,elapsed_ms,error \
-                     FROM vision WHERE file_id=?1",
+                     tags_json,caption,embedding,embedding_model,dimensions,frames,elapsed_ms,\
+                     error,faces_model FROM vision WHERE file_id=?1",
                     [old_id],
-                    |row| (0..15).map(|i| row.get::<_, rusqlite::types::Value>(i)).collect(),
+                    |row| {
+                        (0..16)
+                            .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                            .collect()
+                    },
                 )
                 .optional()?,
+            _ => None,
+        };
+        // The same capture for the face rows, on its own condition. Faces has to
+        // be asked separately because it is a sub-tier, not a tier: a job can run
+        // vision with faces OFF over a file whose faces were recorded by an
+        // earlier job, and the vision carry-forward above would not fire (this
+        // job DID produce a vision result). Dropping the rows then would make
+        // turning faces off destructive, which the rest of vision never is.
+        let carried_faces: Option<Vec<Vec<rusqlite::types::Value>>> = match old_id {
+            Some(old_id)
+                if file
+                    .vision
+                    .as_ref()
+                    .is_none_or(|result| result.faces_model.is_none()) =>
+            {
+                Some(self.stored_faces(old_id)?)
+            }
             _ => None,
         };
         if let Some(old_id) = old_id {
@@ -753,6 +858,9 @@ impl IndexStore {
         match (&file.vision, old_id) {
             (Some(result), _) => {
                 self.upsert_vision(id, result)?;
+                if result.faces_model.is_some() {
+                    self.upsert_faces(id, &result.faces)?;
+                }
             }
             (None, Some(old_id)) => {
                 // Belt-and-braces: on a foreign_keys=OFF build the old row would
@@ -760,19 +868,40 @@ impl IndexStore {
                 self.connection
                     .execute("DELETE FROM vision WHERE file_id=?1", [old_id])?;
                 if let (true, Some(values)) = (unchanged, carried_vision) {
-                    let mut row: Vec<rusqlite::types::Value> = Vec::with_capacity(16);
+                    let mut row: Vec<rusqlite::types::Value> = Vec::with_capacity(17);
                     row.push(rusqlite::types::Value::Integer(id));
                     row.extend(values);
                     self.connection.execute(
                         "INSERT OR REPLACE INTO vision(file_id,mode,width,height,phash,exif_json,\
                          quality_json,objects_json,tags_json,caption,embedding,embedding_model,\
-                         dimensions,frames,elapsed_ms,error) \
-                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                         dimensions,frames,elapsed_ms,error,faces_model) \
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                         rusqlite::params_from_iter(row),
                     )?;
                 }
             }
             (None, None) => {}
+        }
+        // Face rows follow the same three-way rule as the vision row, evaluated
+        // on its own capture: scanned this run -> already written above;
+        // not scanned and the bytes are UNCHANGED -> carry the old rows forward
+        // (turning faces off, or running a plain OCR pass, must not erase them);
+        // not scanned and the bytes CHANGED -> leave them dropped, since boxes
+        // and vectors describing the previous content would now be a claim about
+        // a person that the file no longer supports.
+        if let Some(carried) = &carried_faces {
+            if let Some(old_id) = old_id {
+                // Belt-and-braces on a foreign_keys=OFF build, exactly as above:
+                // clear the stale id before deciding whether to re-attach. Only
+                // reachable when this run wrote no faces of its own, so it can
+                // never delete what was just written — including the case where
+                // SQLite hands the replaced row's freed rowid straight back.
+                self.connection
+                    .execute("DELETE FROM faces WHERE file_id=?1", [old_id])?;
+            }
+            if unchanged {
+                self.restore_faces(id, carried)?;
+            }
         }
         self.stamp_vec0()
     }
@@ -890,8 +1019,9 @@ impl IndexStore {
             .map(|vector| crate::embedding::vector_to_bytes(vector));
         self.connection.execute(
             "INSERT OR REPLACE INTO vision(file_id,mode,width,height,phash,exif_json,quality_json,\
-             objects_json,tags_json,caption,embedding,embedding_model,dimensions,frames,elapsed_ms,error) \
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+             objects_json,tags_json,caption,embedding,embedding_model,dimensions,frames,elapsed_ms,\
+             error,faces_model) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 file_id,
                 vision.mode.as_str(),
@@ -909,8 +1039,76 @@ impl IndexStore {
                 vision.frames.map(|value| value as i64),
                 vision.elapsed_ms.map(|value| value as i64),
                 vision.error,
+                vision.faces_model,
             ],
         )?;
+        Ok(())
+    }
+
+    /// Replace the `faces` rows for `file_id` with `faces`.
+    ///
+    /// `face_index` is the position in the detector's deterministic best-first
+    /// order, so re-running the same file against the same models rewrites the
+    /// same rows. The old rows are deleted first rather than upserted over: a
+    /// re-analysis that finds FEWER faces must not leave the tail of the
+    /// previous one behind, still attributed to a file that no longer shows
+    /// those people.
+    pub fn upsert_faces(&self, file_id: i64, faces: &[FaceDetection]) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM faces WHERE file_id=?1", [file_id])?;
+        for (index, face) in faces.iter().enumerate() {
+            let embedding = face
+                .embedding
+                .as_ref()
+                .map(|vector| crate::embedding::vector_to_bytes(vector));
+            self.connection.execute(
+                "INSERT INTO faces(file_id,face_index,x,y,width,height,quality,embedding,\
+                 dimensions,model,frame) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    file_id,
+                    index as i64,
+                    face.x,
+                    face.y,
+                    face.width,
+                    face.height,
+                    face.quality,
+                    embedding,
+                    face.embedding.as_ref().map(|vector| vector.len() as i64),
+                    crate::vision::faces::FACE_MODEL_ID,
+                    face.frame,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The face rows recorded for `file_id`, in stored order — the capture half
+    /// of the carry-forward that has to survive the rowid change on a re-add.
+    fn stored_faces(&self, file_id: i64) -> Result<Vec<Vec<rusqlite::types::Value>>> {
+        let mut statement = self.connection.prepare(
+            "SELECT face_index,x,y,width,height,quality,embedding,dimensions,model,frame \
+             FROM faces WHERE file_id=?1 ORDER BY face_index",
+        )?;
+        let rows = statement.query_map([file_id], |row| {
+            (0..10)
+                .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Re-attach captured face rows under a new `file_id`.
+    fn restore_faces(&self, file_id: i64, faces: &[Vec<rusqlite::types::Value>]) -> Result<()> {
+        for face in faces {
+            let mut row: Vec<rusqlite::types::Value> = Vec::with_capacity(11);
+            row.push(rusqlite::types::Value::Integer(file_id));
+            row.extend(face.iter().cloned());
+            self.connection.execute(
+                "INSERT OR REPLACE INTO faces(file_id,face_index,x,y,width,height,quality,\
+                 embedding,dimensions,model,frame) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                rusqlite::params_from_iter(row),
+            )?;
+        }
         Ok(())
     }
 
@@ -1443,6 +1641,286 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "vision row carried forward on unchanged bytes");
         assert_eq!(phash, "aaaaaaaaaaaaaaaa");
+    }
+
+    fn face(x: i32, quality: f32) -> FaceDetection {
+        FaceDetection {
+            x,
+            y: 5,
+            width: 64,
+            height: 80,
+            quality,
+            embedding: Some(vec![0.25, -0.5, 0.75]),
+            frame: None,
+        }
+    }
+
+    fn scanned_photo(path: &str, faces: Vec<FaceDetection>) -> ProcessedFile {
+        let mut file = sample_file(path);
+        file.vision = Some(VisionResult {
+            mode: VisionMode::Tags,
+            phash: Some("aaaaaaaaaaaaaaaa".into()),
+            faces,
+            faces_model: Some("yunet-sface".into()),
+            ..Default::default()
+        });
+        file
+    }
+
+    fn stored_face_rows(temp: &Path) -> Vec<(i64, i64, f64, i64, String, Option<i64>)> {
+        let connection = connect(temp).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT face_index,x,quality,dimensions,model,frame FROM faces \
+                 ORDER BY file_id,face_index",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows
+    }
+
+    #[test]
+    fn faces_round_trip_through_add_and_the_off_path_writes_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        // One scanned photo with two faces, one ordinary file with no vision.
+        store
+            .add(
+                &scanned_photo("/a/photo.jpg", vec![face(10, 0.98), face(90, 0.91)]),
+                0.0,
+            )
+            .unwrap();
+        store.add(&sample_file("/a/notes.txt"), 0.0).unwrap();
+        store.finish().unwrap();
+
+        assert_eq!(
+            stored_face_rows(temp.path()),
+            vec![
+                (0, 10, 0.98_f32 as f64, 3, "yunet-sface".to_string(), None),
+                (1, 90, 0.91_f32 as f64, 3, "yunet-sface".to_string(), None),
+            ]
+        );
+        let connection = connect(temp.path()).unwrap();
+        let stamped: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM vision WHERE faces_model='yunet-sface'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 1, "the scan is stamped on the vision row");
+        // The 128-d-shaped blob is little-endian f32, readable exactly as the
+        // chunk vectors are — the app's clustering pass reads it the same way.
+        let blob: Vec<u8> = connection
+            .query_row(
+                "SELECT embedding FROM faces WHERE face_index=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blob, crate::embedding::vector_to_bytes(&[0.25, -0.5, 0.75]));
+    }
+
+    #[test]
+    fn a_scan_that_found_nothing_is_recorded_as_a_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        store
+            .add(&scanned_photo("/a/landscape.jpg", Vec::new()), 0.0)
+            .unwrap();
+        store.finish().unwrap();
+        assert!(stored_face_rows(temp.path()).is_empty());
+        let connection = connect(temp.path()).unwrap();
+        let model: Option<String> = connection
+            .query_row("SELECT faces_model FROM vision", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(model.as_deref(), Some("yunet-sface"));
+    }
+
+    #[test]
+    fn re_scanning_replaces_rather_than_accumulates() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        store
+            .add(
+                &scanned_photo("/a/photo.jpg", vec![face(10, 0.98), face(90, 0.91)]),
+                0.0,
+            )
+            .unwrap();
+        store.finish().unwrap();
+        // A re-scan that finds ONE face must leave one row, not two: the tail of
+        // the previous scan would otherwise keep claiming a person is in this file.
+        let mut store = IndexStore::open(temp.path(), &off_config(), true, false).unwrap();
+        store
+            .add(&scanned_photo("/a/photo.jpg", vec![face(10, 0.99)]), 1.0)
+            .unwrap();
+        store.finish().unwrap();
+        let rows = stored_face_rows(temp.path());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, 0);
+    }
+
+    #[test]
+    fn turning_faces_off_keeps_the_rows_but_changed_bytes_drop_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        store
+            .add(&scanned_photo("/a/photo.jpg", vec![face(10, 0.98)]), 0.0)
+            .unwrap();
+        store.finish().unwrap();
+
+        // Resume with faces OFF but vision still ON over identical bytes: the
+        // vision row is rewritten by THIS job, so the face rows only survive
+        // because they are carried forward on their own condition.
+        let mut store = IndexStore::open(temp.path(), &off_config(), true, false).unwrap();
+        let mut faces_off = sample_file("/a/photo.jpg");
+        faces_off.vision = Some(VisionResult {
+            mode: VisionMode::Tags,
+            phash: Some("aaaaaaaaaaaaaaaa".into()),
+            ..Default::default()
+        });
+        store.add(&faces_off, 1.0).unwrap();
+        store.finish().unwrap();
+        assert_eq!(
+            stored_face_rows(temp.path()).len(),
+            1,
+            "turning faces off must not delete faces"
+        );
+
+        // Same again, but the bytes changed: the faces described the old content,
+        // so they go.
+        let mut store = IndexStore::open(temp.path(), &off_config(), true, false).unwrap();
+        let mut changed = sample_file("/a/photo.jpg");
+        changed.rec.size = 999;
+        changed.rec.mtime = 123.0;
+        store.add(&changed, 2.0).unwrap();
+        store.finish().unwrap();
+        assert!(
+            stored_face_rows(temp.path()).is_empty(),
+            "stale faces must be dropped on content change"
+        );
+    }
+
+    #[test]
+    fn pruning_a_vanished_file_takes_its_faces_with_it() {
+        let temp = tempfile::tempdir().unwrap();
+        // Walker-shaped paths: `prune_missing` matches root prefixes with the
+        // platform separator, so a POSIX literal would prune nothing on Windows.
+        let separator = std::path::MAIN_SEPARATOR;
+        let root = format!("{separator}a");
+        let gone = format!("{root}{separator}photo.jpg");
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        store
+            .add(&scanned_photo(&gone, vec![face(10, 0.98)]), 0.0)
+            .unwrap();
+        store.finish().unwrap();
+        assert_eq!(stored_face_rows(temp.path()).len(), 1);
+
+        let mut store = IndexStore::open(temp.path(), &off_config(), true, false).unwrap();
+        let removed = store.prune_missing(&[root], &HashSet::new()).unwrap();
+        store.finish().unwrap();
+        assert_eq!(removed, 1);
+        assert!(
+            stored_face_rows(temp.path()).is_empty(),
+            "a file that is gone takes the faces attributed to it with it"
+        );
+    }
+
+    /// The `vision` table exactly as the shipped tiers created it — no
+    /// `faces_model`. Written out in full for the same reason as
+    /// [`LEGACY_SCHEMA`]: a fixture derived from [`SCHEMA`] would track the
+    /// current columns and silently stop testing the migration.
+    const PRE_FACES_VISION_SCHEMA: &str = "\
+CREATE TABLE vision(
+  file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL,
+  width INTEGER, height INTEGER,
+  phash TEXT,
+  exif_json TEXT, quality_json TEXT,
+  objects_json TEXT,
+  tags_json TEXT,
+  caption TEXT,
+  embedding BLOB, embedding_model TEXT, dimensions INTEGER,
+  frames INTEGER,
+  elapsed_ms INTEGER, error TEXT
+);
+";
+
+    #[test]
+    fn opening_a_pre_faces_corpus_adds_faces_model_and_keeps_the_vision_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.sqlite");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(LEGACY_SCHEMA).unwrap();
+            connection.execute_batch(PRE_FACES_VISION_SCHEMA).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO files(id,path,method,size,mtime,indexed_at) \
+                     VALUES(1,'/a/photo.jpg','text',10,0.0,1700.0)",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO vision(file_id,mode,phash) VALUES(1,'tags','abcdabcdabcdabcd')",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // Opening a STORE over it migrates in place (that is where the schema is
+        // applied): the column appears, the existing tier/phash survive, and
+        // `faces_model` is NULL — the truthful value, and exactly what makes the
+        // first faces job pick the file up.
+        IndexStore::open(&path, &off_config(), true, false)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let connection = connect(&path).unwrap();
+        let (mode, phash, faces_model): (String, String, Option<String>) = connection
+            .query_row(
+                "SELECT mode,phash,faces_model FROM vision WHERE file_id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(mode, "tags");
+        assert_eq!(phash, "abcdabcdabcdabcd");
+        assert_eq!(faces_model, None);
+        // The faces table itself arrives by `CREATE TABLE IF NOT EXISTS`, like
+        // every other new table here, and starts empty.
+        let faces: i64 = connection
+            .query_row("SELECT COUNT(*) FROM faces", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(faces, 0);
+        drop(connection);
+
+        // Idempotent: a second open is a no-op, not a duplicate-column error.
+        IndexStore::open(&path, &off_config(), true, false)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let connection = connect(&path).unwrap();
+        let columns = existing_columns(&connection, "vision").unwrap();
+        assert!(columns.contains("faces_model"));
+        assert_eq!(
+            columns.iter().filter(|name| *name == "faces_model").count(),
+            1
+        );
     }
 
     /// The `files` table exactly as every corpus on disk was created: no attempt

@@ -20,7 +20,8 @@ use crate::ocr::TesseractOcr;
 use crate::runtime::{Admission, EmbedderPool, RuntimeKnobs, EMBED_RANGE};
 use crate::store::{analyze, connect, database_path, remove_database, ExistingRow, IndexStore};
 use crate::vision::{
-    is_video_ext, is_vision_ext, needs_vision_reprocess, VisionAnalyzer, VisionMode, VisionResult,
+    is_video_ext, is_vision_ext, needs_faces_reprocess, needs_vision_reprocess, VisionAnalyzer,
+    VisionMode, VisionResult,
 };
 use crate::walker::walk;
 
@@ -163,6 +164,14 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     } else {
         HashMap::new()
     };
+    // The face pair this job will actually scan with — `None` when faces are off
+    // or unstaged, in which case nothing below reads the corpus for face state.
+    let faces_model = vision.faces_model();
+    let face_models = if request.resume && faces_model.is_some() {
+        store.existing_face_models()?
+    } else {
+        HashMap::new()
+    };
     let mut records = walk(request.paths, &request.config);
     let current = records
         .iter()
@@ -210,6 +219,16 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
                     vision_modes
                         .get(&record.path)
                         .and_then(|mode| mode.parse().ok()),
+                    &record.ext,
+                )
+                // Turning faces on is an upgrade the tier ladder cannot see: the
+                // requested tier is unchanged, so without this a corpus already
+                // at `tags` would skip every file and the job would do nothing.
+                || needs_faces_reprocess(
+                    faces_model,
+                    face_models
+                        .get(&record.path)
+                        .and_then(|model| model.as_deref()),
                     &record.ext,
                 );
             let selected =
@@ -390,6 +409,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
             stats.incomplete += usize::from(incomplete_method(&file.method));
             stats.embedded_chunks += file.chunks.len();
             stats.vision_files += usize::from(file.vision.is_some());
+            stats.faces += file.vision.as_ref().map_or(0, |result| result.faces.len());
             // Keep-on-failure: a pure UPGRADE that turned into an error must not
             // REPLACE a still-valid lower-quality row. When the reprocess failed
             // but the file is byte-for-byte unchanged and the stored row is already
