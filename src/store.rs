@@ -267,6 +267,17 @@ pub struct IndexStore {
     /// Set when a per-file rollback itself failed, leaving the open transaction
     /// in an unknown state. `finish` then discards it instead of committing.
     poisoned: bool,
+    /// The corpus' `vec0` shadow index, when it has one — `None` for every
+    /// corpus that has never been through `llm-index vector-index`, which is
+    /// every corpus by default and the reason nothing here costs anything
+    /// unless an operator asked for it.
+    ///
+    /// Held in memory because it is a pair of counts that has to move with the
+    /// rows: [`crate::vec0::IndexState::vectors`] and
+    /// [`crate::vec0::IndexState::chunks`] are what let a reader prove the
+    /// index still covers the corpus, so they are re-stamped inside the same
+    /// per-file savepoint that writes the chunks themselves.
+    vec0: Option<crate::vec0::IndexState>,
 }
 
 impl IndexStore {
@@ -276,6 +287,12 @@ impl IndexStore {
         // addressed it.
         let root = database.parent().unwrap_or(Path::new(".")).to_path_buf();
         fs::create_dir_all(&root)?;
+        // Must precede the open: a connection only picks up the `vec0` module
+        // from SQLite's auto-extension list as it is created, so a writer opened
+        // first could not maintain a corpus that has a shadow index — it would
+        // fail on `no such module: vec0` mid-job. Inert for the corpora that
+        // have none, which is all of them by default.
+        crate::vec0::register();
         let connection = Connection::open(&database)?;
         // Journal mode is left at the rollback-journal default on purpose: the
         // corpus is copied and served as a bare single file, and WAL would add
@@ -348,6 +365,16 @@ impl IndexStore {
         } else {
             None
         };
+        // Read BEFORE the write transaction opens, like the rest of open's
+        // inspection. A shadow index whose table exists but whose build never
+        // finished has no state to load, and is left exactly as it is: this job
+        // will not maintain a table it cannot vouch for, and the build the
+        // operator re-runs replaces it wholesale.
+        let vec0 = if crate::vec0::present(&connection)? {
+            crate::vec0::state(&connection)?
+        } else {
+            None
+        };
         connection.execute_batch("BEGIN IMMEDIATE")?;
         Ok(Self {
             out: root,
@@ -359,6 +386,7 @@ impl IndexStore {
             committed: Instant::now(),
             commit_batch: config.commit_batch.max(1),
             poisoned: false,
+            vec0,
         })
     }
 
@@ -426,6 +454,7 @@ impl IndexStore {
             .collect::<Vec<_>>();
         drop(statement);
         for (id, _) in &stale {
+            self.unindex_chunks_of(*id)?;
             self.connection
                 .execute("DELETE FROM chunks WHERE file_id=?1", [id])?;
             self.connection
@@ -435,6 +464,7 @@ impl IndexStore {
             self.connection
                 .execute("DELETE FROM files WHERE id=?1", [id])?;
         }
+        self.stamp_vec0()?;
         Ok(stale.len())
     }
 
@@ -469,7 +499,13 @@ impl IndexStore {
         // would never be repaired. Rolling back leaves the file absent instead,
         // which is precisely what makes resume redo it.
         self.connection.execute_batch("SAVEPOINT file")?;
+        // The shadow index' counts live in memory as well as in `meta`, and only
+        // the `meta` half is inside the savepoint. Snapshot them so a rolled-back
+        // file leaves both halves agreeing — a stranded in-memory count would be
+        // stamped onto the NEXT file and make the index look stale for good.
+        let vec0 = self.vec0.clone();
         if let Err(error) = self.write_rows(file, indexed_at) {
+            self.vec0 = vec0;
             if let Err(rollback) = self
                 .connection
                 .execute_batch("ROLLBACK TO file; RELEASE file")
@@ -510,6 +546,97 @@ impl IndexStore {
             params![path, at, elapsed_ms as i64],
         )?;
         Ok(())
+    }
+
+    /// Mirror one just-written `chunks` row into the shadow index.
+    ///
+    /// A no-op — not a branch taken cheaply, but no work at all — for a corpus
+    /// without an index, which is every corpus that has not been through
+    /// `llm-index vector-index`. That is what makes the index optional at index
+    /// time as well as at query time: a job on an unindexed corpus writes
+    /// exactly the rows it wrote before this existed.
+    ///
+    /// A chunk the index does not cover (another embedding model, another
+    /// width) is counted and not inserted, which is the same rule
+    /// [`crate::vec0::build`] applies. Both counters move here so the state a
+    /// reader validates against is written by the code that writes the rows.
+    fn index_chunk(&mut self, id: i64, embedding: &[u8]) -> Result<()> {
+        let Some(state) = self.vec0.as_mut() else {
+            return Ok(());
+        };
+        state.chunks += 1;
+        if state.model != crate::embedding::EMBEDDING_MODEL
+            || embedding.len() != state.dimensions * 4
+        {
+            return Ok(());
+        }
+        state.vectors += 1;
+        crate::vec0::insert(&self.connection, id, embedding)
+    }
+
+    /// Drop a file's chunks out of the shadow index, ahead of the `DELETE` that
+    /// removes the rows themselves.
+    ///
+    /// Ahead, not after: the ids and the widths this needs live in the rows
+    /// being deleted, so reading them afterwards would read nothing and leave
+    /// the index holding vectors for chunks that no longer exist — which a
+    /// later k-NN would return as candidates and the re-score would silently
+    /// drop, quietly shrinking every result page near a re-indexed file.
+    fn unindex_chunks_of(&mut self, file_id: i64) -> Result<()> {
+        let Some(state) = self.vec0.as_ref() else {
+            return Ok(());
+        };
+        let width = state.dimensions * 4;
+        let model = state.model.clone();
+        let mut statement = self
+            .connection
+            .prepare("SELECT id,model,LENGTH(embedding) FROM chunks WHERE file_id=?1")?;
+        let doomed = statement
+            .query_map([file_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (id, row_model, length) in doomed {
+            let indexed = row_model == model && length as usize == width;
+            if indexed {
+                crate::vec0::delete(&self.connection, id)?;
+            }
+            let state = self.vec0.as_mut().expect("checked above");
+            state.chunks = state.chunks.saturating_sub(1);
+            if indexed {
+                state.vectors = state.vectors.saturating_sub(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-stamp the shadow index' `meta` record from the in-memory counters.
+    ///
+    /// Called at the end of every unit of work that moved them, INSIDE that
+    /// unit's savepoint/transaction, so the counts a reader validates against
+    /// are published by exactly the commit that published the rows they
+    /// describe. A corpus without an index has nothing to stamp.
+    ///
+    /// The job stamp is re-read here rather than captured at open: the pipeline
+    /// writes `meta.last_job_started_at` AFTER opening the store, so a value
+    /// captured at open would be the PREVIOUS job's and leave this job's own
+    /// work looking like a foreign build's. Reading it back is one indexed row
+    /// lookup against the extraction cost of the file that triggered it.
+    fn stamp_vec0(&mut self) -> Result<()> {
+        // Checked before the lookup, not after: a corpus with no index must not
+        // pay a `meta` query per file for a stamp it will never write.
+        if self.vec0.is_none() {
+            return Ok(());
+        }
+        let job = crate::vec0::job_stamp(&self.connection);
+        let state = self.vec0.as_mut().expect("checked above");
+        state.job = job;
+        crate::vec0::write_state(&self.connection, state)
     }
 
     /// Every database row one file contributes, run inside the caller's
@@ -576,6 +703,7 @@ impl IndexStore {
             _ => None,
         };
         if let Some(old_id) = old_id {
+            self.unindex_chunks_of(old_id)?;
             self.connection
                 .execute("DELETE FROM chunks WHERE file_id=?1", [old_id])?;
             self.connection
@@ -600,6 +728,7 @@ impl IndexStore {
             ],
         )?;
         for chunk in &file.chunks {
+            let embedding = crate::embedding::vector_to_bytes(&chunk.vector);
             self.connection.execute(
                 "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model) \
                  VALUES(?1,?2,?3,?4,?5,?6)",
@@ -607,11 +736,12 @@ impl IndexStore {
                     id,
                     chunk.index as i64,
                     chunk.content,
-                    crate::embedding::vector_to_bytes(&chunk.vector),
+                    embedding,
                     chunk.vector.len() as i64,
                     crate::embedding::EMBEDDING_MODEL,
                 ],
             )?;
+            self.index_chunk(self.connection.last_insert_rowid(), &embedding)?;
         }
         // Vision reconciliation across the rowid change on resume. The REPLACE
         // above cascade-dropped any old vision row (foreign_keys ON):
@@ -644,7 +774,7 @@ impl IndexStore {
             }
             (None, None) => {}
         }
-        Ok(())
+        self.stamp_vec0()
     }
 
     /// The manifest/catalog/sidecar views of one stored file.
@@ -719,6 +849,12 @@ impl IndexStore {
             self.connection.execute_batch("ROLLBACK")?;
             anyhow::bail!("transaction discarded after a failed per-file rollback")
         }
+        // Unconditional, not only when files were written: this job stamped
+        // `meta.last_job_started_at` at its start, which is exactly the witness
+        // a reader compares the shadow index against. A run that wrote nothing
+        // would otherwise leave its own index looking stale — a maintained
+        // corpus must not lose its fast path to a no-op job.
+        self.stamp_vec0()?;
         self.connection.execute_batch("COMMIT")?;
         if let Some(writer) = &mut self.jsonl {
             writer.flush()?
@@ -801,6 +937,11 @@ pub fn connect(index: &Path) -> Result<Connection> {
     } else {
         index.to_path_buf()
     };
+    // Before the open: `vec0` reaches a connection through SQLite's
+    // auto-extension list, consulted once as the connection is created, so a
+    // connection opened first could never query a corpus' shadow index. See
+    // [`crate::vec0::register`].
+    crate::vec0::register();
     let connection = Connection::open(path).context("opening index database")?;
     // A corpus can be read while a job is writing into it; wait out the writer's
     // commit instead of failing the query.
@@ -1536,6 +1677,174 @@ CREATE TABLE chunks(
             1,
             "new bytes, first failure"
         );
+    }
+
+    /// A corpus with a shadow index over `dimensions`-wide vectors, built from
+    /// whatever `chunks` already holds. Returns the destination.
+    fn indexed_corpus(destination: &Path, dimensions: usize) {
+        let mut connection = connect(destination).unwrap();
+        crate::vec0::build(
+            &mut connection,
+            crate::embedding::EMBEDDING_MODEL,
+            dimensions,
+            |_, _| {},
+        )
+        .unwrap();
+    }
+
+    /// `(rows in the shadow index, recorded state)` for a corpus on disk.
+    fn shadow(destination: &Path) -> (i64, crate::vec0::IndexState) {
+        let connection = connect(destination).unwrap();
+        let rows = connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {}", crate::vec0::SHADOW_TABLE),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (rows, crate::vec0::state(&connection).unwrap().unwrap())
+    }
+
+    /// A file carrying `count` chunks whose vectors are 2 floats wide, matching
+    /// [`chunk`].
+    fn embedded_file(path: &str, count: usize) -> ProcessedFile {
+        let mut file = sample_file(path);
+        file.chunks = (0..count).map(chunk).collect();
+        file
+    }
+
+    #[test]
+    fn an_index_job_keeps_an_existing_shadow_index_in_step_with_the_chunks() {
+        // Incremental maintenance, end to end through the writer that jobs use:
+        // new chunks are mirrored as they are written, a re-indexed file's old
+        // vectors go with its old rows, and the recorded counts move with both
+        // so a reader can still prove the index covers the corpus.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&embedded_file("/a/one.txt", 2), 0.0).unwrap();
+        store.finish().unwrap();
+        indexed_corpus(&destination, 2);
+        assert_eq!(shadow(&destination).0, 2);
+
+        // A later job adds a file and re-indexes the first with fewer chunks.
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store.add(&embedded_file("/a/two.txt", 3), 1.0).unwrap();
+        let mut shrunk = embedded_file("/a/one.txt", 1);
+        shrunk.rec.size = 999; // changed bytes, so the row is genuinely replaced
+        store.add(&shrunk, 1.0).unwrap();
+        store.finish().unwrap();
+
+        let (rows, state) = shadow(&destination);
+        assert_eq!(rows, 4, "3 new + 1 replacement, the old 2 removed");
+        assert_eq!(state.vectors, 4);
+        assert_eq!(state.chunks, 4);
+        // The witness a reader checks: recorded chunk count == live chunk count.
+        let live: i64 = connect(&destination)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(live as usize, state.chunks);
+    }
+
+    #[test]
+    fn a_pruned_file_takes_its_vectors_out_of_the_shadow_index() {
+        // The other deletion path. Without it a k-NN keeps nominating chunks of
+        // a file that no longer exists, and every such candidate is dropped by
+        // the re-score — silently shortening result pages.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        // Walker-shaped paths: `prune_missing` matches root prefixes with the
+        // platform separator, so a POSIX literal would prune nothing on Windows.
+        let separator = std::path::MAIN_SEPARATOR;
+        let root = format!("{separator}a");
+        let kept = format!("{root}{separator}kept.txt");
+        let gone = format!("{root}{separator}gone.txt");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&embedded_file(&kept, 1), 0.0).unwrap();
+        store.add(&embedded_file(&gone, 2), 0.0).unwrap();
+        store.finish().unwrap();
+        indexed_corpus(&destination, 2);
+
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        let pruned = store
+            .prune_missing(&[root], &HashSet::from([kept]))
+            .unwrap();
+        store.finish().unwrap();
+
+        assert_eq!(pruned, 1);
+        let (rows, state) = shadow(&destination);
+        assert_eq!(rows, 1);
+        assert_eq!(state.vectors, 1);
+        assert_eq!(state.chunks, 1);
+    }
+
+    #[test]
+    fn a_rolled_back_file_leaves_the_shadow_index_counts_where_it_found_them() {
+        // `add` rolls a failed file back, and the index' counts live in memory
+        // as well as in the transaction. A count stranded by the failure would
+        // be stamped onto the NEXT file and mark the index stale for good.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&embedded_file("/a/good.txt", 1), 0.0).unwrap();
+        store.finish().unwrap();
+        indexed_corpus(&destination, 2);
+
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_second_chunk BEFORE INSERT ON chunks \
+                 WHEN NEW.chunk_index = 1 \
+                 BEGIN SELECT RAISE(ABORT,'simulated chunk write failure'); END",
+            )
+            .unwrap();
+        store
+            .add(&embedded_file("/a/broken.txt", 2), 1.0)
+            .unwrap_err();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_second_chunk")
+            .unwrap();
+        store.add(&embedded_file("/a/later.txt", 1), 1.0).unwrap();
+        store.finish().unwrap();
+
+        let (rows, state) = shadow(&destination);
+        assert_eq!(rows, 2, "the failed file left nothing behind");
+        assert_eq!(state.vectors, 2);
+        assert_eq!(state.chunks, 2);
+        let connection = connect(&destination).unwrap();
+        assert!(matches!(
+            crate::vec0::usable(&connection, crate::embedding::EMBEDDING_MODEL, 2).unwrap(),
+            crate::vec0::Usable::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn a_corpus_without_a_shadow_index_gains_neither_table_nor_marker() {
+        // The default. An index job on an unindexed corpus writes exactly what
+        // it wrote before the index existed — no table, no `meta` key, and
+        // nothing in the write path that fires.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let separator = std::path::MAIN_SEPARATOR;
+        let root = format!("{separator}a");
+        let only = format!("{root}{separator}one.txt");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&embedded_file(&only, 2), 0.0).unwrap();
+        store
+            .prune_missing(&[root], &HashSet::from([only]))
+            .unwrap();
+        store.finish().unwrap();
+
+        let connection = connect(&destination).unwrap();
+        assert!(!crate::vec0::present(&connection).unwrap());
+        assert!(crate::vec0::state(&connection).unwrap().is_none());
+        assert!(matches!(
+            crate::vec0::usable(&connection, crate::embedding::EMBEDDING_MODEL, 2).unwrap(),
+            crate::vec0::Usable::Absent
+        ));
     }
 
     #[test]
