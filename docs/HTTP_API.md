@@ -275,8 +275,15 @@ to the standalone `llm-search` repository (commit `5dcd054`, "move HTTP search
 to the standalone search service") — this service is a pure indexer. It still
 publishes the `chunks` embedding table those endpoints read; the CLI's
 `search`/`vector-search` debug subcommands and the underlying
-`store`/`normalize`/`embedding` code are unchanged here. Point search traffic
-at the `llm-search` service instead of this one.
+`store`/`normalize`/`embedding` code are unchanged here. Point keyword search
+traffic at the `llm-search` service instead of this one.
+
+`GET /corpus/search` (below) is **not** a walk-back of that split. `llm-search`
+holds every chunk vector RESIDENT to serve a search-as-you-type socket, which
+is a multi-gigabyte process on a corpus this size; the route below is the
+streaming, nothing-resident half — one exhaustive scan per request, `O(limit)`
+memory, no second service to deploy — added because on the live corpora 4.1 GB
+of already-computed vectors were otherwise reachable only from the CLI.
 
 ## Corpus read surface
 
@@ -361,3 +368,71 @@ Cheap corpus-wide aggregates:
 `output`: the counts are then a snapshot of a corpus still being built, and will
 grow. It is the replacement for the guarantee the old rename-on-success
 publication gave for free — that a corpus you could see was a finished one.
+
+### `GET /corpus/search?q=TEXT`
+
+Semantic search over the embeddings index jobs already wrote. `q` is embedded
+with the same model the corpus rows were embedded with
+(`intfloat/multilingual-e5-small`) and `chunks` is ranked by cosine similarity.
+
+| param | default | meaning |
+|---|---|---|
+| `q` | — | required; blank or missing is `400` |
+| `mode` | `semantic` | only `semantic` today; anything else is `400` listing the accepted modes |
+| `limit` | `20` | clamped to `1..=100` |
+| `output` | `corpus.sqlite` | same plain-filename rule as every other route here |
+
+```json
+{
+  "mode": "semantic",
+  "status": "ready",
+  "query": "beach at sunset",
+  "limit": 20,
+  "model": "intfloat/multilingual-e5-small",
+  "hits": [
+    {
+      "path": "C:\photos\2019\IMG_4021.txt",
+      "name": "IMG_4021.txt",
+      "chunk_index": 0,
+      "score": 0.8269,
+      "content": "the chunk text that was embedded…"
+    }
+  ],
+  "compared_chunks": 100000,
+  "skipped_chunks": 0,
+  "elapsed_ms": 1204
+}
+```
+
+`hits` matches `llm-search`'s `/search/vector` rows so the two search surfaces
+are one shape. `score` is cosine similarity in `-1.0..=1.0`; ordering is
+descending score, ties broken by ascending `chunks.id`, so the same query over
+the same corpus always returns the same list in the same order.
+
+**`status` is the field to branch on.** An empty `hits` is never ambiguous:
+
+| `status` | meaning |
+|---|---|
+| `ready` | the scan ran; `compared_chunks`/`skipped_chunks` say over what |
+| `no_embeddings` | nothing to rank, and `reason` says why: no corpus written yet, a corpus with no `chunks` table, a corpus indexed without embeddings, or one whose vectors came from another model (then `other_models` names them) |
+| `warming` | the query embedding model is still loading; `warming_ms` is how long it has been at it |
+| `unavailable` | the model could not be loaded, or could not embed this query; `reason` carries the failure and `retrying` says whether a fresh load is already in flight |
+
+Only two things are errors: a malformed request (`400`) and a corpus that exists
+but cannot be read (`503`, the same `busy`/`unreadable` bodies the rest of this
+surface uses). A corpus indexed with embedding disabled is a `200`.
+
+**First-call cost.** A serve process that has only ever answered reads has no
+embedding model loaded. The first `mode=semantic` request does not wait for it:
+it arms the load, returns `status: "warming"` immediately (measured: 207 ms
+wall, `warming_ms: 0`), and later requests report a growing `warming_ms` until
+the model is ready — measured 5,336 ms end to end on the workhorse, logged as
+`query embedding model loaded; semantic search is ready load_ms=5336`. A failed
+load is reported with its reason and re-armed on the next request, so it never
+latches. Consumers that want the first *user* query to be fast should fire one
+throwaway search at startup.
+
+**Per-query cost.** The scan is exhaustive, so latency scales with the corpus:
+measured 0.24 s per 100 k vectors and 13.7 s over the live 2.68 M-vector /
+15.6 GB corpus (see `docs/ARCHITECTURE.md` for the full table and why there is
+no ANN index yet). It is not a search-as-you-type endpoint.

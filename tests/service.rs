@@ -1417,3 +1417,131 @@ async fn an_explicit_per_job_workers_seeds_that_jobs_extract_stage() {
     let job = wait_for_job(&app, "seeded").await;
     assert_eq!(job["status"], "complete", "{job}");
 }
+
+// ── /corpus/search?mode=semantic ────────────────────────────────────────────
+//
+// Request validation and the warming contract only. The ranking itself, and
+// every "empty for a stated reason" path, are unit-tested against
+// `semantic_scan` in `src/service.rs`, which takes an already-embedded query —
+// so none of this needs the e5 model, and these tests stay clear of the
+// model-download flake called out above.
+
+/// A router whose config names an embedding model this build does not support,
+/// so the lazy query-embedder load fails FAST and offline (`Embedder::new`
+/// rejects it before touching the fastembed cache). That makes the warming ->
+/// failure transition testable without a model download.
+fn unembeddable_router(temp: &std::path::Path) -> axum::Router {
+    let config = temp.join("config.yaml");
+    fs::write(&config, "data_dir: .\nembedding_model: not-a-real-model\n").unwrap();
+    guard_router_with_config(&temp.join("output"), &temp.join("input"), Some(config))
+}
+
+#[tokio::test]
+async fn corpus_search_rejects_an_unknown_mode_and_lists_the_ones_it_takes() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = guard_router(&temp.path().join("output"), &temp.path().join("input"));
+
+    let (status, body) = get_json_status(&app, "/corpus/search?q=beach&mode=telepathy").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["modes"], json!(["semantic"]));
+    assert!(
+        body["error"].as_str().unwrap().contains("telepathy"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn corpus_search_rejects_a_blank_query_and_a_path_like_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = guard_router(&temp.path().join("output"), &temp.path().join("input"));
+
+    for uri in [
+        "/corpus/search",
+        "/corpus/search?q=",
+        "/corpus/search?q=%20%20",
+    ] {
+        let (status, body) = get_json_status(&app, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body}");
+        assert!(body["error"].as_str().unwrap().contains("q is required"));
+    }
+
+    // Same confinement rule as every other route that names an output.
+    let (status, body) =
+        get_json_status(&app, "/corpus/search?q=beach&output=../escape.sqlite").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn the_first_semantic_search_declares_warming_instead_of_hanging() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = unembeddable_router(temp.path());
+
+    // Nothing is loaded yet, and the response comes back at once saying so
+    // rather than sitting on the model load.
+    let body = get_json(&app, "/corpus/search?q=beach%20at%20sunset").await;
+    assert_eq!(body["status"], "warming", "{body}");
+    assert_eq!(body["mode"], "semantic");
+    assert_eq!(body["query"], "beach at sunset");
+    assert_eq!(body["hits"].as_array().unwrap().len(), 0);
+    assert!(body["warming_ms"].is_number(), "{body}");
+    assert!(
+        body["reason"].as_str().unwrap().contains("loading"),
+        "{body}"
+    );
+
+    // The load it armed really runs, and its failure is reported with the
+    // reason instead of leaving the route warming forever.
+    let mut last = body;
+    for _ in 0..250 {
+        if last["status"] == "unavailable" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        last = get_json(&app, "/corpus/search?q=beach").await;
+    }
+    assert_eq!(last["status"], "unavailable", "{last}");
+    assert!(
+        last["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not-a-real-model"),
+        "{last}"
+    );
+    assert_eq!(last["hits"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn a_failed_embedder_load_is_retried_rather_than_disabling_search() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = unembeddable_router(temp.path());
+
+    let mut last = get_json(&app, "/corpus/search?q=beach").await;
+    for _ in 0..250 {
+        if last["status"] == "unavailable" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        last = get_json(&app, "/corpus/search?q=beach").await;
+    }
+    assert_eq!(last["status"], "unavailable", "{last}");
+    // A request that lands on a failed embedder reports the reason AND arms a
+    // fresh load, so one bad load never leaves the route dead until restart.
+    // (The failure here is instant, so the re-armed `warming` window is far too
+    // short to observe over HTTP — this flag is what makes the retry visible.)
+    assert_eq!(last["retrying"], true, "{last}");
+
+    // And the cycle repeats: the retry this request armed fails in turn and the
+    // route answers with the reason again, rather than latching into a terminal
+    // state or into a permanent `warming`.
+    let mut again = get_json(&app, "/corpus/search?q=beach").await;
+    for _ in 0..250 {
+        if again["status"] == "unavailable" {
+            break;
+        }
+        assert_eq!(again["status"], "warming", "{again}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        again = get_json(&app, "/corpus/search?q=beach").await;
+    }
+    assert_eq!(again["status"], "unavailable", "{again}");
+    assert_eq!(again["retrying"], true, "{again}");
+}

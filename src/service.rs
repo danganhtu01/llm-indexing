@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -20,6 +20,7 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::config::{clamp_workers, Config, MAX_WORKERS};
+use crate::embedding::{rank_chunks, Embedder, VectorScan, EMBEDDING_MODEL, MAX_HITS};
 use crate::jobs_store::{JobsStore, MAX_PERSISTED_HISTORY, RESERVED_OUTPUT_NAME};
 use crate::pipeline::{run_index, IndexRequest};
 use crate::runtime::RuntimeKnobs;
@@ -130,6 +131,9 @@ struct AppState {
     /// Default worker count this serve process runs jobs with; advertised by
     /// `GET /settings` as `workers.default`.
     workers: usize,
+    /// Lazily loaded query-side embedding model, shared by every
+    /// `/corpus/search?mode=semantic` request.
+    embedder: Arc<QueryEmbedder>,
     /// Persisted job envelopes (P0-11) — `jobs.sqlite` under `output_root`.
     /// Written to on every status transition worth reconciling on; read by
     /// `GET /jobs/{id}` once a job has aged out of (or never existed in, after
@@ -228,6 +232,7 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         vision_max: normalized.vision_max,
         config_path: normalized.config_path.clone(),
         workers: normalized.workers,
+        embedder: Arc::new(QueryEmbedder::new(normalized.config_path.clone())),
         jobs_store,
     };
     Ok(Router::new()
@@ -244,6 +249,7 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         .route("/corpus/tree", get(corpus_tree))
         .route("/corpus/documents/{id}/text", get(corpus_document_text))
         .route("/corpus/status", get(corpus_status_handler))
+        .route("/corpus/search", get(corpus_search))
         .layer(DefaultBodyLimit::max(max_body))
         .layer(TraceLayer::new_for_http())
         .with_state(state))
@@ -1636,6 +1642,397 @@ fn empty_status() -> Value {
     })
 }
 
+// ── Semantic search (GET /corpus/search) ────────────────────────────────────
+//
+// The `chunks` embeddings every index job has been writing since the corpus
+// format's first release had exactly one reader — the `vector-search` CLI
+// subcommand — so on the live corpora 4.1 GB of paid-for vectors were reachable
+// only by shelling into the container. This route is that reader, over the same
+// read-only corpus surface as `/corpus/tree` and friends.
+//
+// `POST /search/fts` and `POST /search/vector` were deliberately moved out of
+// this service to `llm-search` (see docs/HTTP_API.md); this is not a walk-back
+// of that. `llm-search` holds every chunk vector RESIDENT to serve a
+// search-as-you-type socket — 2.68 M x 384 floats plus their text is a
+// multi-gigabyte process, which is why the hub app does not run one. What is
+// added back here is the streaming, nothing-resident half: one exhaustive scan
+// per request, `O(limit)` memory, and no second service to deploy.
+
+/// Modes `/corpus/search` accepts. Only `semantic` today; the list is what a
+/// rejected request is told, so adding a keyword mode later stays a one-line
+/// change with no new failure shape.
+const SEARCH_MODES: &[&str] = &["semantic"];
+
+/// Hits returned when the caller does not ask. Matches the `search` CLI
+/// subcommand rather than `vector-search`'s 10: a search API's default page is
+/// what a UI renders, and 20 is that.
+const DEFAULT_SEARCH_LIMIT: usize = 20;
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    /// Optional in the type ONLY so a missing query answers the service's own
+    /// JSON `400` instead of axum's plain-text rejection.
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    output: Option<String>,
+}
+
+/// GET /corpus/search?q=TEXT[&mode=semantic][&limit=20][&output=corpus.sqlite]
+///
+/// Embeds `q` with the same model the corpus rows were embedded with and ranks
+/// `chunks` by cosine similarity. Everything expensive — loading the model,
+/// embedding the query, scanning the corpus — happens on a blocking worker.
+///
+/// The response always carries `status`, and an empty `hits` is never left
+/// ambiguous: a corpus indexed without embeddings, a corpus embedded by another
+/// model, and a model that has not finished loading are three different
+/// `status`/`reason` pairs, not three empty lists. Only a corpus that exists and
+/// cannot be read is an error (`503`, shared with the rest of this surface).
+async fn corpus_search(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Response {
+    let mode = query.mode.as_deref().unwrap_or("semantic");
+    if !SEARCH_MODES.contains(&mode) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("unsupported search mode {mode:?}"),
+                        "modes": SEARCH_MODES})),
+        )
+            .into_response();
+    }
+    let text = query.q.as_deref().unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"q is required and must not be blank"})),
+        )
+            .into_response();
+    }
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .clamp(1, MAX_HITS);
+    let output = match resolve_output(&state, query.output.as_deref()) {
+        Ok(path) => path,
+        Err(response) => return response.into_response(),
+    };
+    let embedder = match state.embedder.acquire().await {
+        Acquired::Ready(embedder) => embedder,
+        Acquired::Warming { warming_ms } => {
+            return Json(search_response(
+                &text,
+                limit,
+                SearchOutcome::Warming { warming_ms },
+            ))
+            .into_response()
+        }
+        Acquired::Unavailable { reason } => {
+            return Json(search_response(
+                &text,
+                limit,
+                // `acquire` armed a fresh load on the way out; say so, or a
+                // caller has no way to know retrying is worth anything.
+                SearchOutcome::Unavailable {
+                    reason,
+                    retrying: true,
+                },
+            ))
+            .into_response();
+        }
+    };
+    let scan = {
+        let text = text.clone();
+        tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            // Embed under the lock, then drop it before the scan: the scan is
+            // the long half, and holding the single embedder across it would
+            // serialize every concurrent search on the wrong resource.
+            //
+            // A panic inside `embed_query` (never observed, but the ONNX call
+            // is not something this code controls) would otherwise poison the
+            // mutex and brick every later search behind an opaque 503 with no
+            // way back short of a restart — unlike a failed *load*, which
+            // explicitly re-arms. `embed_query` only reads the model to
+            // produce a `Result`, so the guarded data is not left structurally
+            // broken by a panic while holding it; recovering the guard keeps
+            // this failure mode self-healing like the rest of this surface.
+            let query_vector = {
+                let mut guard = embedder.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.embed_query(&text)
+            };
+            let query_vector = match query_vector {
+                Ok(vector) => vector,
+                // A model that loaded but cannot embed is a service fault, not
+                // an empty result.
+                Err(error) => {
+                    return Ok(SearchOutcome::Unavailable {
+                        reason: format!("embedding the query failed: {error:#}"),
+                        // The model is loaded and stays loaded: this query
+                        // failed, not the embedder, so nothing is being retried.
+                        retrying: false,
+                    });
+                }
+            };
+            semantic_scan(&output, &query_vector, limit, started)
+        })
+        .await
+    };
+    match scan {
+        Ok(Ok(outcome)) => Json(search_response(&text, limit, outcome)).into_response(),
+        Ok(Err(error)) => read_error(&error),
+        Err(error) => unreadable(&format!("search task failed: {error}")),
+    }
+}
+
+/// Rank one corpus against an already-embedded query.
+///
+/// `started` is passed in so the reported `elapsed_ms` covers the whole
+/// server-side cost the caller waited on — embedding included — rather than
+/// just the scan.
+fn semantic_scan(
+    output: &Path,
+    query_vector: &[f32],
+    limit: usize,
+    started: Instant,
+) -> Result<SearchOutcome, ReadError> {
+    let connection = match open_ro(output) {
+        Corpus::Absent => {
+            let name = output.file_name().unwrap_or_default().to_string_lossy();
+            return Ok(SearchOutcome::NoEmbeddings {
+                reason: format!("no corpus database at {name} yet"),
+                other_models: Vec::new(),
+            });
+        }
+        Corpus::Ready(connection) => connection,
+        Corpus::Busy => return Err(ReadError::Busy),
+        Corpus::Unreadable(error) => return Err(ReadError::Unreadable(error)),
+    };
+    // A corpus written before the chunks table existed has no embeddings and no
+    // table to scan; that is a shape of "nothing to search", not a failed query.
+    let embedded: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if embedded.is_none() {
+        return Ok(SearchOutcome::NoEmbeddings {
+            reason: "this corpus has no chunks table; it was written by a build without \
+                     embeddings"
+                .into(),
+            other_models: Vec::new(),
+        });
+    }
+    let scan = rank_chunks(&connection, EMBEDDING_MODEL, query_vector, limit)?;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if scan.compared > 0 {
+        return Ok(SearchOutcome::Ranked { scan, elapsed_ms });
+    }
+    // Nothing comparable. Which of the two reasons it is matters: one says
+    // "turn embedding on and reindex", the other says "this corpus is on a
+    // different model and reindexing it would migrate, not fix".
+    let reason = if scan.skipped > 0 {
+        format!(
+            "every one of the {} embeddings in this corpus was written by another model; \
+             queries here are embedded with {EMBEDDING_MODEL}, and cosine across two \
+             embedding spaces is meaningless",
+            scan.skipped
+        )
+    } else {
+        "this corpus holds no embeddings: no indexed file has been embedded yet".into()
+    };
+    Ok(SearchOutcome::NoEmbeddings {
+        reason,
+        other_models: scan.other_models,
+    })
+}
+
+/// What one semantic request resolved to. Every variant is a `200`: the only
+/// `/corpus/search` failures are a malformed request (`400`) and a corpus that
+/// exists but cannot be read (`503`, via [`read_error`]).
+enum SearchOutcome {
+    /// A scan ran over comparable vectors. `hits` may still be short of `limit`
+    /// — or empty, if the corpus holds fewer chunks than that.
+    Ranked { scan: VectorScan, elapsed_ms: u64 },
+    /// There was nothing to rank, and this is why.
+    NoEmbeddings {
+        reason: String,
+        other_models: Vec<String>,
+    },
+    /// The query embedder is loading. Reported rather than waited on.
+    Warming { warming_ms: u64 },
+    /// The query embedder could not be loaded, or could not embed. `retrying`
+    /// says whether a fresh load is already in flight.
+    Unavailable { reason: String, retrying: bool },
+}
+
+/// The `/corpus/search` envelope.
+///
+/// `mode`, `status`, `limit` and `hits` are present in every response so a
+/// consumer branches on `status` and never has to interpret an empty `hits`.
+/// `hits` mirrors `llm-search`'s `/search/vector` rows (`path`, `name`,
+/// `chunk_index`, `score`, `content`) so the two search surfaces stay one shape.
+fn search_response(query: &str, limit: usize, outcome: SearchOutcome) -> Value {
+    let mut body = json!({
+        "mode": "semantic",
+        "query": query,
+        "limit": limit,
+        "model": EMBEDDING_MODEL,
+        "hits": Vec::<Value>::new(),
+    });
+    match outcome {
+        SearchOutcome::Ranked { scan, elapsed_ms } => {
+            body["status"] = json!("ready");
+            body["hits"] = json!(scan.hits);
+            body["compared_chunks"] = json!(scan.compared);
+            body["skipped_chunks"] = json!(scan.skipped);
+            body["elapsed_ms"] = json!(elapsed_ms);
+        }
+        SearchOutcome::NoEmbeddings {
+            reason,
+            other_models,
+        } => {
+            body["status"] = json!("no_embeddings");
+            body["reason"] = json!(reason);
+            if !other_models.is_empty() {
+                body["other_models"] = json!(other_models);
+            }
+        }
+        SearchOutcome::Warming { warming_ms } => {
+            body["status"] = json!("warming");
+            body["reason"] = json!(
+                "the query embedding model is loading (first semantic search in this \
+                 process); retry shortly"
+            );
+            body["warming_ms"] = json!(warming_ms);
+        }
+        SearchOutcome::Unavailable { reason, retrying } => {
+            body["status"] = json!("unavailable");
+            body["reason"] = json!(reason);
+            body["retrying"] = json!(retrying);
+        }
+    }
+    body
+}
+
+/// The query half of semantic search: the embedding model, loaded once, lazily,
+/// on the first `mode=semantic` request.
+///
+/// An index job builds its own embedder; a serve process that has only ever
+/// answered reads has none, and building one is not free — it opens an ONNX
+/// session and reads the model out of the fastembed cache (measured on the
+/// workhorse: see docs/HTTP_API.md). Paying that inside the request would make
+/// the first search sit there with nothing to tell the caller apart from a slow
+/// scan, so the first request ARMS the load and answers `status: "warming"` at
+/// once. The load runs on a blocking worker; a later request finds it ready.
+///
+/// This embedder only ever embeds QUERIES. It shares the model and the code
+/// path with indexing but writes nothing, so no corpus row and no job outcome
+/// depends on whether serve happens to have one loaded.
+struct QueryEmbedder {
+    config_path: Option<PathBuf>,
+    state: RwLock<EmbedderState>,
+}
+
+#[derive(Clone)]
+enum EmbedderState {
+    /// Never asked for. The first request moves this to `Loading`.
+    Cold,
+    Loading {
+        since: Instant,
+    },
+    Ready(Arc<Mutex<Embedder>>),
+    /// The last load failed. Kept — a caller is owed the reason — but not
+    /// terminal: the next request re-arms, so a transient failure (a cache not
+    /// yet populated, a disk hiccup) does not disable search until restart.
+    Failed(String),
+}
+
+/// What a caller gets when it asks for the embedder. Never blocks on a load.
+enum Acquired {
+    Ready(Arc<Mutex<Embedder>>),
+    Warming {
+        warming_ms: u64,
+    },
+    /// The previous load failed. Returning it also ARMS a fresh attempt, so the
+    /// reason is history rather than a standing verdict.
+    Unavailable {
+        reason: String,
+    },
+}
+
+impl QueryEmbedder {
+    fn new(config_path: Option<PathBuf>) -> Self {
+        Self {
+            config_path,
+            state: RwLock::new(EmbedderState::Cold),
+        }
+    }
+
+    async fn acquire(self: &Arc<Self>) -> Acquired {
+        // Fast path: a loaded embedder must not queue behind a write lock.
+        if let EmbedderState::Ready(embedder) = &*self.state.read().await {
+            return Acquired::Ready(embedder.clone());
+        }
+        let mut state = self.state.write().await;
+        match state.clone() {
+            EmbedderState::Ready(embedder) => Acquired::Ready(embedder),
+            EmbedderState::Loading { since } => Acquired::Warming {
+                warming_ms: since.elapsed().as_millis() as u64,
+            },
+            // `Loading` is claimed under the write lock, which is what keeps a
+            // burst of first requests to exactly one load attempt.
+            previous @ (EmbedderState::Cold | EmbedderState::Failed(_)) => {
+                *state = EmbedderState::Loading {
+                    since: Instant::now(),
+                };
+                drop(state);
+                self.clone().spawn_load();
+                match previous {
+                    EmbedderState::Failed(reason) => Acquired::Unavailable { reason },
+                    _ => Acquired::Warming { warming_ms: 0 },
+                }
+            }
+        }
+    }
+
+    fn spawn_load(self: Arc<Self>) {
+        let config_path = self.config_path.clone();
+        tokio::spawn(async move {
+            let loaded = tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let config = Config::load(config_path.as_deref())?;
+                let embedder = Embedder::new(&config)?;
+                Ok::<_, anyhow::Error>((embedder, started.elapsed()))
+            })
+            .await;
+            let next = match loaded {
+                Ok(Ok((embedder, elapsed))) => {
+                    tracing::info!(
+                        load_ms = elapsed.as_millis() as u64,
+                        "query embedding model loaded; semantic search is ready"
+                    );
+                    EmbedderState::Ready(Arc::new(Mutex::new(embedder)))
+                }
+                Ok(Err(error)) => {
+                    let detail = format!("{error:#}");
+                    tracing::warn!(error = %detail, "loading the query embedding model failed");
+                    EmbedderState::Failed(detail)
+                }
+                Err(error) => EmbedderState::Failed(format!("embedder load task failed: {error}")),
+            };
+            *self.state.write().await = next;
+        });
+    }
+}
+
 fn prune_history(jobs: &mut HashMap<String, Value>) {
     if jobs.len() < MAX_HISTORY {
         return;
@@ -1974,5 +2371,177 @@ mod tests {
                 .to_string()
         ));
         assert!(requested_paths(&[root], Some(vec!["../escape.txt".into()])).is_err());
+    }
+
+    /// Semantic search below the HTTP layer: `semantic_scan` is where "no
+    /// results" has to become a stated reason, and it is reachable without the
+    /// embedding model because the query vector is already an argument.
+    mod semantic {
+        use super::super::{search_response, semantic_scan, ReadError, SearchOutcome};
+        use crate::embedding::{vector_to_bytes, EMBEDDING_MODEL};
+        use rusqlite::Connection;
+        use serde_json::Value;
+        use std::path::Path;
+        use std::time::Instant;
+
+        /// A corpus with `files` + `chunks`, holding one chunk per `(model,
+        /// vector)`. `chunks: None` writes a corpus with no chunks TABLE at all
+        /// — what a build older than embeddings left behind.
+        fn corpus(path: &Path, chunks: Option<&[(&str, Vec<f32>)]>) {
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, name TEXT);
+                     INSERT INTO files(id,path,name) VALUES(1,'/corpus/a.txt','a.txt');",
+                )
+                .unwrap();
+            let Some(chunks) = chunks else { return };
+            connection
+                .execute_batch(
+                    "CREATE TABLE chunks(id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL,
+                       chunk_index INTEGER NOT NULL, content TEXT NOT NULL,
+                       embedding BLOB NOT NULL, dimensions INTEGER NOT NULL, model TEXT NOT NULL,
+                       page_start INTEGER, page_end INTEGER);",
+                )
+                .unwrap();
+            for (index, (model, vector)) in chunks.iter().enumerate() {
+                connection
+                    .execute(
+                        "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model) \
+                         VALUES(1,?1,?2,?3,?4,?5)",
+                        rusqlite::params![
+                            index as i64,
+                            format!("chunk {index}"),
+                            vector_to_bytes(vector),
+                            vector.len() as i64,
+                            model
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+
+        fn scan(path: &Path) -> SearchOutcome {
+            match semantic_scan(path, &[1.0, 0.0, 0.0], 5, Instant::now()) {
+                Ok(outcome) => outcome,
+                Err(ReadError::Busy) => panic!("a fixture corpus cannot be busy"),
+                Err(ReadError::Unreadable(detail)) => panic!("fixture unreadable: {detail}"),
+            }
+        }
+
+        fn body(outcome: SearchOutcome) -> Value {
+            search_response("beach at sunset", 5, outcome)
+        }
+
+        #[test]
+        fn an_absent_corpus_answers_empty_with_a_reason_not_an_error() {
+            let temp = tempfile::tempdir().unwrap();
+            let body = body(scan(&temp.path().join("corpus.sqlite")));
+            assert_eq!(body["status"], "no_embeddings");
+            assert_eq!(body["hits"].as_array().unwrap().len(), 0);
+            assert!(
+                body["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no corpus database"),
+                "{body}"
+            );
+            // The honest fields a caller branches on are there either way.
+            assert_eq!(body["mode"], "semantic");
+            assert_eq!(body["model"], EMBEDDING_MODEL);
+            assert_eq!(body["query"], "beach at sunset");
+        }
+
+        #[test]
+        fn a_corpus_without_a_chunks_table_degrades_rather_than_failing() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(&path, None);
+            let body = body(scan(&path));
+            assert_eq!(body["status"], "no_embeddings");
+            assert!(
+                body["reason"].as_str().unwrap().contains("no chunks table"),
+                "{body}"
+            );
+        }
+
+        #[test]
+        fn a_corpus_indexed_with_embedding_off_says_so() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(&path, Some(&[]));
+            let body = body(scan(&path));
+            assert_eq!(body["status"], "no_embeddings");
+            assert!(
+                body["reason"].as_str().unwrap().contains("no embeddings"),
+                "{body}"
+            );
+            assert!(body.get("other_models").is_none(), "{body}");
+        }
+
+        #[test]
+        fn a_corpus_embedded_by_another_model_names_it() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(
+                &path,
+                Some(&[
+                    ("clip-vit-b32", vec![1.0, 0.0, 0.0]),
+                    ("clip-vit-b32", vec![0.9, 0.1, 0.0]),
+                ]),
+            );
+            let body = body(scan(&path));
+            assert_eq!(body["status"], "no_embeddings");
+            assert_eq!(
+                body["other_models"],
+                serde_json::json!(["clip-vit-b32 (3d)"])
+            );
+            let reason = body["reason"].as_str().unwrap();
+            assert!(reason.contains("another model"), "{reason}");
+            assert!(reason.contains(EMBEDDING_MODEL), "{reason}");
+        }
+
+        #[test]
+        fn a_ranked_scan_reports_hits_scores_and_what_it_compared() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(
+                &path,
+                Some(&[
+                    (EMBEDDING_MODEL, vec![0.0, 1.0, 0.0]),
+                    (EMBEDDING_MODEL, vec![1.0, 0.0, 0.0]),
+                    ("clip-vit-b32", vec![1.0, 0.0, 0.0]),
+                ]),
+            );
+            let body = body(scan(&path));
+            assert_eq!(body["status"], "ready");
+            assert_eq!(body["compared_chunks"], 2);
+            assert_eq!(body["skipped_chunks"], 1);
+            let hits = body["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0]["content"], "chunk 1");
+            assert_eq!(hits[0]["path"], "/corpus/a.txt");
+            assert!((hits[0]["score"].as_f64().unwrap() - 1.0).abs() < 0.0001);
+            assert!(hits[1]["score"].as_f64().unwrap().abs() < 0.0001);
+            assert!(body["elapsed_ms"].is_number(), "{body}");
+        }
+
+        #[test]
+        fn warming_and_unavailable_are_stated_never_hidden_behind_zero_hits() {
+            let warming = body(SearchOutcome::Warming { warming_ms: 40 });
+            assert_eq!(warming["status"], "warming");
+            assert_eq!(warming["warming_ms"], 40);
+            assert_eq!(warming["hits"].as_array().unwrap().len(), 0);
+            assert!(warming["reason"].as_str().unwrap().contains("loading"));
+
+            let broken = body(SearchOutcome::Unavailable {
+                reason: "no model cache".into(),
+                retrying: true,
+            });
+            assert_eq!(broken["status"], "unavailable");
+            assert_eq!(broken["reason"], "no model cache");
+            assert_eq!(broken["retrying"], true);
+            assert_eq!(broken["hits"].as_array().unwrap().len(), 0);
+        }
     }
 }

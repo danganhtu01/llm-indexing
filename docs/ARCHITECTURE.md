@@ -45,7 +45,11 @@ files(id, path UNIQUE, drive, dir, name, ext, size, mtime,
       attempts, last_attempt_at, elapsed_ms)
 fts USING fts5(name, path, content, tokens,
                tokenize="unicode61 remove_diacritics 2 tokenchars '_'")
-chunks(id, file_id, chunk_index, content, embedding BLOB, dimensions)
+chunks(id, file_id, chunk_index, content, embedding BLOB, dimensions, model)
+vision(file_id, mode, width, height, phash, exif_json, quality_json,
+       objects_json, tags_json, caption,
+       embedding BLOB, embedding_model, dimensions, frames, elapsed_ms, error)
+meta(key, value)
 ```
 
 Normalization combines lowercased words, Unicode diacritic folding, English
@@ -53,10 +57,45 @@ Snowball stems, Vietnamese maximum-matching compounds and editable abbreviation
 expansions. FTS queries use the same normalization and BM25 ranking.
 
 Complete content is split into overlapping 1,200-character chunks. FastEmbed's
-`multilingual-e5-small` produces 384 float32 values stored as a SQLite BLOB.
+`multilingual-e5-small` produces 384 float32 values (a 1,536-byte
+little-endian BLOB) and the model that produced them is stamped on every row.
 Vector retrieval embeds the query with the E5 query prefix and ranks chunks by
-cosine similarity. The current corpus size is intentionally served by a bounded
-in-process scan, keeping the database portable and avoiding a second vector DB.
+cosine similarity, over `GET /corpus/search?mode=semantic` and the
+`vector-search` CLI subcommand alike. `vision.embedding` is a CLIP *image*
+vector and is deliberately NOT part of that search: it lives in a different
+embedding space from the e5 text vectors, and a cosine between the two spaces
+is a number with no meaning. Ranking therefore compares only rows whose
+`chunks.model` matches the model the query was embedded with, and counts the
+rest rather than mixing them in.
+
+### Cost of the vector scan
+
+The ranking is an exhaustive streaming scan — every stored vector is scored,
+so the top-k is exact — with a bounded top-k heap, no per-row allocation, and
+`content` fetched only for the winners. There is no ANN index, and the corpus
+stays a single portable file with no second vector database. Measured with
+`scan_latency_over_a_real_corpus` (release build, Windows workstation with a
+GPU describe job running, so the spread is real machine load):
+
+| vectors | corpus file | cold read | warm scan |
+|---|---|---|---|
+| 100,000 | 415 MB | 0.71 s | 0.24 s |
+| 1,000,000 | 4.17 GB | 6.20 s | 3.89 s |
+| 2,684,125 (live) | 15.6 GB | 54.3 s | 13.7 s |
+
+The pass is bound by SQLite page reads, not arithmetic: scoring a million
+vectors takes ~0.2 s single-threaded against ~2.3 s to read them, which is why
+the scan is deliberately not parallelised — rayon would buy a few percent and
+cost contention with the extraction pool a concurrent index job is using.
+
+`sqlite-vec` was measured, not assumed: 0.1.9 builds cleanly against this
+crate's rusqlite 0.32 (bundled SQLite 3.46.0) and its `vec_distance_cosine()`
+reads the existing BLOBs with no schema change — but at 4.09-6.81 s per million
+it is the same I/O-bound pass, and it agreed with this scan's ranking to the
+last decimal on a million live vectors. Its ANN half (`vec0` virtual tables)
+*would* be the real win, and is the reason this stays revisitable: it requires
+WRITING shadow tables into the corpus, which is a corpus-format change and
+impossible over the read-only surface these routes are built on.
 
 ## Incremental consistency
 
@@ -133,13 +172,14 @@ between the delete and the first write (unwritable output directory, a schema
 that will not create) still costs the previous corpus.
 
 Consumer apps used to open `corpus.sqlite` directly to render a directory tree
-or preview a document. `GET /corpus/tree`, `GET /corpus/documents/{id}/text`
-and `GET /corpus/status` (see `docs/HTTP_API.md`) serve that read-only join
-instead, so no consumer needs to decode the SQLite schema itself. `/corpus/tree`
+or preview a document. `GET /corpus/tree`, `GET /corpus/documents/{id}/text`,
+`GET /corpus/status` and `GET /corpus/search` (see `docs/HTTP_API.md`) serve
+that read-only join instead, so no consumer needs to decode the SQLite schema
+itself. `/corpus/tree`
 walks one named allowed input root (validated against the same allowed-roots
 model as `/index`) and joins it against the published database by each file's
 exact absolute path — precise where a by-name join could collide across
-directories. All three routes degrade to an empty/zeroed result when the corpus
+directories. All four routes degrade to an empty/zeroed result when the corpus
 database hasn't been written yet, but only then: a database that exists and
 cannot be read answers `503`, never a zero, because a consumer handed `0` over a
 corpus holding thousands of rows cannot tell that from an empty one. Since jobs

@@ -21,7 +21,9 @@ this component.
   in exhaustive mode
 - English stemming, Vietnamese segmentation, abbreviation expansion and
   diacritic-insensitive FTS5 search
-- 384-dimensional `multilingual-e5-small` embeddings and cosine vector search
+- 384-dimensional `multilingual-e5-small` embeddings and cosine vector search,
+  over the `vector-search` CLI subcommand and `GET /corpus/search?mode=semantic`
+  alike
 - Crash-safe batched writes, resume/change detection, removal pruning, authentic
   incomplete/error counts, folder aggregation, manifests, reports and optional
   sidecars
