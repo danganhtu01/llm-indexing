@@ -14,7 +14,22 @@ use crate::normalize::{fold, words, Normalizer};
 use crate::pipeline::{row_complete, MAX_ATTEMPTS};
 use crate::vision::{FaceDetection, VisionResult};
 
-const SCHEMA: &str = r#"
+/// One entry per schema version, applied in order starting from wherever the
+/// database's own `PRAGMA user_version` says it is. Index 0 is version 1 — the
+/// schema every corpus has always had, expressed with `IF NOT EXISTS` so it is
+/// a no-op on a database that already carries these tables and simply stamps
+/// the version onto it; a genuinely fresh database gets the same tables from
+/// the same statement. Later versions are appended as new entries — never
+/// edit one that has shipped, since a live corpus may already be stamped past
+/// it.
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
+
+/// The schema version this binary knows how to write. Advertised via
+/// `schema_version` (surfaced in `/corpus/status`) so a consumer sees version
+/// skew as a signal rather than a query failing obscurely later.
+pub const CURRENT_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
+const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS files(
   id INTEGER PRIMARY KEY,
   path TEXT UNIQUE,
@@ -85,7 +100,7 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 /// Columns added to `files` after the corpus format's first release, in the order
 /// they must be applied.
 ///
-/// [`SCHEMA`] is all `IF NOT EXISTS`, which is why new TABLES appear on a live
+/// [`SCHEMA_V1`] is all `IF NOT EXISTS`, which is why new TABLES appear on a live
 /// corpus by themselves — but it never touches a `files` table that already
 /// exists, so a corpus keeps whatever column set it was created with. Every
 /// column added since therefore has to be re-added here, per corpus, at open.
@@ -106,6 +121,90 @@ const ADDED_FILE_COLUMNS: &[(&str, &str)] = &[
 /// truthful value for every pre-existing row — nothing scanned those files for
 /// faces — and it is exactly what makes the first faces job pick them up.
 const ADDED_VISION_COLUMNS: &[(&str, &str)] = &[("faces_model", "TEXT")];
+
+/// P0-8: page anchoring on `chunks`. Both columns are nullable — `NULL` is
+/// what every extraction path that cannot attribute a chunk to a page (every
+/// non-PDF method, and the PDF-with-merged-OCR path) writes, and what any
+/// chunk written before this migration existed reads back as. Runs exactly
+/// once per database via the version-skip loop in `migrate`, so — unlike
+/// `SCHEMA_V1`, which is replayed whole against both a fresh database and a
+/// hand-built pre-harness one — this needs no `IF NOT EXISTS` guard.
+const SCHEMA_V2: &str = r#"
+ALTER TABLE chunks ADD COLUMN page_start INTEGER;
+ALTER TABLE chunks ADD COLUMN page_end INTEGER;
+"#;
+
+/// Bring `connection`'s schema up to `MIGRATIONS.len()`, one version at a time
+/// inside its own transaction, then stamp `user_version`. Refuses a database
+/// stamped past every version this binary knows — an older binary silently
+/// "succeeding" against a newer schema (skipping columns/tables it has never
+/// heard of) is how a downgrade quietly corrupts a corpus instead of failing
+/// loudly at the one point that could catch it.
+fn migrate(connection: &Connection) -> Result<()> {
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let current = current.max(0) as usize;
+    if current > MIGRATIONS.len() {
+        anyhow::bail!(
+            "corpus database is at schema version {current}, newer than this binary knows \
+             (version {}); refusing to open it — upgrade llm-indexing before touching this corpus",
+            MIGRATIONS.len()
+        );
+    }
+    for (index, statement) in MIGRATIONS.iter().enumerate().skip(current) {
+        let version = index + 1;
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .with_context(|| format!("opening the transaction for migration {version}"))?;
+        if let Err(error) = connection.execute_batch(statement) {
+            // Best effort: if the rollback itself fails the connection is
+            // already in an unknown state and the error below is what surfaces.
+            let _ = connection.execute_batch("ROLLBACK");
+            return Err(error).with_context(|| format!("applying migration {version}"));
+        }
+        // Inside the same transaction as the statement it stamps: a crash
+        // between the two would otherwise leave a database whose tables are
+        // version N but whose `user_version` still reads N-1, which would
+        // then try to re-apply migration N (harmless here, since every entry
+        // is `IF NOT EXISTS`-idempotent, but not a guarantee future entries
+        // can make).
+        connection
+            .pragma_update(None, "user_version", version as i64)
+            .with_context(|| format!("stamping user_version {version}"))?;
+        connection
+            .execute_batch("COMMIT")
+            .with_context(|| format!("committing migration {version}"))?;
+    }
+    Ok(())
+}
+
+/// The corpus's own schema version (`PRAGMA user_version`), read fresh —
+/// unlike [`CURRENT_SCHEMA_VERSION`], which is what this binary would write.
+/// The two differing is exactly the version-skew signal `/corpus/status`
+/// exists to surface.
+pub fn schema_version(connection: &Connection) -> Result<i64> {
+    Ok(connection.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+/// Read one `meta` key from an arbitrary connection — the read-only surface
+/// (`/corpus/status` and friends) opens a bare `Connection`, never an
+/// `IndexStore`, so this is free-standing rather than a method. A `meta` table
+/// that does not exist yet (a corpus predating it, or a hand-built test
+/// fixture) reads as "key absent", the same as a present table with no such
+/// row: either way the caller has no value to trust, not a fault to report.
+pub fn read_meta(connection: &Connection, key: &str) -> Result<Option<String>> {
+    match connection.query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
+        row.get(0)
+    }) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref message)))
+            if message.contains("no such table") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 
 /// How long a WRITER waits for a lock before giving up. An indexing job now
 /// writes into the same file readers open, and a batch commit holds an exclusive
@@ -374,9 +473,7 @@ impl IndexStore {
         if config.sync_normal {
             connection.pragma_update(None, "synchronous", "NORMAL")?;
         }
-        connection
-            .execute_batch(SCHEMA)
-            .context("creating SQLite FTS5 schema")?;
+        migrate(&connection).context("applying schema migrations")?;
         // Only ever a no-op for a corpus this build created; the live ones were
         // created by builds whose `files` table stops at `indexed_at`.
         migrate_files_table(&connection)?;
@@ -476,6 +573,30 @@ impl IndexStore {
         Ok(rows.flatten().collect())
     }
 
+    /// Paths whose stored chunks carry NO page attribution at all — every
+    /// chunk's `page_start` is NULL — for the resume change-detection upgrade
+    /// rule (see `pipeline::page_anchorable_pdf_method`).
+    ///
+    /// This is the per-file signal that lets an EXISTING corpus grow page
+    /// locators. `SCHEMA_V2` adds `chunks.page_start`/`page_end` nullable and
+    /// backfills nothing, so every chunk indexed before that migration reads
+    /// back NULL forever: the columns being present says nothing about the
+    /// rows. Without this signal the only way to make a live corpus citable
+    /// would be a destructive `overwrite` re-index of the whole thing.
+    ///
+    /// Files holding no chunks at all are excluded — `existing_keys`'
+    /// `has_chunks` already schedules those — so this reports exactly "indexed,
+    /// and not on any page".
+    pub fn paths_without_page_anchors(&self) -> Result<HashSet<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT f.path FROM files f \
+             WHERE EXISTS(SELECT 1 FROM chunks c WHERE c.file_id=f.id) \
+               AND NOT EXISTS(SELECT 1 FROM chunks c WHERE c.file_id=f.id AND c.page_start IS NOT NULL)",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.flatten().collect())
+    }
+
     /// The highest vision tier recorded per file path, for the resume
     /// change-detection upgrade rule. Absent files simply aren't in the map.
     pub fn existing_vision_modes(&self) -> Result<HashMap<String, String>> {
@@ -565,13 +686,7 @@ impl IndexStore {
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        use rusqlite::OptionalExtension;
-        Ok(self
-            .connection
-            .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
-                row.get(0)
-            })
-            .optional()?)
+        read_meta(&self.connection, key)
     }
 
     pub fn add(&mut self, file: &ProcessedFile, indexed_at: f64) -> Result<()> {
@@ -835,8 +950,8 @@ impl IndexStore {
         for chunk in &file.chunks {
             let embedding = crate::embedding::vector_to_bytes(&chunk.vector);
             self.connection.execute(
-                "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model) \
-                 VALUES(?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model,\
+                 page_start,page_end) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     id,
                     chunk.index as i64,
@@ -844,6 +959,8 @@ impl IndexStore {
                     embedding,
                     chunk.vector.len() as i64,
                     crate::embedding::EMBEDDING_MODEL,
+                    chunk.page_start.map(|value| value as i64),
+                    chunk.page_end.map(|value| value as i64),
                 ],
             )?;
             self.index_chunk(self.connection.last_insert_rowid(), &embedding)?;
@@ -1312,6 +1429,7 @@ mod tests {
             chunks: Vec::new(),
             vision: None,
             elapsed_ms: 0,
+            page_segments: Vec::new(),
         }
     }
 
@@ -1332,6 +1450,82 @@ mod tests {
             database_path(Path::new("/out")),
             PathBuf::from("/out/index.sqlite")
         );
+    }
+
+    #[test]
+    fn a_fresh_database_lands_on_the_current_schema_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        assert_eq!(
+            schema_version(&store.connection).unwrap(),
+            CURRENT_SCHEMA_VERSION,
+            "a brand-new database must be stamped, not left at the SQLite default of 0"
+        );
+    }
+
+    #[test]
+    fn an_existing_pre_migration_database_reaches_the_same_version_and_keeps_its_rows() {
+        // A database written before this harness existed: the same tables
+        // (created by hand here, the way an old binary's `execute_batch(SCHEMA)`
+        // would have), but never stamped — `PRAGMA user_version` defaults to 0.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        {
+            let raw = Connection::open(&destination).unwrap();
+            raw.execute_batch(SCHEMA_V1).unwrap();
+            raw.execute(
+                "INSERT INTO files(path,drive,dir,name,ext,size,mtime,lang,method,ocr_used,pages,chars,sha1,indexed_at) \
+                 VALUES ('/a/old.txt','/','a','old.txt','.txt',3,0.0,'en','text',0,1,3,NULL,0.0)",
+                [],
+            )
+            .unwrap();
+            assert_eq!(schema_version(&raw).unwrap(), 0);
+        }
+
+        // Opening it through the harness must migrate it up WITHOUT touching the
+        // row that was already there — identical destination shape to a fresh
+        // open, but the pre-existing data survives.
+        let store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        assert_eq!(
+            schema_version(&store.connection).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        let existing = store.existing_keys().unwrap();
+        assert!(existing.contains_key("/a/old.txt"), "{existing:?}");
+    }
+
+    #[test]
+    fn opening_a_database_stamped_past_the_known_schema_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        {
+            let raw = Connection::open(&destination).unwrap();
+            raw.execute_batch(SCHEMA_V1).unwrap();
+            raw.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+
+        let error = IndexStore::open(&destination, &off_config(), false, false)
+            .err()
+            .expect("a newer-than-known user_version must refuse to open, not silently proceed");
+        assert!(
+            format!("{error:#}").contains("newer than this binary knows"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn read_meta_tolerates_a_database_with_no_meta_table() {
+        // The read-only corpus surface opens a bare Connection (never an
+        // IndexStore), including against hand-built test fixtures that predate
+        // `meta` entirely — that must read as "no value", not an error.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let raw = Connection::open(&destination).unwrap();
+        raw.execute_batch("CREATE TABLE files(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        assert_eq!(read_meta(&raw, "last_discovered_files").unwrap(), None);
     }
 
     #[test]
@@ -1398,7 +1592,50 @@ mod tests {
             index,
             content: format!("chunk {index}"),
             vector: vec![0.5, 0.25],
+            page_start: None,
+            page_end: None,
         }
+    }
+
+    fn anchored_chunk(index: usize, page: usize) -> crate::embedding::EmbeddedChunk {
+        crate::embedding::EmbeddedChunk {
+            page_start: Some(page),
+            page_end: Some(page),
+            ..chunk(index)
+        }
+    }
+
+    /// The P0-8 backfill signal (see `paths_without_page_anchors`). `SCHEMA_V2`
+    /// adds the page columns without backfilling them, so "which files are
+    /// still unanchored" is the only thing that can tell a resume which rows
+    /// of a LIVE corpus predate page attribution and must be redone.
+    #[test]
+    fn unanchored_files_are_reported_and_anchored_ones_are_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+
+        // Indexed before pages existed: chunks, every one of them NULL.
+        let mut legacy = sample_file("/a/legacy.pdf");
+        legacy.chunks = vec![chunk(0), chunk(1)];
+        store.add(&legacy, 0.0).unwrap();
+
+        // Indexed after: at least one chunk carries a page.
+        let mut anchored = sample_file("/a/anchored.pdf");
+        anchored.chunks = vec![anchored_chunk(0, 1), anchored_chunk(1, 2)];
+        store.add(&anchored, 0.0).unwrap();
+
+        // A file with no chunks at all is NOT this rule's business —
+        // `existing_keys`' `has_chunks` already schedules it, and reporting it
+        // here would double-count a case with a different remedy.
+        store.add(&sample_file("/a/chunkless.txt"), 0.0).unwrap();
+
+        let unanchored = store.paths_without_page_anchors().unwrap();
+        assert_eq!(
+            unanchored,
+            HashSet::from(["/a/legacy.pdf".to_string()]),
+            "only a file whose every chunk is unanchored is stale"
+        );
     }
 
     #[test]
@@ -1500,6 +1737,8 @@ mod tests {
             index: 0,
             content: "some indexed text".into(),
             vector: vec![0.5, 0.25],
+            page_start: None,
+            page_end: None,
         }];
         let mut failed = sample_file("/a/broken.pdf");
         failed.method = "error:poppler".into();
