@@ -65,6 +65,12 @@ pub struct IndexStats {
     pub embedded_chunks: usize,
     pub removed: usize,
     pub vision_files: usize,
+    /// Faces stored by this run, summed over files. Zero on every job that did
+    /// not turn the opt-in faces sub-tier on (and on every job whose box has no
+    /// face models staged), so an operator can tell at a glance whether the
+    /// capability actually did anything. Deliberately a COUNT and nothing more:
+    /// no paths, no boxes, no vectors leave the corpus in a job summary.
+    pub faces: usize,
     pub elapsed_seconds: f64,
 }
 

@@ -36,10 +36,14 @@ apart.
     "detectors": [{"id": "nano", "present": true}],
     "taggers": [{"id": "clip", "present": true}],
     "captioners": [{"id": "florence2", "present": false}],
+    "faces": [{"id": "yunet-sface", "present": false}],
     "defaults": {
       "detector_conf": 0.5,
       "tag_threshold": 0.22,
       "tag_top_k": 8,
+      "faces": "off",
+      "face_score": 0.9,
+      "max_faces": 20,
       "max_frames": 12,
       "timeout_secs": 60
     }
@@ -59,11 +63,20 @@ apart.
   files are present under `<data_dir>/vision` **and** pass the pinned SHA-256
   check (`available_tiers`/`corrupt_models`) — so an entry here is a real
   guarantee the tier will run, not just that the tier name is known.
-- `vision.detectors`/`taggers`/`captioners` list every selectable sub-model id
-  (`ocr_opts`/`vision_opts`' accepted enum values, minus `off`) with a
-  `present` flag backed by the same model-file existence + hash check
-  (`detector_present`/`tagger_present`/`captioner_present`). In v1 each
-  category has exactly one model, so all its ids currently share one flag.
+- `vision.detectors`/`taggers`/`captioners`/`faces` list every selectable
+  sub-model id (`ocr_opts`/`vision_opts`' accepted enum values, minus `off`)
+  with a `present` flag backed by the same model-file existence + hash check
+  (`detector_present`/`tagger_present`/`captioner_present`/`faces_present`). In
+  v1 each category has exactly one model, so all its ids currently share one
+  flag.
+- `vision.faces` is the **opt-in, privacy-sensitive** face pair (YuNet + SFace).
+  It differs from the other three in two ways worth reading carefully:
+  `defaults.faces` is `"off"` on every server (nothing enables it by omission),
+  and `present: false` means the capability is **absent**, not that a job will
+  fail — a job that asks for faces on a box that has not run
+  `fetch-data --faces` runs the rest of its tier and writes no faces. It also
+  never appears in `tiers_available`: faces is a sub-model of the `tags` tier,
+  not a tier, so an unstaged pair can never gate a tier off.
 - `vision.defaults` and `ocr.dpi.default`/`psm.default`/`preprocess_default`/
   `max_pages.default` are read live from the loaded `Config` — the same
   `OcrSettings::from_config`/`VisionSettings::from_config` base every
@@ -106,6 +119,9 @@ Queues one job and returns `202 Accepted` with an `id`.
     "tag_threshold": 0.22,
     "tag_top_k": 8,
     "captioner": "florence2",
+    "faces": "off",
+    "face_score": 0.9,
+    "max_faces": 20,
     "max_frames": 12,
     "timeout_secs": 60
   }
@@ -194,8 +210,28 @@ violation:
 | `vision_opts.tag_threshold` | float | `0.0..=1.0` | Minimum CLIP tag score kept. |
 | `vision_opts.tag_top_k` | integer | `1..=32` | Max tags kept per file. |
 | `vision_opts.captioner` | string | `off`\|`florence2` | Captioner selection. |
+| `vision_opts.faces` | string | `off`\|`yunet-sface` | Face detection + embedding. **Default `off`**; see the privacy note below. |
+| `vision_opts.face_score` | float | `0.05..=0.99` | Minimum face-detection score kept. |
+| `vision_opts.max_faces` | integer | `1..=200` | Max faces kept per file. |
 | `vision_opts.max_frames` | integer | `1..=64` | Max video keyframes analysed. |
 | `vision_opts.timeout_secs` | integer | `5..=1800` | Per-file vision timeout (seconds). |
+
+`vision_opts.faces` is the one knob here that produces data about **people**
+rather than files, so it behaves differently on purpose:
+
+- it is `off` by default in config, in the merge, and on the CLI — no request
+  turns it on by omission;
+- its models are staged only by an explicit `llm-index fetch-data --faces`
+  (`fetch-data --vision` does **not** fetch them);
+- if the pair is not staged the capability is absent and the job succeeds
+  without faces — an unavailable privacy feature never fails a job. A pair that
+  IS staged but fails its pinned SHA-256 does fail the job, since bytes nobody
+  vouched for must not compute claims about a person's identity;
+- results land only in the corpus's own `faces` table
+  (`file_id, face_index, x, y, width, height, quality, embedding, dimensions,
+  model, frame`). They are never rendered into `fts.content`, sidecars,
+  manifests, or the job summary — which reports only a `faces` COUNT — and this
+  engine never transmits them anywhere.
 
 Unknown top-level fields anywhere in the job body remain permissively ignored
 (existing forward-compat serde posture) — only the fields above are validated.
@@ -205,7 +241,8 @@ Unknown top-level fields anywhere in the job body remain permissively ignored
 Returns `queued`, `running`, `cancelling`, `cancelled`, `complete` or `error`.
 Running jobs include live `processed` and `total` file counters. A completed job includes the
 database path, file/OCR/error/incomplete counts, the `capped` count of rows resume
-declined because they have failed too often, embedded chunk count, removed
+declined because they have failed too often, embedded chunk count, the `faces`
+count of faces stored (0 unless the opt-in faces sub-tier ran), removed
 source count, elapsed time and OCR languages.
 
 ## `POST /jobs/{id}/cancel`
