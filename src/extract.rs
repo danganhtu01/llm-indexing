@@ -53,6 +53,14 @@ pub struct Extracted {
     pub method: String,
     pub ocr_used: bool,
     pub pages: usize,
+    /// `(page_number, text)` for the extraction paths that can attribute text
+    /// to a specific page (currently only the two PDF paths that keep
+    /// `pdftotext`'s per-page structure intact), 1-based to match `pages` and
+    /// `pdf_pages`. Empty for every other extraction method and for a PDF
+    /// path that merged page-agnostic OCR text into `text` in a way that
+    /// cannot be re-split honestly (P0-8: this is what lets the chunker
+    /// attribute a search hit to "p. 14" instead of just a filename).
+    pub page_segments: Vec<(usize, String)>,
 }
 
 impl Extracted {
@@ -62,6 +70,7 @@ impl Extracted {
             method: "name-only".into(),
             ocr_used: false,
             pages: 0,
+            page_segments: Vec::new(),
         }
     }
 }
@@ -96,6 +105,7 @@ fn extract_inner(
             method: "excluded:office-lock".into(),
             ocr_used: false,
             pages: 0,
+            page_segments: Vec::new(),
         });
     }
     if (size > config.max_bytes && config.ocr != "exhaustive") || config.skip_ext(ext) {
@@ -113,6 +123,7 @@ fn extract_inner(
             method: "text".into(),
             ocr_used: false,
             pages: 0,
+            page_segments: Vec::new(),
         });
     }
     if EMAIL_EXTS.contains(&ext) {
@@ -121,6 +132,7 @@ fn extract_inner(
             method: "email".into(),
             ocr_used: false,
             pages: 0,
+            page_segments: Vec::new(),
         });
     }
     match ext {
@@ -150,6 +162,7 @@ fn extract_inner(
                 text,
                 method: "ocr".into(),
                 pages: 1,
+                page_segments: Vec::new(),
             })
         }
         _ if AUDIO_EXTS.contains(&ext) || VIDEO_EXTS.contains(&ext) => {
@@ -185,6 +198,7 @@ fn legacy_doc(path: &Path, max_chars: usize) -> Result<Extracted> {
         method: "doc".into(),
         ocr_used: false,
         pages: 0,
+        page_segments: Vec::new(),
     })
 }
 
@@ -305,6 +319,7 @@ fn archive(
         .into(),
         ocr_used,
         pages,
+        page_segments: Vec::new(),
     })
 }
 
@@ -377,6 +392,7 @@ fn media(
         .into(),
         ocr_used: frame_count > 0,
         pages: frame_count,
+        page_segments: Vec::new(),
     })
 }
 
@@ -518,6 +534,7 @@ fn office_archive(
         },
         ocr_used,
         pages: images.len(),
+        page_segments: Vec::new(),
     })
 }
 
@@ -564,6 +581,7 @@ fn pdf_exhaustive(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Ex
     let temp = tempdir()?;
     let dpi = config.ocr_dpi.to_string();
     let mut parts = Vec::with_capacity(pages);
+    let mut page_segments = Vec::with_capacity(pages);
     let mut used_ocr = false;
     for page in 1..=pages {
         let output = Command::new("pdftotext")
@@ -610,6 +628,11 @@ fn pdf_exhaustive(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Ex
             }
         };
         parts.push(format!("[Page {page}]\n{page_text}"));
+        // Exhaustive mode never truncates `text` (its `max_chars` is
+        // effectively unlimited — see `extract_inner`), so the per-page
+        // segments built alongside it need no truncation either: the two
+        // always agree on how much of the document was kept.
+        page_segments.push((page, page_text));
     }
     Ok(Extracted {
         text: parts.join("\n\n"),
@@ -621,6 +644,7 @@ fn pdf_exhaustive(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Ex
         .into(),
         ocr_used: used_ocr,
         pages,
+        page_segments,
     })
 }
 
@@ -634,6 +658,11 @@ fn pdf(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
         .unwrap_or_default();
+    // `pdftotext` inserts a form-feed between pages by default (no `-nopgbrk`
+    // is passed anywhere here), which is a free, page-numbered split of text
+    // that already went through this exact call — no extra `pdftotext -f -l`
+    // invocation per page needed for the common (non-OCR) case.
+    let page_segments = truncate_page_segments(page_segments_from_form_feeds(&text), config.max_chars);
     let need_ocr = config.ocr == "on"
         || (config.ocr == "auto" && text.trim().chars().count() < 20 * pages.max(1));
     if !need_ocr || !ocr.available {
@@ -642,6 +671,7 @@ fn pdf(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
             method: "pdf-text".into(),
             ocr_used: false,
             pages,
+            page_segments,
         });
     }
     let temp = tempdir()?;
@@ -674,6 +704,12 @@ fn pdf(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
             method: "pdf-ocr".into(),
             ocr_used: true,
             pages,
+            // The merged text prefixes the whole-document `pdftotext` output
+            // ahead of a flat join of per-image OCR text, so the page split
+            // computed from `text` alone no longer lines up with what is
+            // actually stored — leave this run page-agnostic rather than
+            // attribute OCR'd content to the wrong page.
+            page_segments: Vec::new(),
         })
     } else {
         Ok(Extracted {
@@ -681,8 +717,45 @@ fn pdf(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
             method: "pdf-text".into(),
             ocr_used: false,
             pages,
+            page_segments,
         })
     }
+}
+
+/// Split `pdftotext`'s default output on the form-feed page breaks it inserts
+/// between pages into one `(page_number, text)` segment per page, 1-based.
+/// Blank pages are dropped from the result but not from the numbering — the
+/// `enumerate` runs over every split part before `filter_map` discards the
+/// empty ones, so a document with a blank page 2 still reports page 3
+/// correctly rather than shifting it down to 2.
+fn page_segments_from_form_feeds(text: &str) -> Vec<(usize, String)> {
+    text.split('\u{000c}')
+        .enumerate()
+        .filter_map(|(index, part)| (!part.trim().is_empty()).then(|| (index + 1, part.to_string())))
+        .collect()
+}
+
+/// Trim page segments so their concatenated length never exceeds `max_chars`
+/// — the same budget `truncate` applies to the flat `Extracted::text` — by
+/// keeping whole pages up to the budget and, once it runs out mid-page,
+/// truncating that page's text and dropping every later page entirely.
+/// Without this the chunker (which chunks `page_segments` directly when they
+/// are present, see `embedding::chunk_spans`) would embed an amount of text
+/// the rest of the pipeline never agreed to.
+fn truncate_page_segments(segments: Vec<(usize, String)>, max_chars: usize) -> Vec<(usize, String)> {
+    let mut budget = max_chars;
+    let mut out = Vec::with_capacity(segments.len());
+    for (page, text) in segments {
+        if budget == 0 {
+            break;
+        }
+        let kept = truncate(text, budget);
+        budget -= kept.chars().count();
+        if !kept.trim().is_empty() {
+            out.push((page, kept));
+        }
+    }
+    out
 }
 
 fn pdf_pages(path: &Path) -> usize {
