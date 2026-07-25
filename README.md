@@ -32,7 +32,8 @@ this component.
 - Bounded HTTP job queue with input/output path confinement, live per-file
   counters and cooperative cancellation
 - Optional local vision analysis of photos/video (EXIF, perceptual hash,
-  quality, CLIP tags, object detection, best-effort captions), off by default
+  quality, CLIP tags, object detection, best-effort captions), plus a separate
+  opt-in local faces sub-model, all off by default
   — see [Vision (photos & video)](#vision-photos--video)
 
 `ocr: exhaustive` removes the normal byte, character and PDF-page caps. It OCRs
@@ -113,7 +114,7 @@ worker, sidecar and skip settings.
 
 Beyond the service-wide `config.yaml` defaults, every `index` job (native CLI
 or `POST /index`) can override OCR quality (`dpi`, `psm`, `preprocess`,
-`max_pages`, `langs`) and vision quality (`detector`, `detector_conf`,
+`max_pages`, `langs`) and vision quality (`detector`, `detector_conf`, `faces`,
 `tagger`, `tag_threshold`, `tag_top_k`, `captioner`, `max_frames`,
 `timeout_secs`) for that job alone:
 
@@ -153,10 +154,27 @@ values and FTS content are byte-identical until a caller opts in.
 ./target/release/llm-index serve --vision-max tags        # allow jobs up to `tags`
 ```
 
+A separate, **opt-in** faces sub-model (YuNet detect + SFace embed, both
+Apache-2.0) writes face boxes and 128-d embeddings into their own `faces`
+table. It is off by default at every layer and its models are staged only by
+their own command — `fetch-data --vision` never downloads them:
+
+```bash
+./target/release/llm-index fetch-data --faces            # opt-in, pinned SHA-256
+./target/release/llm-index index ./photos --out index_out \
+  --vision tags --vision-faces yunet-sface
+```
+
+Face data is local-only: no network at index time, and embeddings never reach
+the searchable FTS content, sidecars, manifests or job summaries — a job
+reports a `faces` count and nothing more. A box that has not staged the pair
+reports the capability as absent (`GET /settings`) and runs jobs without it
+rather than failing them.
+
 Full tier reference, config knobs (`--vision`, `--vision-max` /
-`INDEX_VISION_MAX`, `VisionConfig`), the model/license table, consumer
-compatibility notes and performance/security details:
-[`docs/VISION.md`](docs/VISION.md).
+`INDEX_VISION_MAX`, `VisionConfig`), the faces privacy posture, the
+model/license table, consumer compatibility notes and performance/security
+details: [`docs/VISION.md`](docs/VISION.md).
 
 ## Output and incremental behavior
 
@@ -176,21 +194,51 @@ intact, but irreversibly once indexing has begun.
 
 Resume uses path, size and mtime and also repairs records missing vectors or
 marked partial/error. It reprocesses older PDF methods when exhaustive OCR is
-requested. A record that has failed three times without finishing is then left
-alone: re-extracting a file the engine cannot read costs the same on every resume
-and produces the same row. Changed bytes, an available upgrade, a changed
-embedding model, a build whose extraction capability has moved, and the explicit
-`retry_errors` / `--retry-errors` flag (default off) each reopen it. Source files
-removed from the mounted tree are pruned from `files`, FTS and vector chunks —
-unless the walk found no files at all, which is treated as an unmounted or
-mistyped root rather than an instruction to empty the corpus. The job result
-reports `incomplete`, `capped`, `embedded_chunks` and `removed`, allowing callers
-to show authentic state.
+requested, and PDFs whose stored chunks carry no page anchors (see
+[Page anchors](#page-anchors)). A record that has failed three times without
+finishing is then left alone: re-extracting a file the engine cannot read costs
+the same on every resume and produces the same row. Changed bytes, an available
+upgrade, a changed embedding model, a build whose extraction capability has
+moved, and the explicit `retry_errors` / `--retry-errors` flag (default off)
+each reopen it. Source files removed from the mounted tree are pruned from
+`files`, FTS and vector chunks — unless the walk found no files at all, which is
+treated as an unmounted or mistyped root rather than an instruction to empty the
+corpus. The job result reports `incomplete`, `capped`, `embedded_chunks` and
+`removed`, allowing callers to show authentic state.
 
 Service callers may additionally provide a confined `include_paths` list of
 relative file paths. The engine still scans the mounted tree to prune deletions,
 but extraction, OCR, transcription and embedding are restricted to exactly that
 list. This is how `ff-lc-app` guarantees that a button press processes only its
 database-derived new, changed or incomplete rows.
+
+### Page anchors
+
+Chunks carry `page_start`/`page_end` — the 1-based page span the chunk's text
+came from — so a retrieved passage is citable ("p. 14") rather than just
+attributable to a file. They are filled by the extraction paths that can
+attribute text to a page: the text-layer PDF paths (`pdf-text`,
+`pdf-exhaustive-text`, `pdf-exhaustive-ocr`). They are NULL for every other
+method, and for `pdf-ocr` — the merged text-layer + OCR branch — whose stored
+text no longer lines up with the per-page split, so attributing it would put
+OCR'd content on the wrong page.
+
+**Upgrading an existing corpus.** The columns arrived as a schema migration,
+and a migration adds columns, not data: every chunk indexed before it reads
+back NULL, and simply opening the corpus with a newer binary changes nothing.
+Resume therefore treats "a PDF whose every chunk is unanchored, indexed by a
+method that CAN be anchored" as a per-file upgrade, exactly like the
+OCR-exhaustive and vision-tier rules. So:
+
+- **Deploying this build does not require a destructive re-index.** Run an
+  ordinary `resume` job over the corpus's own paths and the affected PDFs are
+  reprocessed in place; everything else is skipped as usual. A
+  `{"overwrite": true}` job works too but throws away the whole corpus first
+  and is not needed.
+- Until that job runs, an already-indexed corpus keeps reporting no locators,
+  and consumers (`llm-search`, and the apps above it) correctly render no page
+  — they do not fail.
+- The rule terminates: a reprocessed file comes back anchored, and the methods
+  that can never be anchored are never scheduled by it.
 
 MIT licensed.

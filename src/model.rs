@@ -35,6 +35,12 @@ pub struct ProcessedFile {
     /// The stage that spent it is already in `method` (`error:embed:…` against
     /// any other `error:…`).
     pub elapsed_ms: u64,
+    /// Carried straight from `Extracted::page_segments` (see `extract.rs`):
+    /// `(page_number, text)` pairs for the extraction paths that can
+    /// attribute text to a page. Empty for everything else. The embedder
+    /// chunks these directly when present so `EmbeddedChunk::page_start`/
+    /// `page_end` — and from there `VectorHit`'s — are populated (P0-8).
+    pub page_segments: Vec<(usize, String)>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -59,6 +65,12 @@ pub struct IndexStats {
     pub embedded_chunks: usize,
     pub removed: usize,
     pub vision_files: usize,
+    /// Faces stored by this run, summed over files. Zero on every job that did
+    /// not turn the opt-in faces sub-tier on (and on every job whose box has no
+    /// face models staged), so an operator can tell at a glance whether the
+    /// capability actually did anything. Deliberately a COUNT and nothing more:
+    /// no paths, no boxes, no vectors leave the corpus in a job summary.
+    pub faces: usize,
     pub elapsed_seconds: f64,
 }
 
