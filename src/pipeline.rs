@@ -478,7 +478,7 @@ fn embed_worker(
                 // Cancelled while parked for an instance.
                 Ok(None) => return,
                 Ok(Some(mut embedder)) => {
-                    let embedded = embedder.embed_document(&file.content);
+                    let embedded = embedder.embed_document(&file.content, &file.page_segments);
                     // Explicitly BEFORE the send below: a worker blocked on
                     // backpressure must not hold a pooled instance, or shrinking
                     // the pool cannot reclaim it and other workers park behind a
@@ -531,6 +531,20 @@ fn process(
     match extract(path, &record.ext, record.size, config, ocr, transcriber) {
         Ok(extracted) => {
             let empty = extracted.text.trim().is_empty();
+            // NFC-normalized per segment, same transform `content` gets below,
+            // so the embedder never chunks a mix of decomposed and precomposed
+            // text depending on whether a passage happened to fall in a page
+            // segment or the flat fallback. Dropped entirely alongside the
+            // empty-extraction fallback: a name+dir stand-in has no pages.
+            let page_segments: Vec<(usize, String)> = if empty {
+                Vec::new()
+            } else {
+                extracted
+                    .page_segments
+                    .iter()
+                    .map(|(page, text)| (*page, nfc(text.clone())))
+                    .collect()
+            };
             let mut content = nfc(if empty {
                 format!("{} {}", record.name, record.dir)
             } else {
@@ -567,6 +581,7 @@ fn process(
                 sha1: hash,
                 chunks: Vec::new(),
                 vision,
+                page_segments,
             }
         }
         Err(error) => ProcessedFile {
@@ -579,6 +594,7 @@ fn process(
             sha1: None,
             chunks: Vec::new(),
             vision: None,
+            page_segments: Vec::new(),
             rec: record,
         },
     }
@@ -781,6 +797,7 @@ mod tests {
             sha1: None,
             chunks: Vec::new(),
             vision: None,
+            page_segments: Vec::new(),
         }
     }
 

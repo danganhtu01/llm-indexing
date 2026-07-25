@@ -21,7 +21,7 @@ use crate::vision::VisionResult;
 /// the same statement. Later versions are appended as new entries — never
 /// edit one that has shipped, since a live corpus may already be stamped past
 /// it.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
 
 /// The schema version this binary knows how to write. Advertised via
 /// `schema_version` (surfaced in `/corpus/status`) so a consumer sees version
@@ -78,6 +78,18 @@ CREATE TABLE IF NOT EXISTS vision(
 );
 CREATE INDEX IF NOT EXISTS idx_vision_phash ON vision(phash);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"#;
+
+/// P0-8: page anchoring on `chunks`. Both columns are nullable — `NULL` is
+/// what every extraction path that cannot attribute a chunk to a page (every
+/// non-PDF method, and the PDF-with-merged-OCR path) writes, and what any
+/// chunk written before this migration existed reads back as. Runs exactly
+/// once per database via the version-skip loop in `migrate`, so — unlike
+/// `SCHEMA_V1`, which is replayed whole against both a fresh database and a
+/// hand-built pre-harness one — this needs no `IF NOT EXISTS` guard.
+const SCHEMA_V2: &str = r#"
+ALTER TABLE chunks ADD COLUMN page_start INTEGER;
+ALTER TABLE chunks ADD COLUMN page_end INTEGER;
 "#;
 
 /// Bring `connection`'s schema up to `MIGRATIONS.len()`, one version at a time
@@ -523,8 +535,8 @@ impl IndexStore {
         )?;
         for chunk in &file.chunks {
             self.connection.execute(
-                "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model) \
-                 VALUES(?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model,\
+                 page_start,page_end) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     id,
                     chunk.index as i64,
@@ -532,6 +544,8 @@ impl IndexStore {
                     crate::embedding::vector_to_bytes(&chunk.vector),
                     chunk.vector.len() as i64,
                     crate::embedding::EMBEDDING_MODEL,
+                    chunk.page_start.map(|value| value as i64),
+                    chunk.page_end.map(|value| value as i64),
                 ],
             )?;
         }
@@ -892,6 +906,7 @@ mod tests {
             sha1: None,
             chunks: Vec::new(),
             vision: None,
+            page_segments: Vec::new(),
         }
     }
 
@@ -1051,6 +1066,8 @@ mod tests {
             index,
             content: format!("chunk {index}"),
             vector: vec![0.5, 0.25],
+            page_start: None,
+            page_end: None,
         }
     }
 
@@ -1153,6 +1170,8 @@ mod tests {
             index: 0,
             content: "some indexed text".into(),
             vector: vec![0.5, 0.25],
+            page_start: None,
+            page_end: None,
         }];
         let mut failed = sample_file("/a/broken.pdf");
         failed.method = "error:poppler".into();
