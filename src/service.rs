@@ -175,9 +175,8 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
     // HTTP listener binds — means the very first `GET /jobs/{id}` a caller
     // can make already sees the honest post-restart state, never a stale
     // "running" that no worker will ever finish.
-    let jobs_store = Arc::new(
-        JobsStore::open(&normalized.output_root).context("opening jobs.sqlite")?,
-    );
+    let jobs_store =
+        Arc::new(JobsStore::open(&normalized.output_root).context("opening jobs.sqlite")?);
     let swept = jobs_store
         .sweep_interrupted()
         .context("sweeping interrupted jobs at startup")?;
@@ -662,12 +661,13 @@ async fn job(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> R
 }
 
 async fn cancel_job(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    // A cancellation flag exists ONLY for a job this very process admitted
+    // via `submit` — it is never persisted or reconstructed. So an id absent
+    // here is either a job this process never ran (a restart, or an id that
+    // simply does not exist) or one that aged out of `cancellations` — either
+    // way, this process cannot cancel it, whatever its recorded state.
     let Some(cancellation) = state.cancellations.read().await.get(&id).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error":"job not found"})),
-        )
-            .into_response();
+        return cancel_unmanaged(&state, &id).await;
     };
     // The write lock is scoped to the in-memory mutation only: persisting to
     // `jobs.sqlite` below awaits a `spawn_blocking` task, and holding an async
@@ -676,11 +676,14 @@ async fn cancel_job(State(state): State<AppState>, AxumPath(id): AxumPath<String
     let cancelling = {
         let mut jobs = state.jobs.write().await;
         let Some(job) = jobs.get_mut(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error":"job not found"})),
-            )
-                .into_response();
+            // `prune_history` (see below) removes only terminal rows from
+            // `jobs`, never from `cancellations` — so a cancellation flag can
+            // outlive its job here. The row is gone from memory but its
+            // terminal state is durable in `jobs.sqlite`; treat it the same
+            // as any other id this process cannot presently act on rather
+            // than 404ing a job `GET /jobs/{id}` still happily answers for.
+            drop(jobs);
+            return cancel_unmanaged(&state, &id).await;
         };
         match job["status"].as_str() {
             Some("queued" | "running" | "cancelling") => {
@@ -702,6 +705,50 @@ async fn cancel_job(State(state): State<AppState>, AxumPath(id): AxumPath<String
             Json(json!({"error":"job is not active"})),
         )
             .into_response(),
+    }
+}
+
+/// The fallback for `cancel_job` when `id` has no live cancellation flag in
+/// this process. Consults `jobs.sqlite` — the same persisted fallback
+/// `GET /jobs/{id}` reads — so a job this process merely lost live track of
+/// (aged out of `jobs`/`cancellations`, or genuinely run by a prior instance
+/// before a restart) is reported "not active" (409) rather than the
+/// misleading "not found" (404) a caller would otherwise see for an id
+/// `GET /jobs/{id}` still happily answers. This path can never itself flip a
+/// job's status: without a cancellation flag there is no running work to
+/// signal, so a persisted row — terminal by construction, since
+/// `sweep_interrupted` rewrites anything a restart caught mid-run — is only
+/// ever read, never mutated, which is what keeps a completed run from ever
+/// being reported cancelled. An id in neither place is genuinely unknown.
+async fn cancel_unmanaged(state: &AppState, id: &str) -> Response {
+    let store = state.jobs_store.clone();
+    let lookup = id.to_string();
+    let found = match tokio::task::spawn_blocking(move || store.get(&lookup)).await {
+        Ok(Ok(value)) => value.is_some(),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "failed to read persisted job envelope while cancelling"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(error = %format!("{error}"), "job-store read task failed");
+            false
+        }
+    };
+    if found {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"job is not active"})),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"job not found"})),
+        )
+            .into_response()
     }
 }
 

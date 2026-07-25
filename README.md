@@ -148,7 +148,8 @@ intact, but irreversibly once indexing has begun.
 
 Resume uses path, size and mtime and also repairs records missing vectors or
 marked partial/error. It reprocesses older PDF methods when exhaustive OCR is
-requested. Source files removed from the mounted tree are pruned from `files`,
+requested, and PDFs whose stored chunks carry no page anchors (see
+[Page anchors](#page-anchors)). Source files removed from the mounted tree are pruned from `files`,
 FTS and vector chunks — unless the walk found no files at all, which is treated
 as an unmounted or mistyped root rather than an instruction to empty the corpus.
 The job result reports `incomplete`, `embedded_chunks` and `removed`, allowing
@@ -159,5 +160,34 @@ relative file paths. The engine still scans the mounted tree to prune deletions,
 but extraction, OCR, transcription and embedding are restricted to exactly that
 list. This is how `ff-lc-app` guarantees that a button press processes only its
 database-derived new, changed or incomplete rows.
+
+### Page anchors
+
+Chunks carry `page_start`/`page_end` — the 1-based page span the chunk's text
+came from — so a retrieved passage is citable ("p. 14") rather than just
+attributable to a file. They are filled by the extraction paths that can
+attribute text to a page: the text-layer PDF paths (`pdf-text`,
+`pdf-exhaustive-text`, `pdf-exhaustive-ocr`). They are NULL for every other
+method, and for `pdf-ocr` — the merged text-layer + OCR branch — whose stored
+text no longer lines up with the per-page split, so attributing it would put
+OCR'd content on the wrong page.
+
+**Upgrading an existing corpus.** The columns arrived as a schema migration,
+and a migration adds columns, not data: every chunk indexed before it reads
+back NULL, and simply opening the corpus with a newer binary changes nothing.
+Resume therefore treats "a PDF whose every chunk is unanchored, indexed by a
+method that CAN be anchored" as a per-file upgrade, exactly like the
+OCR-exhaustive and vision-tier rules. So:
+
+- **Deploying this build does not require a destructive re-index.** Run an
+  ordinary `resume` job over the corpus's own paths and the affected PDFs are
+  reprocessed in place; everything else is skipped as usual. A
+  `{"overwrite": true}` job works too but throws away the whole corpus first
+  and is not needed.
+- Until that job runs, an already-indexed corpus keeps reporting no locators,
+  and consumers (`llm-search`, and the apps above it) correctly render no page
+  — they do not fail.
+- The rule terminates: a reprocessed file comes back anchored, and the methods
+  that can never be anchored are never scheduled by it.
 
 MIT licensed.

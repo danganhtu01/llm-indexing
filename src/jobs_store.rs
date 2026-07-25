@@ -152,7 +152,10 @@ impl JobsStore {
     pub fn record(&self, id: &str, envelope: &Value) -> Result<()> {
         let status = envelope["status"].as_str().unwrap_or("unknown").to_string();
         let envelope_json = serde_json::to_string(envelope)?;
-        let connection = self.connection.lock().unwrap_or_else(|poison| poison.into_inner());
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         connection.execute(
             "INSERT INTO jobs(id, status, envelope_json, updated_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET status = excluded.status,
@@ -166,7 +169,10 @@ impl JobsStore {
     /// reads once the in-memory map no longer holds it (aged out, or the
     /// process restarted since).
     pub fn get(&self, id: &str) -> Result<Option<Value>> {
-        let connection = self.connection.lock().unwrap_or_else(|poison| poison.into_inner());
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let json: Option<String> = connection
             .query_row(
                 "SELECT envelope_json FROM jobs WHERE id = ?1",
@@ -174,7 +180,8 @@ impl JobsStore {
                 |row| row.get(0),
             )
             .optional()?;
-        json.map(|text| Ok(serde_json::from_str(&text)?)).transpose()
+        json.map(|text| Ok(serde_json::from_str(&text)?))
+            .transpose()
     }
 
     /// Rewrite every non-terminal row (`queued`/`running`/`cancelling`) to a
@@ -184,7 +191,10 @@ impl JobsStore {
     /// terminal state is "the restart killed it, resubmit", never "still
     /// running" forever. Returns the ids rewritten, for a startup log line.
     pub fn sweep_interrupted(&self) -> Result<Vec<String>> {
-        let connection = self.connection.lock().unwrap_or_else(|poison| poison.into_inner());
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut statement = connection.prepare(
             "SELECT id, envelope_json FROM jobs \
              WHERE status IN ('queued', 'running', 'cancelling')",
@@ -215,7 +225,10 @@ impl JobsStore {
     /// Keep only the `keep` most recently updated rows — bounds an otherwise
     /// ever-growing history in a long-lived service.
     pub fn prune(&self, keep: usize) -> Result<()> {
-        let connection = self.connection.lock().unwrap_or_else(|poison| poison.into_inner());
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         connection.execute(
             "DELETE FROM jobs WHERE id NOT IN (
                 SELECT id FROM jobs ORDER BY updated_at DESC LIMIT ?1
@@ -228,8 +241,14 @@ impl JobsStore {
     /// Row count — test/diagnostic use.
     #[cfg(test)]
     pub fn row_count(&self) -> Result<usize> {
-        let connection = self.connection.lock().unwrap_or_else(|poison| poison.into_inner());
-        Ok(connection.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get::<_, i64>(0))? as usize)
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Ok(
+            connection.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get::<_, i64>(0))?
+                as usize,
+        )
     }
 }
 

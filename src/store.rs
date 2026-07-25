@@ -21,7 +21,7 @@ use crate::vision::VisionResult;
 /// the same statement. Later versions are appended as new entries — never
 /// edit one that has shipped, since a live corpus may already be stamped past
 /// it.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
 
 /// The schema version this binary knows how to write. Advertised via
 /// `schema_version` (surfaced in `/corpus/status`) so a consumer sees version
@@ -78,6 +78,18 @@ CREATE TABLE IF NOT EXISTS vision(
 );
 CREATE INDEX IF NOT EXISTS idx_vision_phash ON vision(phash);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"#;
+
+/// P0-8: page anchoring on `chunks`. Both columns are nullable — `NULL` is
+/// what every extraction path that cannot attribute a chunk to a page (every
+/// non-PDF method, and the PDF-with-merged-OCR path) writes, and what any
+/// chunk written before this migration existed reads back as. Runs exactly
+/// once per database via the version-skip loop in `migrate`, so — unlike
+/// `SCHEMA_V1`, which is replayed whole against both a fresh database and a
+/// hand-built pre-harness one — this needs no `IF NOT EXISTS` guard.
+const SCHEMA_V2: &str = r#"
+ALTER TABLE chunks ADD COLUMN page_start INTEGER;
+ALTER TABLE chunks ADD COLUMN page_end INTEGER;
 "#;
 
 /// Bring `connection`'s schema up to `MIGRATIONS.len()`, one version at a time
@@ -138,7 +150,9 @@ pub fn schema_version(connection: &Connection) -> Result<i64> {
 /// fixture) reads as "key absent", the same as a present table with no such
 /// row: either way the caller has no value to trust, not a fault to report.
 pub fn read_meta(connection: &Connection, key: &str) -> Result<Option<String>> {
-    match connection.query_row("SELECT value FROM meta WHERE key=?1", [key], |row| row.get(0)) {
+    match connection.query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
+        row.get(0)
+    }) {
         Ok(value) => Ok(Some(value)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(rusqlite::Error::SqliteFailure(_, Some(ref message)))
@@ -351,6 +365,30 @@ impl IndexStore {
             .collect())
     }
 
+    /// Paths whose stored chunks carry NO page attribution at all — every
+    /// chunk's `page_start` is NULL — for the resume change-detection upgrade
+    /// rule (see `pipeline::page_anchorable_pdf_method`).
+    ///
+    /// This is the per-file signal that lets an EXISTING corpus grow page
+    /// locators. `SCHEMA_V2` adds `chunks.page_start`/`page_end` nullable and
+    /// backfills nothing, so every chunk indexed before that migration reads
+    /// back NULL forever: the columns being present says nothing about the
+    /// rows. Without this signal the only way to make a live corpus citable
+    /// would be a destructive `overwrite` re-index of the whole thing.
+    ///
+    /// Files holding no chunks at all are excluded — `existing_keys`'
+    /// `has_chunks` already schedules those — so this reports exactly "indexed,
+    /// and not on any page".
+    pub fn paths_without_page_anchors(&self) -> Result<HashSet<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT f.path FROM files f \
+             WHERE EXISTS(SELECT 1 FROM chunks c WHERE c.file_id=f.id) \
+               AND NOT EXISTS(SELECT 1 FROM chunks c WHERE c.file_id=f.id AND c.page_start IS NOT NULL)",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.flatten().collect())
+    }
+
     /// The highest vision tier recorded per file path, for the resume
     /// change-detection upgrade rule. Absent files simply aren't in the map.
     pub fn existing_vision_modes(&self) -> Result<HashMap<String, String>> {
@@ -523,8 +561,8 @@ impl IndexStore {
         )?;
         for chunk in &file.chunks {
             self.connection.execute(
-                "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model) \
-                 VALUES(?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model,\
+                 page_start,page_end) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     id,
                     chunk.index as i64,
@@ -532,6 +570,8 @@ impl IndexStore {
                     crate::embedding::vector_to_bytes(&chunk.vector),
                     chunk.vector.len() as i64,
                     crate::embedding::EMBEDDING_MODEL,
+                    chunk.page_start.map(|value| value as i64),
+                    chunk.page_end.map(|value| value as i64),
                 ],
             )?;
         }
@@ -892,6 +932,7 @@ mod tests {
             sha1: None,
             chunks: Vec::new(),
             vision: None,
+            page_segments: Vec::new(),
         }
     }
 
@@ -949,7 +990,10 @@ mod tests {
         // row that was already there — identical destination shape to a fresh
         // open, but the pre-existing data survives.
         let store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
-        assert_eq!(schema_version(&store.connection).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            schema_version(&store.connection).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
         let existing = store.existing_keys().unwrap();
         assert!(existing.contains_key("/a/old.txt"), "{existing:?}");
     }
@@ -1051,7 +1095,50 @@ mod tests {
             index,
             content: format!("chunk {index}"),
             vector: vec![0.5, 0.25],
+            page_start: None,
+            page_end: None,
         }
+    }
+
+    fn anchored_chunk(index: usize, page: usize) -> crate::embedding::EmbeddedChunk {
+        crate::embedding::EmbeddedChunk {
+            page_start: Some(page),
+            page_end: Some(page),
+            ..chunk(index)
+        }
+    }
+
+    /// The P0-8 backfill signal (see `paths_without_page_anchors`). `SCHEMA_V2`
+    /// adds the page columns without backfilling them, so "which files are
+    /// still unanchored" is the only thing that can tell a resume which rows
+    /// of a LIVE corpus predate page attribution and must be redone.
+    #[test]
+    fn unanchored_files_are_reported_and_anchored_ones_are_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+
+        // Indexed before pages existed: chunks, every one of them NULL.
+        let mut legacy = sample_file("/a/legacy.pdf");
+        legacy.chunks = vec![chunk(0), chunk(1)];
+        store.add(&legacy, 0.0).unwrap();
+
+        // Indexed after: at least one chunk carries a page.
+        let mut anchored = sample_file("/a/anchored.pdf");
+        anchored.chunks = vec![anchored_chunk(0, 1), anchored_chunk(1, 2)];
+        store.add(&anchored, 0.0).unwrap();
+
+        // A file with no chunks at all is NOT this rule's business —
+        // `existing_keys`' `has_chunks` already schedules it, and reporting it
+        // here would double-count a case with a different remedy.
+        store.add(&sample_file("/a/chunkless.txt"), 0.0).unwrap();
+
+        let unanchored = store.paths_without_page_anchors().unwrap();
+        assert_eq!(
+            unanchored,
+            HashSet::from(["/a/legacy.pdf".to_string()]),
+            "only a file whose every chunk is unanchored is stale"
+        );
     }
 
     #[test]
@@ -1153,6 +1240,8 @@ mod tests {
             index: 0,
             content: "some indexed text".into(),
             vector: vec![0.5, 0.25],
+            page_start: None,
+            page_end: None,
         }];
         let mut failed = sample_file("/a/broken.pdf");
         failed.method = "error:poppler".into();
