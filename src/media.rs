@@ -7,6 +7,7 @@ use tempfile::tempdir;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::config::Config;
+use crate::failure::CapabilityUnavailable;
 
 #[derive(Clone)]
 pub struct Transcriber {
@@ -39,10 +40,13 @@ impl Transcriber {
     }
 
     pub fn transcribe(&self, path: &Path) -> Result<String> {
+        // A typed error, not `.context(..)` on the `Option`, so
+        // `crate::failure::classify` recognizes this as `Unsupported` by
+        // downcasting rather than parsing the message — see `failure.rs`.
         let context = self
             .context
             .as_ref()
-            .context("Whisper model is unavailable")?;
+            .ok_or(CapabilityUnavailable("Whisper model is unavailable"))?;
         let temp = tempdir()?;
         let wav = temp.path().join("audio.wav");
         let output = Command::new("ffmpeg")

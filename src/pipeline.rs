@@ -649,7 +649,7 @@ fn process(
             content: format!("{} {}", record.name, record.dir),
             tokens: Vec::new(),
             lang: "und".into(),
-            method: format!("error:{}", error_chain_name(&error)),
+            method: format!("error:{}", crate::failure::classify(&error).as_str()),
             ocr_used: false,
             pages: 0,
             sha1: None,
@@ -825,16 +825,6 @@ fn sha1(path: &Path) -> Option<String> {
         hash.update(&buffer[..n]);
     }
     Some(format!("{:x}", hash.finalize()))
-}
-
-fn error_chain_name(error: &anyhow::Error) -> String {
-    error
-        .root_cause()
-        .to_string()
-        .split_whitespace()
-        .next()
-        .unwrap_or("extract")
-        .to_string()
 }
 
 fn now() -> f64 {
@@ -1174,6 +1164,80 @@ mod tests {
             assert!(!row_complete("text", false), "vectors never landed");
             assert!(!row_complete("error:extract:pdf", true));
             assert!(!row_complete("name-only-partial", true));
+        }
+    }
+
+    /// B5 replaced `error_chain_name`'s locale-derived suffix with
+    /// [`crate::failure::FailureClass`], but every EXISTING corpus row keeps
+    /// its old locale-derived string (`error:Das`, `error:local`,
+    /// `error:program`) forever — there is no migration that rewrites stored
+    /// `method` values. Every predicate that matches `error:` rows, in this
+    /// module and in `store.rs`'s `method LIKE 'error:%'`, matches on the
+    /// PREFIX alone, so it must treat an old-style suffix and a new
+    /// [`FailureClass`] one identically. This pins that for every such
+    /// predicate reachable from this module.
+    mod legacy_error_rows_stay_equivalent {
+        use super::super::{
+            incomplete_method, keep_old_on_error, needs_reprocess, row_complete, MAX_ATTEMPTS,
+        };
+        use super::stored;
+        use crate::failure::FailureClass;
+
+        /// A stored `error:` row's suffix predates this workstream, a fixed
+        /// class it introduced, or (once B2 lands) the reserved encrypted
+        /// class — resume must not be able to tell them apart.
+        fn suffixes() -> Vec<String> {
+            vec![
+                "Das".into(),     // German Windows: live corpus, 85 rows
+                "local".into(),   // live corpus, 2,877 rows
+                "program".into(), // live corpus, 439 rows
+                "poppler".into(), // this crate's own pre-B5 store.rs fixtures
+                FailureClass::IoNotFound.as_str().into(),
+                FailureClass::IoDenied.as_str().into(),
+                FailureClass::Decode.as_str().into(),
+                FailureClass::Timeout.as_str().into(),
+                FailureClass::Encrypted.as_str().into(),
+                FailureClass::Unsupported.as_str().into(),
+                FailureClass::Unknown.as_str().into(),
+            ]
+        }
+
+        #[test]
+        fn every_error_row_shape_is_incomplete() {
+            for suffix in suffixes() {
+                let method = format!("error:{suffix}");
+                assert!(incomplete_method(&method), "{method}");
+                assert!(!row_complete(&method, true), "{method}, even with chunks");
+            }
+        }
+
+        #[test]
+        fn every_error_row_shape_is_resumed_until_the_cap_and_capped_the_same_way() {
+            for suffix in suffixes() {
+                let method = format!("error:{suffix}");
+                assert!(
+                    needs_reprocess(&stored(&method, false, 0), 12, 100, false, false),
+                    "{method} at 0 attempts must be retried"
+                );
+                assert!(
+                    !needs_reprocess(&stored(&method, false, MAX_ATTEMPTS), 12, 100, false, false),
+                    "{method} at the cap must be left alone, same as any other class"
+                );
+            }
+        }
+
+        #[test]
+        fn every_error_row_shape_yields_to_a_reprocess_the_same_way() {
+            // A complete, unchanged row: an old-style OR a new-style error
+            // result must equally be DROPPED in favor of the good stored row.
+            let complete = stored("text", true, 0);
+            for suffix in suffixes() {
+                let method = format!("error:{suffix}");
+                assert!(
+                    keep_old_on_error(&method, 12, 100, Some(&complete)),
+                    "{method} must not clobber a complete unchanged row"
+                );
+            }
         }
     }
 
