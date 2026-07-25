@@ -662,7 +662,8 @@ fn pdf(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
     // is passed anywhere here), which is a free, page-numbered split of text
     // that already went through this exact call — no extra `pdftotext -f -l`
     // invocation per page needed for the common (non-OCR) case.
-    let page_segments = truncate_page_segments(page_segments_from_form_feeds(&text), config.max_chars);
+    let page_segments =
+        truncate_page_segments(page_segments_from_form_feeds(&text), config.max_chars);
     let need_ocr = config.ocr == "on"
         || (config.ocr == "auto" && text.trim().chars().count() < 20 * pages.max(1));
     if !need_ocr || !ocr.available {
@@ -731,7 +732,8 @@ fn pdf(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
 fn page_segments_from_form_feeds(text: &str) -> Vec<(usize, String)> {
     text.split('\u{000c}')
         .enumerate()
-        .filter_map(|(index, part)| (!part.trim().is_empty()).then(|| (index + 1, part.to_string())))
+        .filter(|(_, part)| !part.trim().is_empty())
+        .map(|(index, part)| (index + 1, part.to_string()))
         .collect()
 }
 
@@ -742,7 +744,10 @@ fn page_segments_from_form_feeds(text: &str) -> Vec<(usize, String)> {
 /// Without this the chunker (which chunks `page_segments` directly when they
 /// are present, see `embedding::chunk_spans`) would embed an amount of text
 /// the rest of the pipeline never agreed to.
-fn truncate_page_segments(segments: Vec<(usize, String)>, max_chars: usize) -> Vec<(usize, String)> {
+fn truncate_page_segments(
+    segments: Vec<(usize, String)>,
+    max_chars: usize,
+) -> Vec<(usize, String)> {
     let mut budget = max_chars;
     let mut out = Vec::with_capacity(segments.len());
     for (page, text) in segments {

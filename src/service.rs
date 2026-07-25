@@ -175,9 +175,8 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
     // HTTP listener binds — means the very first `GET /jobs/{id}` a caller
     // can make already sees the honest post-restart state, never a stale
     // "running" that no worker will ever finish.
-    let jobs_store = Arc::new(
-        JobsStore::open(&normalized.output_root).context("opening jobs.sqlite")?,
-    );
+    let jobs_store =
+        Arc::new(JobsStore::open(&normalized.output_root).context("opening jobs.sqlite")?);
     let swept = jobs_store
         .sweep_interrupted()
         .context("sweeping interrupted jobs at startup")?;

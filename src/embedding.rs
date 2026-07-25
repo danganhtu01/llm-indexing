@@ -256,7 +256,9 @@ mod tests {
         assert_eq!(output[1].content.chars().count(), CHUNK_CHARS);
         // No page segments were given: every span is page-agnostic, the exact
         // previous behaviour for every method but PDF.
-        assert!(output.iter().all(|span| span.page_start.is_none() && span.page_end.is_none()));
+        assert!(output
+            .iter()
+            .all(|span| span.page_start.is_none() && span.page_end.is_none()));
     }
 
     #[test]

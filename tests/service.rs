@@ -66,7 +66,10 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
     assert_eq!(job["status"], "complete", "{job}");
     // Only the published corpus plus P0-11's persisted job store
     // (`jobs.sqlite`) live under `output_root` — nothing else.
-    assert_eq!(output_dir_names(&output), vec!["corpus.sqlite", "jobs.sqlite"]);
+    assert_eq!(
+        output_dir_names(&output),
+        vec!["corpus.sqlite", "jobs.sqlite"]
+    );
     assert!(output.join("corpus.sqlite").is_file());
 
     let response = app
@@ -216,7 +219,10 @@ async fn overwrite_replaces_the_existing_corpus() {
     assert_eq!(job["files"], 1);
     // Nothing but the published database and the persisted job store are left
     // behind.
-    assert_eq!(output_dir_names(&output), vec!["corpus.sqlite", "jobs.sqlite"]);
+    assert_eq!(
+        output_dir_names(&output),
+        vec!["corpus.sqlite", "jobs.sqlite"]
+    );
 }
 
 #[tokio::test]
