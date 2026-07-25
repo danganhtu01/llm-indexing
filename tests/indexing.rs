@@ -68,6 +68,26 @@ fn indexes_and_searches_english_and_vietnamese() {
     assert_eq!(stats.files, 3);
 
     let connection = connect(&output).unwrap();
+
+    // Migration harness: a freshly-written corpus lands on the version this
+    // binary writes, not the SQLite default of 0.
+    assert_eq!(
+        llm_indexing::store::schema_version(&connection).unwrap(),
+        llm_indexing::store::CURRENT_SCHEMA_VERSION
+    );
+    // `GET /corpus/status`'s `pending_files` is derived from exactly this meta
+    // key — the pipeline's own last-discovery snapshot — rather than a
+    // filesystem walk; this is what proves the real pipeline actually writes
+    // it (the service-level tests only ever fabricate it via a fixture).
+    let discovered = llm_indexing::store::read_meta(&connection, "last_discovered_files")
+        .unwrap()
+        .and_then(|value| value.parse::<i64>().ok());
+    assert_eq!(
+        discovered,
+        Some(3),
+        "all 3 discovered files, not just the 3 processed"
+    );
+
     let normalizer = Normalizer::load(&config);
     assert!(!search(&connection, &normalizer, "launder", 5, false)
         .unwrap()
@@ -531,6 +551,178 @@ fn a_changed_file_whose_reprocess_fails_still_replaces_the_old_row() {
     );
 }
 
+// ── P0-8: page anchoring from PDF extraction into stored chunks ─────────────
+
+/// Word-wrapped filler lines of (at least) `total_chars` of `word`, so a page
+/// built from them is long enough to force more than one embedding chunk
+/// (`CHUNK_CHARS` is 1,200) without relying on any single `Tj` string wider
+/// than a page — poppler's text extraction does not reliably recover text
+/// positioned off the visible `MediaBox`, which a single unwrapped multi-KB
+/// line easily runs into at any normal font size.
+fn padded_lines(word: &str, total_chars: usize) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut length = 0;
+    while length < total_chars {
+        words.push(word);
+        length += word.len() + 1;
+    }
+    words.chunks(10).map(|line| line.join(" ")).collect()
+}
+
+/// Write a minimal but VALID multi-page PDF by hand — one Type1/Helvetica
+/// content stream per page, a correct object-offset xref table, no external
+/// tool involved — so `pdftotext`'s page breaks (and therefore
+/// `extract::page_segments_from_form_feeds`) are exercised against a REAL
+/// multi-page document rather than simulated. Mirrors `write_docx`'s
+/// handcraft-a-minimal-valid-file approach one file up.
+fn write_pdf(path: &Path, pages: &[Vec<String>]) {
+    let mut objects: Vec<String> = Vec::new();
+    objects.push("<< /Type /Catalog /Pages 2 0 R >>".to_string()); // 1
+    let kids = (0..pages.len())
+        .map(|i| format!("{} 0 R", 3 + 2 * i))
+        .collect::<Vec<_>>()
+        .join(" ");
+    objects.push(format!(
+        "<< /Type /Pages /Kids [{kids}] /Count {} >>",
+        pages.len()
+    )); // 2
+    let font_obj = 3 + 2 * pages.len();
+    for (index, lines) in pages.iter().enumerate() {
+        let content_obj = 4 + 2 * index;
+        objects.push(format!(
+            "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 {font_obj} 0 R >> >> \
+             /MediaBox [0 0 612 792] /Contents {content_obj} 0 R >>"
+        ));
+        let mut parts = vec!["BT /F1 10 Tf 72 720 Td".to_string()];
+        for (line_index, line) in lines.iter().enumerate() {
+            if line_index == 0 {
+                parts.push(format!("({line}) Tj"));
+            } else {
+                parts.push(format!("0 -14 Td ({line}) Tj"));
+            }
+        }
+        parts.push("ET".to_string());
+        let stream = parts.join("\n");
+        objects.push(format!(
+            "<< /Length {} >>\nstream\n{stream}\nendstream",
+            stream.len()
+        ));
+    }
+    objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
+
+    let header = "%PDF-1.4\n";
+    let mut body = String::new();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(header.len() + body.len());
+        body.push_str(&format!("{} 0 obj\n{object}\nendobj\n", index + 1));
+    }
+    let xref_offset = header.len() + body.len();
+    let mut xref = format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1);
+    for offset in &offsets {
+        xref.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    let trailer = format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF",
+        objects.len() + 1
+    );
+    fs::write(path, format!("{header}{body}{xref}{trailer}")).unwrap();
+}
+
+/// End-to-end: a real multi-page PDF, indexed through the real pipeline
+/// (extraction -> chunking -> the corpus database), must leave every stored
+/// chunk with a page range that is present, in bounds, and never regresses
+/// across `chunk_index` — the whole point of P0-8's `page_start`/`page_end`.
+/// Padded long enough (2,000+ chars/page, `CHUNK_CHARS` is 1,200) that the
+/// three pages produce more than one chunk, including at least one that
+/// straddles a page boundary — the exact case a per-file-only test cannot
+/// exercise, because it depends on `extract::pdf` actually handing the
+/// chunker real, page-numbered segments rather than a fabricated slice.
+#[test]
+fn page_boundaries_survive_from_pdf_extraction_into_stored_chunks() {
+    // NOT `model_lock()` here too: `index()` below takes it itself (see its
+    // doc comment), and the plain `std::sync::Mutex` it wraps is not
+    // reentrant — a second `.lock()` from the same thread that already holds
+    // it deadlocks rather than blocking briefly.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let destination = temp.path().join("corpus.sqlite");
+
+    let pages = vec![
+        padded_lines("alpha", 2000),
+        padded_lines("bravo", 2000),
+        padded_lines("charlie", 2000),
+    ];
+    write_pdf(&input.join("report.pdf"), &pages);
+
+    let stats = index(&input, &destination, false, None, None, None).unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.errors, 0, "the handcrafted PDF must extract cleanly");
+
+    let connection = connect(&destination).unwrap();
+    let pages_recorded: i64 = connection
+        .query_row("SELECT pages FROM files", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(pages_recorded, 3, "pdfinfo's page count is unaffected");
+
+    let mut statement = connection
+        .prepare("SELECT chunk_index, page_start, page_end FROM chunks ORDER BY chunk_index")
+        .unwrap();
+    let rows: Vec<(i64, Option<i64>, Option<i64>)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .flatten()
+        .collect();
+
+    assert!(
+        rows.len() > 1,
+        "the padded pages must produce more than one chunk: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|(_, start, end)| start.is_some() && end.is_some()),
+        "every chunk of a page-segmented PDF must carry a page range: {rows:?}"
+    );
+    assert_eq!(
+        rows.first().unwrap().1,
+        Some(1),
+        "the first chunk starts on page 1: {rows:?}"
+    );
+    assert_eq!(
+        rows.last().unwrap().2,
+        Some(3),
+        "the last chunk ends on page 3: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|(_, start, end)| start != end),
+        "at least one chunk must straddle a page boundary given how long each page is: {rows:?}"
+    );
+    // Page ranges never point past the 3 real pages, and — since a chunk's
+    // character window only ever starts and ends later than the previous
+    // chunk's (the overlap subtracts from `end`, never producing an earlier
+    // `start`) — `page_start` and `page_end` are each non-decreasing across
+    // `chunk_index`. They are NOT compared cross-field (`start` against the
+    // previous chunk's `end`): overlapping windows can revisit a tail of an
+    // earlier page a later-starting chunk has already moved past in `page_end`,
+    // so `page_start` alone can sit behind the previous chunk's `page_end`
+    // without that being a regression.
+    let (mut previous_start, mut previous_end) = (1, 1);
+    for (chunk_index, start, end) in &rows {
+        let (start, end) = (start.unwrap(), end.unwrap());
+        assert!(
+            (1..=3).contains(&start) && start <= end && end <= 3,
+            "chunk {chunk_index}: page range out of bounds: {rows:?}"
+        );
+        assert!(
+            start >= previous_start && end >= previous_end,
+            "chunk {chunk_index}: page range regressed: {rows:?}"
+        );
+        previous_start = start;
+        previous_end = end;
+    }
+}
+
 /// The interaction keep-on-failure must NOT break: a pure EMBED-MODEL upgrade
 /// re-embeds the whole corpus, and when an unchanged file's reprocess fails,
 /// keep-on-failure preserves its old (old-model) row. That file is therefore
@@ -865,4 +1057,78 @@ mod encrypted_pdf_fast_path {
         let (method, _) = only_file_row(&destination);
         assert_eq!(method, "pdf-text");
     }
+}
+
+/// The other half of P0-8, and the one a live deployment actually depends on:
+/// `SCHEMA_V2` adds `chunks.page_start`/`page_end` NULLABLE and backfills
+/// nothing, so every chunk of an ALREADY-INDEXED corpus reads back NULL — the
+/// migration migrates the schema, not the data. Without a per-file signal the
+/// only way to make an existing corpus citable would be a destructive
+/// `{overwrite:true}` re-index of the whole thing, which is not something a
+/// deploy should have to do.
+///
+/// Reproduces the live shape exactly (index, then blank the anchors, which is
+/// what a pre-migration corpus looks like once the columns are added) and
+/// asserts an ORDINARY resume repairs it — and then, just as importantly, that
+/// the next resume leaves it alone. A rule that re-schedules an unanchored file
+/// it cannot anchor would redo those files on every run for the life of the
+/// corpus.
+#[test]
+fn an_unanchored_corpus_regains_its_page_anchors_on_an_ordinary_resume() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let destination = temp.path().join("corpus.sqlite");
+
+    write_pdf(
+        &input.join("report.pdf"),
+        &[padded_lines("alpha", 2000), padded_lines("bravo", 2000)],
+    );
+    assert_eq!(
+        index(&input, &destination, false, None, None, None)
+            .unwrap()
+            .files,
+        1
+    );
+    assert!(anchored_chunks(&destination) > 0, "indexed with anchors");
+
+    // Become a corpus indexed before page attribution existed.
+    rusqlite::Connection::open(&destination)
+        .unwrap()
+        .execute_batch("UPDATE chunks SET page_start=NULL, page_end=NULL")
+        .unwrap();
+    assert_eq!(anchored_chunks(&destination), 0);
+
+    // Nothing about the FILE changed — same size, same mtime, complete method,
+    // chunks present — so every pre-existing resume rule would skip it. Only
+    // the missing anchors schedule it.
+    let repaired = index(&input, &destination, true, None, None, None).unwrap();
+    assert_eq!(
+        repaired.files, 1,
+        "an unanchored PDF must be redone by a plain resume"
+    );
+    assert!(
+        anchored_chunks(&destination) > 0,
+        "and must come back with its page anchors"
+    );
+
+    // Termination: the file is anchored now, so the signal is gone and the
+    // next resume skips it like any other unchanged file.
+    let settled = index(&input, &destination, true, None, None, None).unwrap();
+    assert_eq!(
+        (settled.files, settled.skipped),
+        (0, 1),
+        "a repaired file must not be re-scheduled forever"
+    );
+}
+
+fn anchored_chunks(destination: &Path) -> i64 {
+    connect(destination)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM chunks WHERE page_start IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
