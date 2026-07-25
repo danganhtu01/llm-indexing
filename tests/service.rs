@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use llm_indexing::jobs_store::{JobsStore, INTERRUPTED_ERROR};
 use llm_indexing::service::{router, ServiceConfig};
 use llm_indexing::vision::VisionMode;
 use serde_json::{json, Value};
@@ -63,7 +64,12 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let job = wait_for_job(&app, "job-1").await;
     assert_eq!(job["status"], "complete", "{job}");
-    assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+    // Only the published corpus plus P0-11's persisted job store
+    // (`jobs.sqlite`) live under `output_root` — nothing else.
+    assert_eq!(
+        output_dir_names(&output),
+        vec!["corpus.sqlite", "jobs.sqlite"]
+    );
     assert!(output.join("corpus.sqlite").is_file());
 
     let response = app
@@ -95,6 +101,18 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
 //
 // Jobs write straight into the published database, so the guards deciding
 // whether an existing corpus may be touched are the whole safety contract.
+
+/// Sorted top-level filenames under `output_root` — used to assert nothing
+/// stray was left behind (P0-11 makes `jobs.sqlite` a permanent, expected
+/// sibling of the published corpora).
+fn output_dir_names(output: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(output)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
 
 fn guard_router(output: &std::path::Path, input: &std::path::Path) -> axum::Router {
     guard_router_with_config(output, input, None)
@@ -199,8 +217,12 @@ async fn overwrite_replaces_the_existing_corpus() {
         .unwrap();
     assert_eq!(stale, 0);
     assert_eq!(job["files"], 1);
-    // Nothing but the published database is left behind.
-    assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+    // Nothing but the published database and the persisted job store are left
+    // behind.
+    assert_eq!(
+        output_dir_names(&output),
+        vec!["corpus.sqlite", "jobs.sqlite"]
+    );
 }
 
 #[tokio::test]
@@ -252,6 +274,225 @@ async fn a_failed_overwrite_leaves_the_existing_corpus_intact() {
     );
 }
 
+// ── P0-11: restart/crash reconciliation ─────────────────────────────────────
+
+#[tokio::test]
+async fn a_completed_job_is_served_from_the_persisted_store_after_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("hello.txt"), "compliance report").unwrap();
+    let app = guard_router(&output, &input);
+
+    let (status, _) = submit_body(
+        &app,
+        json!({"id":"persisted","paths":[input.clone()],"output":"corpus.sqlite","ocr":"off"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let job = wait_for_job(&app, "persisted").await;
+    assert_eq!(job["status"], "complete", "{job}");
+
+    // A brand-new router over the SAME output_root is exactly what a service
+    // restart looks like: a fresh in-memory `jobs` map with nothing in it,
+    // backed by the same `jobs.sqlite` already on disk. The old router (and
+    // its in-memory state) is dropped here, never consulted again.
+    drop(app);
+    let restarted = guard_router(&output, &input);
+    let (status, body) = get_json_status(&restarted, "/jobs/persisted").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], "persisted");
+    assert_eq!(body["status"], "complete", "{body}");
+}
+
+#[tokio::test]
+async fn an_unknown_job_id_still_404s_after_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+    let app = guard_router(&output, &input);
+    let (status, _) = get_json_status(&app, "/jobs/never-existed").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_startup_sweep_rewrites_jobs_left_non_terminal_by_a_prior_instance_to_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+
+    // Reproduce what a process killed mid-job leaves on disk: `queued`,
+    // `running` and `cancelling` rows in `jobs.sqlite` with no worker left
+    // that will ever finish them — nothing about this depends on the HTTP
+    // layer, so it is written directly through the store the way a crash
+    // would leave it, rather than raced against a real (near-instant) job.
+    {
+        let store = JobsStore::open(&output).unwrap();
+        store
+            .record(
+                "was-queued",
+                &json!({"id":"was-queued","status":"queued","submitted_at":1.0}),
+            )
+            .unwrap();
+        store
+            .record(
+                "was-running",
+                &json!({"id":"was-running","status":"running","processed":3,"total":10}),
+            )
+            .unwrap();
+        store
+            .record(
+                "already-done",
+                &json!({"id":"already-done","status":"complete","files":2}),
+            )
+            .unwrap();
+    }
+
+    // `router(...)` runs the P0-11 startup sweep before returning — this is
+    // the moment a restarted process would run it, before it ever binds a
+    // listener.
+    let app = guard_router(&output, &input);
+
+    for id in ["was-queued", "was-running"] {
+        let (status, body) = get_json_status(&app, &format!("/jobs/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{id}: {body}");
+        assert_eq!(body["status"], "error", "{id}: {body}");
+        assert_eq!(body["error"], INTERRUPTED_ERROR, "{id}: {body}");
+        assert!(body["completed_at"].is_number(), "{id}: {body}");
+    }
+    // Progress the running job had made survives the rewrite — only
+    // status/error/completed_at change.
+    let (_, running) = get_json_status(&app, "/jobs/was-running").await;
+    assert_eq!(running["processed"], 3);
+    assert_eq!(running["total"], 10);
+
+    // A job that was already terminal before the restart is untouched.
+    let (status, done) = get_json_status(&app, "/jobs/already-done").await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!(done["status"], "complete", "{done}");
+    assert_eq!(done["files"], 2);
+}
+
+// ── Cancellation ─────────────────────────────────────────────────────────
+//
+// A job's cancellation flag lives only in this process's memory (see
+// `AppState::cancellations`), never in `jobs.sqlite` — so an id this process
+// has no live flag for (aged out, or genuinely from a prior instance) must
+// still get an honest answer instead of a bare 404, and cancelling it must
+// never flip a persisted terminal row to "cancelled".
+
+#[tokio::test]
+async fn cancelling_a_truly_unknown_job_id_404s() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+    let app = guard_router(&output, &input);
+
+    let (status, body) = post_json(&app, "/jobs/never-existed/cancel", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn cancelling_a_job_this_process_only_knows_from_jobs_sqlite_reports_conflict_not_404() {
+    // Reproduces the P0-11-era gap: a job this process has no in-memory
+    // cancellation flag for (aged out of `cancellations`, or — the far more
+    // common case — swept to a terminal `error` by `sweep_interrupted` at
+    // startup, exactly as `a_startup_sweep_rewrites_...` above sets up) must
+    // not 404 just because `GET /jobs/{id}` would happily answer for it from
+    // `jobs.sqlite`. And crucially: this call must not be the thing that
+    // marks a completed/errored run "cancelled" — there is no live worker
+    // behind it to cancel.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+    {
+        let store = JobsStore::open(&output).unwrap();
+        store
+            .record(
+                "was-running",
+                &json!({"id":"was-running","status":"running","processed":3,"total":10}),
+            )
+            .unwrap();
+        store
+            .record(
+                "already-done",
+                &json!({"id":"already-done","status":"complete","files":2}),
+            )
+            .unwrap();
+    }
+    // `router(...)` (via `guard_router`) runs the startup sweep, so
+    // "was-running" is now a terminal `error` row before this process ever
+    // saw a cancellation request for it — the same state a real restart
+    // leaves.
+    let app = guard_router(&output, &input);
+
+    for id in ["was-running", "already-done", "unknown-but-plausible"] {
+        let plausible_but_unknown = id == "unknown-but-plausible";
+        let (status, body) = post_json(&app, &format!("/jobs/{id}/cancel"), json!({})).await;
+        if plausible_but_unknown {
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+            continue;
+        }
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{id}: expected \"not active\", not a bare 404: {body}"
+        );
+    }
+
+    // Neither persisted row was mutated by the cancel attempt.
+    let (_, was_running) = get_json_status(&app, "/jobs/was-running").await;
+    assert_eq!(was_running["status"], "error", "{was_running}");
+    assert_eq!(was_running["error"], INTERRUPTED_ERROR, "{was_running}");
+    let (_, already_done) = get_json_status(&app, "/jobs/already-done").await;
+    assert_eq!(already_done["status"], "complete", "{already_done}");
+}
+
+#[tokio::test]
+async fn cancelling_a_genuinely_running_job_still_accepts_and_marks_it_cancelling() {
+    // The live path (a cancellation flag this process itself created via
+    // `submit`) must keep working exactly as before.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    sample_corpus(&input, 40);
+    let app = guard_router(&output, &input);
+
+    let (status, _) = post_json(
+        &app,
+        "/index",
+        json!({"id":"job-cancel-me","paths":[input],"output":"corpus.sqlite","ocr":"off"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    wait_until_running(&app, "job-cancel-me").await;
+
+    let (status, body) = post_json(&app, "/jobs/job-cancel-me/cancel", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["status"], "cancelling", "{body}");
+
+    // `wait_for_job` only recognises "complete"/"error" as terminal, so a
+    // cancelled run needs its own poll here.
+    let mut job = json!({});
+    for _ in 0..1500 {
+        job = get_json(&app, "/jobs/job-cancel-me").await;
+        if job["status"] == "cancelled" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(job["status"], "cancelled", "{job}");
+}
+
 #[tokio::test]
 async fn an_unreadable_corpus_is_reported_rather_than_read_as_empty() {
     // The failure mode this guards: a corpus that cannot be read answering
@@ -294,6 +535,7 @@ async fn an_absent_corpus_still_reads_as_empty_rather_than_an_error() {
 
     let status = get_json(&app, "/corpus/status").await;
     assert_eq!(status["indexed_files"], 0, "{status}");
+    assert_eq!(status["pending_files"], 0, "{status}");
     assert_eq!(status["writing"], false, "{status}");
     let tree = get(&app, "/corpus/tree?root=input").await;
     assert_eq!(tree.status(), StatusCode::OK);
@@ -524,6 +766,148 @@ async fn corpus_tree_status_and_document_text_join_the_published_database() {
 
     let missing = get(&app, "/corpus/documents/999/text").await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn corpus_status_reports_pending_files_from_meta_not_a_tree_walk() {
+    // The fix this proves: a consumer used to learn "pending" by re-fetching
+    // `/corpus/tree` (a full sorted `fs::read_dir` walk plus a snippet-carrying
+    // join) a second time just to count null `document_id`s. `pending_files`
+    // must come back from `/corpus/status` alone, derived from the pipeline's
+    // own `last_discovered_files` meta key against a plain `COUNT(*)`.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    let app = router(ServiceConfig {
+        output_root: output.clone(),
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input.clone()],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers: 1,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
+    })
+    .unwrap();
+
+    write_fixture_corpus(&output, input.join("indexed.txt").to_str().unwrap());
+    let connection = rusqlite::Connection::open(output.join("corpus.sqlite")).unwrap();
+    connection
+        .execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO meta(key,value) VALUES('last_discovered_files','3')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let status = get_json(&app, "/corpus/status").await;
+    assert_eq!(status["indexed_files"], 1, "{status}");
+    assert_eq!(
+        status["pending_files"], 2,
+        "3 last discovered minus 1 indexed = 2 still pending: {status}"
+    );
+    // The fixture never ran through the migration harness, so its raw
+    // `user_version` is 0 — distinct from what this binary would write. That
+    // gap IS the version-skew signal a consumer's health banner reads.
+    assert_eq!(status["schema_version"], 0, "{status}");
+    // The fixture's `write_fixture_corpus` never creates a `chunks` table
+    // either (it predates the migration harness) — that must read as "0
+    // embedded" rather than fail the whole status read.
+    assert_eq!(status["embedded_chunks"], 0, "{status}");
+}
+
+#[tokio::test]
+async fn corpus_status_reports_embedded_chunks_when_the_table_exists() {
+    // The fix this proves: a consumer (da-academic's Search tab semantic
+    // diagnostic) reads `embedded_chunks` off `/corpus/status` to tell "no
+    // chunks embedded yet" apart from "this build doesn't report the count at
+    // all". Before this, the field never appeared in the response no matter
+    // how many rows `chunks` held.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    let app = router(ServiceConfig {
+        output_root: output.clone(),
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input.clone()],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers: 1,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
+    })
+    .unwrap();
+
+    write_fixture_corpus(&output, input.join("indexed.txt").to_str().unwrap());
+    let connection = rusqlite::Connection::open(output.join("corpus.sqlite")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE chunks(
+                id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL, embedding BLOB NOT NULL, dimensions INTEGER NOT NULL,
+                model TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO chunks(id,file_id,chunk_index,content,embedding,dimensions,model)
+             VALUES (1,1,0,'chunk one',x'00',4,'test-model'),
+                    (2,1,1,'chunk two',x'00',4,'test-model')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let status = get_json(&app, "/corpus/status").await;
+    assert_eq!(status["embedded_chunks"], 2, "{status}");
+}
+
+#[tokio::test]
+async fn corpus_status_pending_files_never_goes_negative() {
+    // A corpus that has indexed MORE than the last recorded discovery (a
+    // second job covering more paths, or files added between calls) must not
+    // report a negative "still pending" count.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    let app = router(ServiceConfig {
+        output_root: output.clone(),
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input.clone()],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers: 1,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
+    })
+    .unwrap();
+
+    write_fixture_corpus(&output, input.join("indexed.txt").to_str().unwrap());
+    let connection = rusqlite::Connection::open(output.join("corpus.sqlite")).unwrap();
+    connection
+        .execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO meta(key,value) VALUES('last_discovered_files','0')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let status = get_json(&app, "/corpus/status").await;
+    assert_eq!(status["indexed_files"], 1, "{status}");
+    assert_eq!(status["pending_files"], 0, "{status}");
 }
 
 // ── Vision submit validation (--vision-max cap, unknown tier, missing models) ──
