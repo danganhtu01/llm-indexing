@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use llm_indexing::jobs_store::{JobsStore, INTERRUPTED_ERROR};
 use llm_indexing::service::{router, ServiceConfig};
 use llm_indexing::vision::VisionMode;
 use serde_json::{json, Value};
@@ -63,7 +64,9 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let job = wait_for_job(&app, "job-1").await;
     assert_eq!(job["status"], "complete", "{job}");
-    assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+    // Only the published corpus plus P0-11's persisted job store
+    // (`jobs.sqlite`) live under `output_root` — nothing else.
+    assert_eq!(output_dir_names(&output), vec!["corpus.sqlite", "jobs.sqlite"]);
     assert!(output.join("corpus.sqlite").is_file());
 
     let response = app
@@ -95,6 +98,18 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
 //
 // Jobs write straight into the published database, so the guards deciding
 // whether an existing corpus may be touched are the whole safety contract.
+
+/// Sorted top-level filenames under `output_root` — used to assert nothing
+/// stray was left behind (P0-11 makes `jobs.sqlite` a permanent, expected
+/// sibling of the published corpora).
+fn output_dir_names(output: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(output)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
 
 fn guard_router(output: &std::path::Path, input: &std::path::Path) -> axum::Router {
     guard_router_with_config(output, input, None)
@@ -199,8 +214,9 @@ async fn overwrite_replaces_the_existing_corpus() {
         .unwrap();
     assert_eq!(stale, 0);
     assert_eq!(job["files"], 1);
-    // Nothing but the published database is left behind.
-    assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+    // Nothing but the published database and the persisted job store are left
+    // behind.
+    assert_eq!(output_dir_names(&output), vec!["corpus.sqlite", "jobs.sqlite"]);
 }
 
 #[tokio::test]
@@ -250,6 +266,110 @@ async fn a_failed_overwrite_leaves_the_existing_corpus_intact() {
         stale, 1,
         "a job that never indexed anything kept the corpus"
     );
+}
+
+// ── P0-11: restart/crash reconciliation ─────────────────────────────────────
+
+#[tokio::test]
+async fn a_completed_job_is_served_from_the_persisted_store_after_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("hello.txt"), "compliance report").unwrap();
+    let app = guard_router(&output, &input);
+
+    let (status, _) = submit_body(
+        &app,
+        json!({"id":"persisted","paths":[input.clone()],"output":"corpus.sqlite","ocr":"off"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let job = wait_for_job(&app, "persisted").await;
+    assert_eq!(job["status"], "complete", "{job}");
+
+    // A brand-new router over the SAME output_root is exactly what a service
+    // restart looks like: a fresh in-memory `jobs` map with nothing in it,
+    // backed by the same `jobs.sqlite` already on disk. The old router (and
+    // its in-memory state) is dropped here, never consulted again.
+    drop(app);
+    let restarted = guard_router(&output, &input);
+    let (status, body) = get_json_status(&restarted, "/jobs/persisted").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], "persisted");
+    assert_eq!(body["status"], "complete", "{body}");
+}
+
+#[tokio::test]
+async fn an_unknown_job_id_still_404s_after_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+    let app = guard_router(&output, &input);
+    let (status, _) = get_json_status(&app, "/jobs/never-existed").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_startup_sweep_rewrites_jobs_left_non_terminal_by_a_prior_instance_to_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+
+    // Reproduce what a process killed mid-job leaves on disk: `queued`,
+    // `running` and `cancelling` rows in `jobs.sqlite` with no worker left
+    // that will ever finish them — nothing about this depends on the HTTP
+    // layer, so it is written directly through the store the way a crash
+    // would leave it, rather than raced against a real (near-instant) job.
+    {
+        let store = JobsStore::open(&output).unwrap();
+        store
+            .record(
+                "was-queued",
+                &json!({"id":"was-queued","status":"queued","submitted_at":1.0}),
+            )
+            .unwrap();
+        store
+            .record(
+                "was-running",
+                &json!({"id":"was-running","status":"running","processed":3,"total":10}),
+            )
+            .unwrap();
+        store
+            .record(
+                "already-done",
+                &json!({"id":"already-done","status":"complete","files":2}),
+            )
+            .unwrap();
+    }
+
+    // `router(...)` runs the P0-11 startup sweep before returning — this is
+    // the moment a restarted process would run it, before it ever binds a
+    // listener.
+    let app = guard_router(&output, &input);
+
+    for id in ["was-queued", "was-running"] {
+        let (status, body) = get_json_status(&app, &format!("/jobs/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{id}: {body}");
+        assert_eq!(body["status"], "error", "{id}: {body}");
+        assert_eq!(body["error"], INTERRUPTED_ERROR, "{id}: {body}");
+        assert!(body["completed_at"].is_number(), "{id}: {body}");
+    }
+    // Progress the running job had made survives the rewrite — only
+    // status/error/completed_at change.
+    let (_, running) = get_json_status(&app, "/jobs/was-running").await;
+    assert_eq!(running["processed"], 3);
+    assert_eq!(running["total"], 10);
+
+    // A job that was already terminal before the restart is untouched.
+    let (status, done) = get_json_status(&app, "/jobs/already-done").await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!(done["status"], "complete", "{done}");
+    assert_eq!(done["files"], 2);
 }
 
 #[tokio::test]
