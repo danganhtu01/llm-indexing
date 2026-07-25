@@ -35,6 +35,12 @@ pub struct ProcessedFile {
     /// The stage that spent it is already in `method` (`error:embed:…` against
     /// any other `error:…`).
     pub elapsed_ms: u64,
+    /// Carried straight from `Extracted::page_segments` (see `extract.rs`):
+    /// `(page_number, text)` pairs for the extraction paths that can
+    /// attribute text to a page. Empty for everything else. The embedder
+    /// chunks these directly when present so `EmbeddedChunk::page_start`/
+    /// `page_end` — and from there `VectorHit`'s — are populated (P0-8).
+    pub page_segments: Vec<(usize, String)>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

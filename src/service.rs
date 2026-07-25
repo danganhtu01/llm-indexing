@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::config::{clamp_workers, Config, MAX_WORKERS};
 use crate::embedding::{rank_chunks, Embedder, VectorScan, EMBEDDING_MODEL, MAX_HITS};
+use crate::jobs_store::{JobsStore, MAX_PERSISTED_HISTORY, RESERVED_OUTPUT_NAME};
 use crate::pipeline::{run_index, IndexRequest};
 use crate::runtime::RuntimeKnobs;
 use crate::settings::{
@@ -133,6 +134,11 @@ struct AppState {
     /// Lazily loaded query-side embedding model, shared by every
     /// `/corpus/search?mode=semantic` request.
     embedder: Arc<QueryEmbedder>,
+    /// Persisted job envelopes (P0-11) — `jobs.sqlite` under `output_root`.
+    /// Written to on every status transition worth reconciling on; read by
+    /// `GET /jobs/{id}` once a job has aged out of (or never existed in, after
+    /// a restart) the in-memory `jobs` map.
+    jobs_store: Arc<JobsStore>,
 }
 
 pub fn router(config: ServiceConfig) -> Result<Router> {
@@ -175,6 +181,29 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         config.workers = clamp_workers(normalized.workers);
         Arc::new(RuntimeKnobs::from_config(&config))
     };
+    // P0-11: open (or create) the persisted job store before anything else
+    // touches `jobs`, sweep any row a previous process left non-terminal, and
+    // bound the history it starts this run with. Sweeping here — before the
+    // HTTP listener binds — means the very first `GET /jobs/{id}` a caller
+    // can make already sees the honest post-restart state, never a stale
+    // "running" that no worker will ever finish.
+    let jobs_store =
+        Arc::new(JobsStore::open(&normalized.output_root).context("opening jobs.sqlite")?);
+    let swept = jobs_store
+        .sweep_interrupted()
+        .context("sweeping interrupted jobs at startup")?;
+    if !swept.is_empty() {
+        tracing::warn!(
+            count = swept.len(),
+            ids = ?swept,
+            "rewrote jobs left queued/running/cancelling by a prior instance to a terminal \
+             error (\"{}\")",
+            crate::jobs_store::INTERRUPTED_ERROR,
+        );
+    }
+    jobs_store
+        .prune(MAX_PERSISTED_HISTORY)
+        .context("pruning persisted job history at startup")?;
     let (sender, receiver) = mpsc::channel(normalized.max_pending);
     let max_body = normalized.max_body;
     let mut roots = HashMap::with_capacity(normalized.allowed_roots.len());
@@ -190,6 +219,7 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         cancellations.clone(),
         runtimes.clone(),
         normalized.clone(),
+        jobs_store.clone(),
     ));
     let state = AppState {
         jobs,
@@ -203,6 +233,7 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         config_path: normalized.config_path.clone(),
         workers: normalized.workers,
         embedder: Arc::new(QueryEmbedder::new(normalized.config_path.clone())),
+        jobs_store,
     };
     Ok(Router::new()
         .route("/health", get(health))
@@ -470,6 +501,40 @@ fn bad_field(message: String) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// Persist one job envelope to `jobs.sqlite`, off the async executor. Best
+/// effort: a write failure here is logged and swallowed rather than turned
+/// into an HTTP error — the in-memory `jobs` map (the live queue's source of
+/// truth) is unaffected either way, and the cost of a lost persisted write is
+/// bounded to "this one transition doesn't survive an immediate restart",
+/// never a wedged request.
+async fn persist_job(jobs_store: &Arc<JobsStore>, id: &str, envelope: &Value) {
+    let store = jobs_store.clone();
+    let id = id.to_string();
+    let envelope = envelope.clone();
+    match tokio::task::spawn_blocking(move || store.record(&id, &envelope)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(error = %format!("{error:#}"), "failed to persist job envelope")
+        }
+        Err(error) => tracing::warn!(error = %format!("{error}"), "job-store write task failed"),
+    }
+}
+
+/// [`persist_job`] plus a bound on the persisted history — called on every
+/// terminal transition, so the store's row count stays checked at exactly the
+/// points where new terminal rows are created.
+async fn persist_terminal_job(jobs_store: &Arc<JobsStore>, id: &str, envelope: &Value) {
+    persist_job(jobs_store, id, envelope).await;
+    let store = jobs_store.clone();
+    match tokio::task::spawn_blocking(move || store.prune(MAX_PERSISTED_HISTORY)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(error = %format!("{error:#}"), "failed to prune persisted job history")
+        }
+        Err(error) => tracing::warn!(error = %format!("{error}"), "job-store prune task failed"),
+    }
+}
+
 async fn submit(State(state): State<AppState>, Json(mut request): Json<JobRequest>) -> Response {
     if let Err((status, body)) = validate_vision(&state, request.vision.as_deref()) {
         return (status, body).into_response();
@@ -544,16 +609,31 @@ async fn submit(State(state): State<AppState>, Json(mut request): Json<JobReques
     }
     state.runtimes.write().await.insert(id.clone(), runtime);
     request.id = Some(id.clone());
+    let output = request.output.clone();
+    let queued_envelope = json!({"id":id,"status":"queued","output":output,"submitted_at":now()});
+    // Persisted BEFORE `try_send` below, not after: `try_send` is what makes
+    // this job visible to the worker loop, which persists its own "running"
+    // transition the moment it dequeues. Persisting "queued" first establishes
+    // a strict happens-before between the two writes to the same row — were
+    // this the other way around, a worker that dequeues and writes "running"
+    // faster than this request resumes from its own await could have its
+    // write clobbered back to "queued" moments later.
+    persist_job(&state.jobs_store, &id, &queued_envelope).await;
     match state.sender.try_send((id.clone(), request)) {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(json!({"id":id,"status":"queued","submitted_at":now()})),
-        )
-            .into_response(),
+        Ok(()) => (StatusCode::ACCEPTED, Json(queued_envelope)).into_response(),
         Err(_) => {
             state.jobs.write().await.remove(&id);
             state.cancellations.write().await.remove(&id);
             state.runtimes.write().await.remove(&id);
+            // The job was never actually queued — leaving the "queued" row
+            // above in `jobs.sqlite` would advertise a job through
+            // `GET /jobs/{id}` that this response is telling the caller was
+            // rejected. Overwrite it with the terminal state instead of
+            // deleting it, so a caller that already saw "queued" and polls
+            // afterward gets a coherent answer rather than a 404.
+            let rejected = json!({"id":id,"status":"error",
+                "error":"indexing queue is full","completed_at":now()});
+            persist_terminal_job(&state.jobs_store, &id, &rejected).await;
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({"status":"error","error":"indexing queue is full"})),
@@ -563,51 +643,135 @@ async fn submit(State(state): State<AppState>, Json(mut request): Json<JobReques
     }
 }
 
+/// GET /jobs/{id} — the in-memory `jobs` map first (the live/fast path for a
+/// job this process is actively tracking), falling back to the persisted
+/// store for a job that has aged out of it (or, after a restart, was never in
+/// it to begin with — P0-11's `jobs.sqlite` is what makes that case a served
+/// terminal row instead of a bare 404).
 async fn job(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
-    state
-        .jobs
-        .read()
-        .await
-        .get(&id)
-        .cloned()
-        .map(|value| Json(value).into_response())
-        .unwrap_or_else(|| {
+    if let Some(value) = state.jobs.read().await.get(&id).cloned() {
+        return Json(value).into_response();
+    }
+    let store = state.jobs_store.clone();
+    let lookup = id.clone();
+    match tokio::task::spawn_blocking(move || store.get(&lookup)).await {
+        Ok(Ok(Some(value))) => Json(value).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"job not found"})),
+        )
+            .into_response(),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "failed to read persisted job envelope"
+            );
             (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error":"job not found"})),
             )
                 .into_response()
-        })
+        }
+        Err(error) => {
+            tracing::warn!(error = %format!("{error}"), "job-store read task failed");
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"job not found"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn cancel_job(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    // A cancellation flag exists ONLY for a job this very process admitted
+    // via `submit` — it is never persisted or reconstructed. So an id absent
+    // here is either a job this process never ran (a restart, or an id that
+    // simply does not exist) or one that aged out of `cancellations` — either
+    // way, this process cannot cancel it, whatever its recorded state.
     let Some(cancellation) = state.cancellations.read().await.get(&id).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error":"job not found"})),
-        )
-            .into_response();
+        return cancel_unmanaged(&state, &id).await;
     };
-    let mut jobs = state.jobs.write().await;
-    let Some(job) = jobs.get_mut(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error":"job not found"})),
-        )
-            .into_response();
-    };
-    match job["status"].as_str() {
-        Some("queued" | "running" | "cancelling") => {
-            cancellation.store(true, Ordering::Relaxed);
-            job["status"] = json!("cancelling");
-            job["message"] = json!("cancellation requested");
-            (StatusCode::ACCEPTED, Json(job.clone())).into_response()
+    // The write lock is scoped to the in-memory mutation only: persisting to
+    // `jobs.sqlite` below awaits a `spawn_blocking` task, and holding an async
+    // `RwLock` write guard across an `.await` would block every other job-map
+    // reader/writer for that whole round trip.
+    let cancelling = {
+        let mut jobs = state.jobs.write().await;
+        let Some(job) = jobs.get_mut(&id) else {
+            // `prune_history` (see below) removes only terminal rows from
+            // `jobs`, never from `cancellations` — so a cancellation flag can
+            // outlive its job here. The row is gone from memory but its
+            // terminal state is durable in `jobs.sqlite`; treat it the same
+            // as any other id this process cannot presently act on rather
+            // than 404ing a job `GET /jobs/{id}` still happily answers for.
+            drop(jobs);
+            return cancel_unmanaged(&state, &id).await;
+        };
+        match job["status"].as_str() {
+            Some("queued" | "running" | "cancelling") => {
+                cancellation.store(true, Ordering::Relaxed);
+                job["status"] = json!("cancelling");
+                job["message"] = json!("cancellation requested");
+                Some(job.clone())
+            }
+            _ => None,
         }
-        _ => (
+    };
+    match cancelling {
+        Some(job) => {
+            persist_job(&state.jobs_store, &id, &job).await;
+            (StatusCode::ACCEPTED, Json(job)).into_response()
+        }
+        None => (
             StatusCode::CONFLICT,
             Json(json!({"error":"job is not active"})),
         )
             .into_response(),
+    }
+}
+
+/// The fallback for `cancel_job` when `id` has no live cancellation flag in
+/// this process. Consults `jobs.sqlite` — the same persisted fallback
+/// `GET /jobs/{id}` reads — so a job this process merely lost live track of
+/// (aged out of `jobs`/`cancellations`, or genuinely run by a prior instance
+/// before a restart) is reported "not active" (409) rather than the
+/// misleading "not found" (404) a caller would otherwise see for an id
+/// `GET /jobs/{id}` still happily answers. This path can never itself flip a
+/// job's status: without a cancellation flag there is no running work to
+/// signal, so a persisted row — terminal by construction, since
+/// `sweep_interrupted` rewrites anything a restart caught mid-run — is only
+/// ever read, never mutated, which is what keeps a completed run from ever
+/// being reported cancelled. An id in neither place is genuinely unknown.
+async fn cancel_unmanaged(state: &AppState, id: &str) -> Response {
+    let store = state.jobs_store.clone();
+    let lookup = id.to_string();
+    let found = match tokio::task::spawn_blocking(move || store.get(&lookup)).await {
+        Ok(Ok(value)) => value.is_some(),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "failed to read persisted job envelope while cancelling"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(error = %format!("{error}"), "job-store read task failed");
+            false
+        }
+    };
+    if found {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"job is not active"})),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"job not found"})),
+        )
+            .into_response()
     }
 }
 
@@ -735,6 +899,7 @@ async fn worker(
     cancellations: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
     runtimes: Arc<RwLock<HashMap<String, Arc<RuntimeKnobs>>>>,
     config: ServiceConfig,
+    jobs_store: Arc<JobsStore>,
 ) {
     while let Some((id, request)) = receiver.recv().await {
         let cancellation = cancellations
@@ -744,18 +909,16 @@ async fn worker(
             .cloned()
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         if cancellation.load(Ordering::Relaxed) {
-            jobs.write().await.insert(
-                id.clone(),
-                json!({"id":id,"status":"cancelled","message":"cancelled before start","completed_at":now()}),
-            );
+            let value = json!({"id":id,"status":"cancelled","message":"cancelled before start","completed_at":now()});
+            jobs.write().await.insert(id.clone(), value.clone());
+            persist_terminal_job(&jobs_store, &id, &value).await;
             continue;
         }
         let output = request.output.clone();
-        jobs.write().await.insert(
-            id.clone(),
-            json!({"id":id,"status":"running","output":output,"processed":0,"total":0,
-                   "started_at":now()}),
-        );
+        let running = json!({"id":id,"status":"running","output":output,"processed":0,"total":0,
+                   "started_at":now()});
+        jobs.write().await.insert(id.clone(), running.clone());
+        persist_job(&jobs_store, &id, &running).await;
         // Same lookup shape as the cancellation above: the settings the HTTP
         // route can reach must be the very ones this job runs with, so take the
         // registered Arc rather than building a fresh one.
@@ -813,7 +976,8 @@ async fn worker(
                 }
             }
         };
-        jobs.write().await.insert(id, value);
+        jobs.write().await.insert(id.clone(), value.clone());
+        persist_terminal_job(&jobs_store, &id, &value).await;
     }
 }
 
@@ -995,9 +1159,14 @@ fn within(path: &Path, root: &Path) -> bool {
 
 /// A published corpus database must be a plain filename (no directories, no
 /// traversal) ending in `.sqlite`, confining every job's output under
-/// `output_root`.
+/// `output_root` — and it must not be `jobs.sqlite` (P0-11's persisted job
+/// store), which shares that directory but is not a corpus: a job targeting
+/// it would corrupt the restart-reconciliation state, and a `/corpus/*` read
+/// against it would just fail confusingly on a schema it doesn't recognize.
 fn valid_output_name(name: &str) -> bool {
-    Path::new(name).file_name().and_then(|n| n.to_str()) == Some(name) && name.ends_with(".sqlite")
+    Path::new(name).file_name().and_then(|n| n.to_str()) == Some(name)
+        && name.ends_with(".sqlite")
+        && name != RESERVED_OUTPUT_NAME
 }
 
 // ── Corpus read surface (GET /corpus/tree, /corpus/documents/{id}/text, /corpus/status) ──
@@ -1382,8 +1551,11 @@ fn document_text(corpus_db: &Path, id: i64) -> Result<Option<String>, ReadError>
 
 /// GET /corpus/status[?output=corpus.sqlite]
 ///
-/// Cheap corpus-wide aggregates: total indexed files/characters/bytes, OCR
-/// count, and language/method breakdowns. Zeroed when the database is absent.
+/// Cheap corpus-wide aggregates: indexed/pending file counts, total
+/// characters/bytes, OCR count, language/method breakdowns, and the corpus's
+/// schema version. Every one of these is a single `COUNT`/`meta` lookup —
+/// deliberately, so a consumer polling this on a tight tick never pays for a
+/// tree walk. Zeroed when the database is absent.
 async fn corpus_status_handler(
     State(state): State<AppState>,
     Query(query): Query<OutputQuery>,
@@ -1436,20 +1608,64 @@ fn corpus_status(path: &Path) -> Result<Value, ReadError> {
             .query_row(sql, [], |row| row.get(0))
             .map_err(ReadError::from)
     };
+    let indexed_files = count("SELECT COUNT(*) FROM files")?;
+    // `pending_files` used to cost the caller a full `/corpus/tree` walk (sorted
+    // recursive `fs::read_dir` plus a snippet-carrying join) just to count entries
+    // whose `document_id` came back null. Deriving it from the pipeline's own
+    // last-discovery snapshot (`crate::pipeline::run_index` stamps
+    // `last_discovered_files` into `meta` before it filters down to what actually
+    // needs work) turns that into one more `COUNT(*)` here — no tree walk, no
+    // snippets. A corpus with no recorded discovery yet (never indexed through
+    // this harness, or a bare test fixture) reads as 0 pending rather than an error.
+    let discovered = crate::store::read_meta(&connection, "last_discovered_files")
+        .map_err(ReadError::from)?
+        .and_then(|value| value.parse::<i64>().ok());
+    let pending_files = discovered
+        .map(|total| (total - indexed_files).max(0))
+        .unwrap_or(0);
+    // A corpus predating the `chunks` table (or a hand-built fixture that
+    // never ran through `migrate`) simply has nothing embedded yet — that
+    // reads as 0, not as a fault, the same way a fresh `meta` table does above.
+    let embedded_chunks = if table_exists(&connection, "chunks")? {
+        count("SELECT COUNT(*) FROM chunks")?
+    } else {
+        0
+    };
     Ok(json!({
-        "indexed_files": count("SELECT COUNT(*) FROM files")?,
+        "indexed_files": indexed_files,
+        "pending_files": pending_files,
         "total_characters": count("SELECT COALESCE(SUM(chars),0) FROM files")?,
         "total_bytes": count("SELECT COALESCE(SUM(size),0) FROM files")?,
         "ocr_files": count("SELECT COALESCE(SUM(ocr_used),0) FROM files")?,
+        "embedded_chunks": embedded_chunks,
         "languages": grouped(&connection, "lang", 10)?,
         "methods": grouped(&connection, "method", 20)?,
+        "schema_version": crate::store::schema_version(&connection).map_err(ReadError::from)?,
     }))
+}
+
+/// Whether `name` exists as a table in this connection's schema. Guards
+/// aggregates over tables that a corpus might simply not have yet — added
+/// after schema version 1, or absent from a hand-built test fixture — so
+/// `/corpus/status` reads that as "nothing there" rather than failing the
+/// whole response the way a bare `SELECT COUNT(*)` against a missing table
+/// would (`ReadError::Unreadable`, indistinguishable from real corruption).
+fn table_exists(connection: &Connection, name: &str) -> Result<bool, ReadError> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .map_err(ReadError::from)
 }
 
 fn empty_status() -> Value {
     json!({
-        "indexed_files": 0, "total_characters": 0, "total_bytes": 0, "ocr_files": 0,
-        "languages": Vec::<(String, i64)>::new(), "methods": Vec::<(String, i64)>::new(),
+        "indexed_files": 0, "pending_files": 0, "total_characters": 0, "total_bytes": 0,
+        "ocr_files": 0, "embedded_chunks": 0, "languages": Vec::<(String, i64)>::new(),
+        "methods": Vec::<(String, i64)>::new(), "schema_version": 0,
     })
 }
 
@@ -2209,6 +2425,11 @@ mod tests {
     }
 
     #[test]
+    fn valid_output_name_reserves_jobs_sqlite_for_the_job_store() {
+        assert!(!valid_output_name("jobs.sqlite"));
+    }
+
+    #[test]
     fn requested_paths_are_exact_and_confined() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("input");
@@ -2264,7 +2485,8 @@ mod tests {
                 .execute_batch(
                     "CREATE TABLE chunks(id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL,
                        chunk_index INTEGER NOT NULL, content TEXT NOT NULL,
-                       embedding BLOB NOT NULL, dimensions INTEGER NOT NULL, model TEXT NOT NULL);",
+                       embedding BLOB NOT NULL, dimensions INTEGER NOT NULL, model TEXT NOT NULL,
+                       page_start INTEGER, page_end INTEGER);",
                 )
                 .unwrap();
             for (index, (model, vector)) in chunks.iter().enumerate() {
