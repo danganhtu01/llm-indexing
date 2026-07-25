@@ -15,6 +15,7 @@ mod caption;
 mod clip;
 mod detector;
 mod exif;
+pub mod faces;
 mod phash;
 mod quality;
 mod video;
@@ -30,7 +31,9 @@ use image::{DynamicImage, ImageError, ImageReader, Limits};
 use crate::config::{Config, VisionConfig};
 
 pub use phash::hamming;
-pub use types::{ExifInfo, GpsCoord, ObjectDetection, TagScore, VisionMode, VisionResult};
+pub use types::{
+    ExifInfo, FaceDetection, GpsCoord, ObjectDetection, TagScore, VisionMode, VisionResult,
+};
 
 /// Image extensions the vision pipeline analyses — mirrors `extract::IMAGE_EXTS`.
 pub const VISION_IMAGE_EXTS: &[&str] = &[
@@ -57,6 +60,18 @@ pub struct VisionModel {
     pub sha256: Option<&'static str>,
     /// License note for docs/VISION.md.
     pub license: &'static str,
+    /// Whether the file backs an OPT-IN sub-model its tier does not require.
+    ///
+    /// Required artifacts (`false`) are what [`missing_models`] reports, what
+    /// the submit pre-flight rejects a job over, and what `fetch-data --vision`
+    /// downloads. Optional ones (`true` — today only the face pair) are none of
+    /// those things: their absence makes one capability absent instead of
+    /// failing a job, and staging them takes its own explicit
+    /// `fetch-data --faces`. The flag exists so ONE registry still pins every
+    /// artifact's URL, hash and license in one place — the property this file's
+    /// security model rests on — without a privacy-sensitive model riding into a
+    /// deployment on the back of a tier it does not belong to.
+    pub optional: bool,
 }
 
 /// Downloadable vision models with pinned checksums.
@@ -80,6 +95,7 @@ pub const VISION_MODELS: &[VisionModel] = &[
         ),
         sha256: Some("9cbac6b11ce34a03034e4d5a24cfac5f18632fd6761d1311dd640232088d7fee"),
         license: "Apache-2.0 (RF-DETR-Nano, onnx-community/rfdetr_nano-ONNX)",
+        optional: false,
     },
     VisionModel {
         tier: VisionMode::Captions,
@@ -87,6 +103,7 @@ pub const VISION_MODELS: &[VisionModel] = &[
         url: None,    // Captions ships as the v1 unsupported stub (see caption.rs).
         sha256: None, // A live decode needs a multi-graph export; deferred to V6.
         license: "MIT (Microsoft Florence-2-base)",
+        optional: false,
     },
     VisionModel {
         tier: VisionMode::Captions,
@@ -94,6 +111,31 @@ pub const VISION_MODELS: &[VisionModel] = &[
         url: None,    // Captions ships as the v1 unsupported stub (see caption.rs).
         sha256: None, // A live decode needs a multi-graph export; deferred to V6.
         license: "MIT (Microsoft Florence-2-base)",
+        optional: false,
+    },
+    // The opt-in face pair (plan.md §7 B1). Pinned at the opencv_zoo 4.10.0 tag
+    // rather than `main` so the URL is immutable as well as hash-checked; both
+    // hashes were taken from those exact bytes on 2026-07-26. `optional: true`
+    // keeps them out of every tier gate — see [`VisionModel::optional`].
+    VisionModel {
+        tier: VisionMode::Tags,
+        relative: faces::YUNET_ONNX,
+        url: Some(
+            "https://github.com/opencv/opencv_zoo/raw/4.10.0/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+        ),
+        sha256: Some("8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"),
+        license: "Apache-2.0 (YuNet 2023mar, opencv/opencv_zoo)",
+        optional: true,
+    },
+    VisionModel {
+        tier: VisionMode::Tags,
+        relative: faces::SFACE_ONNX,
+        url: Some(
+            "https://github.com/opencv/opencv_zoo/raw/4.10.0/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
+        ),
+        sha256: Some("0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79"),
+        license: "Apache-2.0 (SFace 2021dec, opencv/opencv_zoo)",
+        optional: true,
     },
 ];
 
@@ -128,10 +170,14 @@ pub fn needs_vision_reprocess(
 /// The model files required for `requested` that are missing under `models_dir`.
 /// An empty vec means the tier's pinned files are all present. Used by the submit
 /// pre-flight to fail a job as a whole rather than surprising the caller per file.
+///
+/// Optional artifacts ([`VisionModel::optional`]) are excluded by construction:
+/// they are not required by any tier, so an unstaged face pair must never make a
+/// `tags` job unsubmittable.
 pub fn missing_models(models_dir: &Path, requested: VisionMode) -> Vec<PathBuf> {
     VISION_MODELS
         .iter()
-        .filter(|model| requested.includes(model.tier))
+        .filter(|model| !model.optional && requested.includes(model.tier))
         .map(|model| models_dir.join(model.relative))
         .filter(|path| !path.is_file())
         .collect()
@@ -166,7 +212,7 @@ pub fn missing_vision_prereqs(models_dir: &Path, requested: VisionMode) -> Vec<S
 pub fn corrupt_models(models_dir: &Path, requested: VisionMode) -> Vec<PathBuf> {
     VISION_MODELS
         .iter()
-        .filter(|model| requested.includes(model.tier))
+        .filter(|model| !model.optional && requested.includes(model.tier))
         .filter_map(|model| {
             let expected = model.sha256?;
             let path = models_dir.join(model.relative);
@@ -232,6 +278,53 @@ pub fn detector_present(models_dir: &Path) -> bool {
 /// Backs the `taggers[].present` flag in `GET /settings`.
 pub fn tagger_present(models_dir: &Path) -> bool {
     clip::cache_present(models_dir)
+}
+
+/// Whether the opt-in face pair (`yunet-sface`) is staged AND hash-valid under
+/// `models_dir`. Backs the `faces[].present` flag in `GET /settings`, which is
+/// how an app learns to grey the control out instead of offering a capability
+/// this box does not have.
+///
+/// Existence alone is never enough here, for the same reason as the detector:
+/// the whole security model is that the bytes running inference are the bytes
+/// whose hash is pinned in this file.
+pub fn faces_present(models_dir: &Path) -> bool {
+    model_ready(models_dir, faces::YUNET_ONNX) && model_ready(models_dir, faces::SFACE_ONNX)
+}
+
+/// Face model files present under `models_dir` whose bytes do NOT match their
+/// pinned SHA-256. Empty ⇒ what is staged is what was pinned (or nothing is
+/// staged, which is the capability-absent case, not a corruption).
+///
+/// Used by the job-time pre-flight for the one case that must NOT degrade
+/// silently: a face model that is present but tampered with, truncated, or
+/// swapped. An ABSENT pair is a choice not to have the capability; a WRONG pair
+/// is a claim about a person's identity computed by bytes nobody vouched for, so
+/// it fails the job the way a corrupt detector does.
+pub fn corrupt_face_models(models_dir: &Path) -> Vec<PathBuf> {
+    [faces::YUNET_ONNX, faces::SFACE_ONNX]
+        .into_iter()
+        .filter(|relative| models_dir.join(relative).is_file())
+        .filter(|relative| !model_ready(models_dir, relative))
+        .map(|relative| models_dir.join(relative))
+        .collect()
+}
+
+/// Incremental change-detection rule for the faces sub-tier, the companion to
+/// [`needs_vision_reprocess`].
+///
+/// The tier ladder cannot see this on its own: turning faces on changes nothing
+/// about the requested tier, so a corpus already at `tags` would be skipped
+/// wholesale and the operator would watch a faces job do nothing. `recorded` is
+/// the file's `vision.faces_model` — `None` when no face model has ever scanned
+/// it — so a file is reworked exactly when the enabled pair is not the pair
+/// already recorded for it. Turning faces OFF never reprocesses and never
+/// deletes: like a lowered vision tier, it is non-destructive.
+pub fn needs_faces_reprocess(enabled: Option<&str>, recorded: Option<&str>, ext: &str) -> bool {
+    match enabled {
+        Some(model) => is_vision_ext(ext) && recorded != Some(model),
+        None => false,
+    }
 }
 
 /// Whether the captioner (`florence2`) files are all present under `models_dir`.
@@ -349,19 +442,47 @@ where
 pub struct VisionAnalyzer {
     cfg: VisionConfig,
     models_dir: PathBuf,
+    /// Whether the opt-in faces sub-tier will actually run: requested by config
+    /// AND staged on this box. Resolved ONCE here rather than per file so the
+    /// answer is stable for a whole job (a job cannot half-scan a corpus because
+    /// the models appeared mid-run) and so the off-path pays nothing — the probe
+    /// is skipped entirely unless a job asked for faces.
+    faces_ready: bool,
 }
 
 impl VisionAnalyzer {
     pub fn new(config: &Config) -> Result<Self> {
+        let models_dir = config.vision_models_dir();
+        let faces_ready = config.vision.max != VisionMode::Off
+            && config.vision.faces_enabled()
+            && faces::available(&models_dir);
+        if config.vision.faces_enabled() && config.vision.max != VisionMode::Off && !faces_ready {
+            // Capability absent, not an error: say so once, then run the rest of
+            // the tier. Silence here is what would be dishonest — an operator who
+            // asked for faces and got an empty table deserves the reason.
+            tracing::warn!(
+                models_dir = %models_dir.display(),
+                "faces requested but the yunet/sface pair is not staged; \
+                 skipping faces (run `llm-index fetch-data --faces`)"
+            );
+        }
         Ok(Self {
             cfg: config.vision.clone(),
-            models_dir: config.vision_models_dir(),
+            models_dir,
+            faces_ready,
         })
     }
 
     /// The resolved directory model files are expected under.
     pub fn models_dir(&self) -> &Path {
         &self.models_dir
+    }
+
+    /// The face model pair this job will actually scan with, or `None` when the
+    /// faces sub-tier is off or unstaged. Feeds [`needs_faces_reprocess`], so
+    /// the resume rule and the run agree on one answer.
+    pub fn faces_model(&self) -> Option<&'static str> {
+        self.faces_ready.then_some(faces::FACE_MODEL_ID)
     }
 
     /// Analyse a still image up to `mode`. Never panics: decode failures and
@@ -415,7 +536,19 @@ impl VisionAnalyzer {
             } else {
                 true
             };
-            if detector_ok && clip_ok {
+            // Faces is the third model-backed sub-tier and behaves like the
+            // other two — except that "not staged" is not a failure here, it is
+            // `faces_ready == false`, which counts as ok exactly like an `off`
+            // toggle. Only a real inference failure records an error and holds
+            // `mode` back so a later resume retries the file.
+            let faces_ok = if self.faces_ready {
+                run_tier(&mut result, |out| {
+                    faces::fill(&image, &self.models_dir, &self.cfg, out)
+                })
+            } else {
+                true
+            };
+            if detector_ok && clip_ok && faces_ok {
                 result.mode = VisionMode::Tags;
             }
         }
@@ -441,7 +574,7 @@ impl VisionAnalyzer {
         if mode == VisionMode::Off {
             return VisionResult::default();
         }
-        video::analyze(path, &self.models_dir, &self.cfg, mode)
+        video::analyze(path, &self.models_dir, &self.cfg, mode, self.faces_ready)
     }
 }
 
@@ -599,6 +732,90 @@ mod tests {
         assert_eq!(result.mode, VisionMode::Tags);
         assert!(result.objects.is_empty());
         assert!(result.tags.is_empty());
+    }
+
+    /// The whole point of the faces opt-in: an unstaged box degrades, it does
+    /// not fail. Faces are ASKED for over an empty models dir, and the tags tier
+    /// still completes — no error, no held-back tier, no faces, and no
+    /// `faces_model` stamp (so the file stays eligible once the pair is staged).
+    #[test]
+    fn absent_face_models_are_a_missing_capability_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.png");
+        image::RgbImage::new(4, 3).save(&good).unwrap();
+        let mut config = Config::default();
+        config.vision.detector = "off".into();
+        config.vision.tagger = "off".into();
+        config.vision.faces = faces::FACE_MODEL_ID.into();
+        config.vision.max = VisionMode::Tags;
+        config.finalize();
+        let analyzer = VisionAnalyzer::new(&config).unwrap();
+        assert_eq!(analyzer.faces_model(), None, "capability absent");
+        let result = analyzer.analyze_image(&good, VisionMode::Tags);
+        assert_eq!(result.error, None, "{:?}", result.error);
+        assert_eq!(result.mode, VisionMode::Tags);
+        assert!(result.faces.is_empty());
+        assert_eq!(result.faces_model, None);
+    }
+
+    /// And an unstaged pair never reaches the tier gates: a `tags` job on a box
+    /// with no face models is exactly as submittable as before this feature —
+    /// the optional entries are invisible to `missing_models`,
+    /// `missing_vision_prereqs`, `corrupt_models` and `available_tiers`.
+    #[test]
+    fn optional_face_models_are_outside_every_tier_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only the required tags artifact is reported missing — not the pair.
+        let missing = missing_models(dir.path(), VisionMode::Captions);
+        assert_eq!(missing.len(), 3, "{missing:?}");
+        assert!(!missing
+            .iter()
+            .any(|path| path.ends_with(faces::YUNET_ONNX) || path.ends_with(faces::SFACE_ONNX)));
+
+        // Stage the required tags prerequisites; `tags` becomes available with
+        // no face model anywhere near the box.
+        let staged = tempfile::tempdir().unwrap();
+        assert!(!faces_present(staged.path()));
+        assert!(
+            corrupt_face_models(staged.path()).is_empty(),
+            "absent is not corrupt"
+        );
+
+        // A present-but-wrong face model is neither available nor silent: the
+        // presence flag stays false AND it is reported corrupt, which is what
+        // fails a faces job instead of running unvouched-for bytes.
+        std::fs::write(staged.path().join(faces::YUNET_ONNX), b"not yunet").unwrap();
+        assert!(!faces_present(staged.path()));
+        assert_eq!(corrupt_face_models(staged.path()).len(), 1);
+        // …and it still does not touch the tags/captions gates.
+        assert!(corrupt_models(staged.path(), VisionMode::Captions).is_empty());
+        assert!(missing_vision_prereqs(staged.path(), VisionMode::Tags)
+            .iter()
+            .all(|entry| !entry.contains("yunet") && !entry.contains("sface")));
+    }
+
+    #[test]
+    fn faces_change_detection_reworks_only_what_a_new_pair_has_not_scanned() {
+        // Never scanned -> rework.
+        assert!(needs_faces_reprocess(Some("yunet-sface"), None, ".jpg"));
+        // Scanned by this exact pair -> leave alone, even with no faces stored.
+        assert!(!needs_faces_reprocess(
+            Some("yunet-sface"),
+            Some("yunet-sface"),
+            ".jpg"
+        ));
+        // Scanned by a different pair -> rework (a model change is a new answer).
+        assert!(needs_faces_reprocess(
+            Some("yunet-sface"),
+            Some("buffalo_l"),
+            ".jpg"
+        ));
+        // Faces off or unstaged -> never, whatever is recorded.
+        assert!(!needs_faces_reprocess(None, None, ".jpg"));
+        assert!(!needs_faces_reprocess(None, Some("yunet-sface"), ".jpg"));
+        // Non-vision extensions are not face-eligible; videos are.
+        assert!(!needs_faces_reprocess(Some("yunet-sface"), None, ".txt"));
+        assert!(needs_faces_reprocess(Some("yunet-sface"), None, ".mp4"));
     }
 
     #[test]

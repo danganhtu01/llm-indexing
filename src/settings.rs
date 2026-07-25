@@ -38,6 +38,10 @@ const TAG_THRESHOLD_MIN: f32 = 0.0;
 const TAG_THRESHOLD_MAX: f32 = 1.0;
 const TAG_TOP_K_MIN: usize = 1;
 const TAG_TOP_K_MAX: usize = 32;
+const FACE_SCORE_MIN: f32 = 0.05;
+const FACE_SCORE_MAX: f32 = 0.99;
+const MAX_FACES_MIN: usize = 1;
+const MAX_FACES_MAX: usize = 200;
 const MAX_FRAMES_MIN: usize = 1;
 const MAX_FRAMES_MAX: usize = 64;
 const TIMEOUT_MIN: u64 = 5;
@@ -51,6 +55,11 @@ pub const DETECTOR_DEFAULT: &str = "nano";
 pub const TAGGER_DEFAULT: &str = "clip";
 pub const CAPTIONER_DEFAULT: &str = "florence2";
 
+/// The `off` token every vision sub-model toggle accepts, spelled once. It is
+/// the DEFAULT of exactly one of them — `vision.faces` — so that default has a
+/// name to point at rather than a bare literal (see `config::default_faces`).
+pub const FACES_OFF: &str = "off";
+
 /// Accepted values for the vision sub-model toggles. `off` disables the
 /// sub-tier; the named value selects the v1 model for it. Public so the
 /// `GET /settings` capability surface enumerates the accepted ids from this one
@@ -58,6 +67,11 @@ pub const CAPTIONER_DEFAULT: &str = "florence2";
 pub const DETECTORS: &[&str] = &["off", DETECTOR_DEFAULT];
 pub const TAGGERS: &[&str] = &["off", TAGGER_DEFAULT];
 pub const CAPTIONERS: &[&str] = &["off", CAPTIONER_DEFAULT];
+/// Accepted values for the faces toggle. One id for the detect+embed pair: SFace
+/// vectors are only comparable across files when the crops were aligned by
+/// YuNet's landmarks, so the two are never selected apart
+/// (`vision::faces::FACE_MODEL_ID` is the same string, and owns the explanation).
+pub const FACE_MODELS: &[&str] = &[FACES_OFF, crate::vision::faces::FACE_MODEL_ID];
 
 /// Numeric bounds for the per-job OCR knobs, as `(min, max)` — exposed so
 /// `GET /settings` renders each range from THIS single definition (SETTINGS-SPEC
@@ -74,6 +88,8 @@ pub const OCR_MAX_PAGES_RANGE: (usize, usize) = (MAX_PAGES_MIN, MAX_PAGES_MAX);
 pub const VISION_DETECTOR_CONF_RANGE: (f32, f32) = (DETECTOR_CONF_MIN, DETECTOR_CONF_MAX);
 pub const VISION_TAG_THRESHOLD_RANGE: (f32, f32) = (TAG_THRESHOLD_MIN, TAG_THRESHOLD_MAX);
 pub const VISION_TAG_TOP_K_RANGE: (usize, usize) = (TAG_TOP_K_MIN, TAG_TOP_K_MAX);
+pub const VISION_FACE_SCORE_RANGE: (f32, f32) = (FACE_SCORE_MIN, FACE_SCORE_MAX);
+pub const VISION_MAX_FACES_RANGE: (usize, usize) = (MAX_FACES_MIN, MAX_FACES_MAX);
 pub const VISION_MAX_FRAMES_RANGE: (usize, usize) = (MAX_FRAMES_MIN, MAX_FRAMES_MAX);
 pub const VISION_TIMEOUT_RANGE: (u64, u64) = (TIMEOUT_MIN, TIMEOUT_MAX);
 
@@ -297,6 +313,17 @@ pub struct VisionSettings {
     /// Captioner: `off` | `florence2`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captioner: Option<String>,
+    /// Faces: `off` (default) | `yunet-sface`. Privacy-sensitive and opt-in;
+    /// asking for it on a box with no staged face models is not an error, the
+    /// capability is simply absent (`GET /settings` reports which).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faces: Option<String>,
+    /// Minimum face-detection score to keep a face (`0.05..=0.99`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_score: Option<f32>,
+    /// Maximum faces kept per file (`1..=200`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_faces: Option<usize>,
     /// Maximum video keyframes analysed (`1..=64`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_frames: Option<usize>,
@@ -319,6 +346,9 @@ impl VisionSettings {
             tag_threshold: Some(config.vision.tag_score),
             tag_top_k: Some(config.vision.tag_top_k),
             captioner: Some(config.vision.captioner.clone()),
+            faces: Some(config.vision.faces.clone()),
+            face_score: Some(config.vision.face_score),
+            max_faces: Some(config.vision.max_faces),
             max_frames: Some(config.vision.max_frames),
             timeout_secs: Some(config.vision.timeout_secs),
         }
@@ -333,6 +363,9 @@ impl VisionSettings {
             tag_threshold: over.tag_threshold.or(base.tag_threshold),
             tag_top_k: over.tag_top_k.or(base.tag_top_k),
             captioner: over.captioner.clone().or_else(|| base.captioner.clone()),
+            faces: over.faces.clone().or_else(|| base.faces.clone()),
+            face_score: over.face_score.or(base.face_score),
+            max_faces: over.max_faces.or(base.max_faces),
             max_frames: over.max_frames.or(base.max_frames),
             timeout_secs: over.timeout_secs.or(base.timeout_secs),
         }
@@ -373,6 +406,15 @@ impl VisionSettings {
         if let Some(value) = &self.captioner {
             config.vision.captioner = value.trim().to_ascii_lowercase();
         }
+        if let Some(value) = &self.faces {
+            config.vision.faces = value.trim().to_ascii_lowercase();
+        }
+        if let Some(value) = self.face_score {
+            config.vision.face_score = value;
+        }
+        if let Some(value) = self.max_faces {
+            config.vision.max_faces = value;
+        }
         if let Some(value) = self.max_frames {
             config.vision.max_frames = value;
         }
@@ -387,6 +429,21 @@ impl VisionSettings {
         validate_enum("detector", &self.detector, DETECTORS)?;
         validate_enum("tagger", &self.tagger, TAGGERS)?;
         validate_enum("captioner", &self.captioner, CAPTIONERS)?;
+        validate_enum("faces", &self.faces, FACE_MODELS)?;
+        if let Some(score) = self.face_score {
+            if !(FACE_SCORE_MIN..=FACE_SCORE_MAX).contains(&score) {
+                return Err(format!(
+                    "vision.face_score must be between {FACE_SCORE_MIN} and {FACE_SCORE_MAX} (got {score})"
+                ));
+            }
+        }
+        if let Some(max_faces) = self.max_faces {
+            if !(MAX_FACES_MIN..=MAX_FACES_MAX).contains(&max_faces) {
+                return Err(format!(
+                    "vision.max_faces must be between {MAX_FACES_MIN} and {MAX_FACES_MAX} (got {max_faces})"
+                ));
+            }
+        }
         if let Some(conf) = self.detector_conf {
             if !(DETECTOR_CONF_MIN..=DETECTOR_CONF_MAX).contains(&conf) {
                 return Err(format!(
@@ -724,6 +781,104 @@ mod tests {
         .validate()
         .unwrap_err()
         .contains("vision.captioner"));
+        for value in ["off", "yunet-sface", "YuNet-SFace"] {
+            assert!(
+                VisionSettings {
+                    faces: Some(value.into()),
+                    ..Default::default()
+                }
+                .validate()
+                .is_ok(),
+                "{value}"
+            );
+        }
+        // Only the pair is selectable — never one half of it, and never a model
+        // whose weights this engine will not ship.
+        for value in ["yunet", "sface", "buffalo_l", "arcface"] {
+            assert!(VisionSettings {
+                faces: Some(value.into()),
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_err()
+            .contains("vision.faces"));
+        }
+    }
+
+    #[test]
+    fn faces_bounds_accept_edges_and_reject_beyond() {
+        let edge = VisionSettings {
+            face_score: Some(0.05),
+            max_faces: Some(1),
+            ..Default::default()
+        };
+        assert!(edge.validate().is_ok());
+        let edge_high = VisionSettings {
+            face_score: Some(0.99),
+            max_faces: Some(200),
+            ..Default::default()
+        };
+        assert!(edge_high.validate().is_ok());
+        assert!(VisionSettings {
+            face_score: Some(0.04),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("vision.face_score"));
+        assert!(VisionSettings {
+            face_score: Some(1.0),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(VisionSettings {
+            max_faces: Some(0),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("vision.max_faces"));
+        assert!(VisionSettings {
+            max_faces: Some(201),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+    }
+
+    /// The default that matters most in this file: a request that says nothing
+    /// about faces resolves to `off`, from the config base, through the same
+    /// merge every other knob uses. Nothing enables faces by omission.
+    #[test]
+    fn faces_default_off_and_the_toggle_reaches_vision_config() {
+        let config = Config::default();
+        assert_eq!(config.vision.faces, "off");
+        assert!(!config.vision.faces_enabled());
+        assert_eq!(
+            VisionSettings::resolve(&config, None).faces.as_deref(),
+            Some("off")
+        );
+        assert_eq!(
+            VisionSettings::resolve(&config, Some(&VisionSettings::default()))
+                .faces
+                .as_deref(),
+            Some("off"),
+            "an override that omits faces must not turn them on"
+        );
+
+        let mut config = Config::default();
+        let over = VisionSettings {
+            faces: Some("YuNet-SFace".into()),
+            face_score: Some(0.5),
+            max_faces: Some(3),
+            ..Default::default()
+        };
+        VisionSettings::resolve(&config, Some(&over)).apply_to(&mut config);
+        assert_eq!(config.vision.faces, "yunet-sface"); // normalized
+        assert!(config.vision.faces_enabled());
+        assert!((config.vision.face_score - 0.5).abs() < 1e-6);
+        assert_eq!(config.vision.max_faces, 3);
     }
 
     #[test]

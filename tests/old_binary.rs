@@ -19,6 +19,12 @@
 //! older binary gets. That is process-wide, which is why this lives in its own
 //! integration test binary and is a single test: it must not race another test
 //! opening a connection.
+//!
+//! The same test carries the `faces` table, which is the OTHER thing this build
+//! adds to a published corpus. It is deliberately checked here, in the same
+//! narrative, because the contrast is the point: `faces` is an ORDINARY table,
+//! so an older binary can read it, write it, and even join it — it needs no
+//! module and cannot be tripped by one. What it must not do is notice.
 
 use llm_indexing::embedding::{vector_to_bytes, EMBEDDING_MODEL};
 use llm_indexing::store::connect;
@@ -42,6 +48,23 @@ CREATE TABLE chunks(
 );
 CREATE INDEX idx_chunks_file ON chunks(file_id);
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+";
+
+/// The `faces` table this build adds, spelled as `store::SCHEMA` spells it. A
+/// corpus gains it by `CREATE TABLE IF NOT EXISTS` on its next open by a build
+/// that has it — which is exactly the situation an older binary then meets.
+const FACES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS faces(
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  face_index INTEGER NOT NULL,
+  x INTEGER NOT NULL, y INTEGER NOT NULL,
+  width INTEGER NOT NULL, height INTEGER NOT NULL,
+  quality REAL NOT NULL,
+  embedding BLOB, dimensions INTEGER,
+  model TEXT NOT NULL,
+  frame INTEGER,
+  PRIMARY KEY(file_id, face_index)
+);
+CREATE INDEX IF NOT EXISTS idx_faces_file ON faces(file_id);
 ";
 
 /// The `sqlite3_vec_init` pointer, cast the way SQLite's auto-extension list
@@ -127,6 +150,18 @@ fn a_corpus_with_a_shadow_index_stays_readable_and_writable_without_the_module()
                 )
                 .unwrap();
         }
+        // A faces job also ran over this corpus: the table exists and two of the
+        // files carry face rows, embeddings and all.
+        connection.execute_batch(FACES_SCHEMA).unwrap();
+        for (file_id, index) in [(1_i64, 0_i64), (1, 1), (2, 0)] {
+            connection
+                .execute(
+                    "INSERT INTO faces(file_id,face_index,x,y,width,height,quality,embedding,\
+                     dimensions,model,frame) VALUES(?1,?2,10,20,64,80,0.97,?3,3,'yunet-sface',NULL)",
+                    params![file_id, index, vector_to_bytes(&[0.5, 0.25, -0.25])],
+                )
+                .unwrap();
+        }
         for tier in [vec0::Tier::Float, vec0::Tier::Int8] {
             let report = vec0::build(&mut connection, tier, EMBEDDING_MODEL, 3, |_, _| {}).unwrap();
             assert_eq!(report.vectors, 8, "{tier:?}");
@@ -184,6 +219,22 @@ fn a_corpus_with_a_shadow_index_stays_readable_and_writable_without_the_module()
     )
     .unwrap();
 
+    // The `faces` table is an ordinary table, so unlike the shadow index it is
+    // fully available to a build that has never heard of it — the extra table
+    // costs an older binary exactly nothing.
+    let faces: i64 = old
+        .query_row("SELECT COUNT(*) FROM faces", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(faces, 3);
+    let joined: i64 = old
+        .query_row(
+            "SELECT COUNT(*) FROM faces f JOIN files fi ON fi.id=f.file_id",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(joined, 3, "an older binary can even join it");
+
     // And a write: an older job indexing into this corpus succeeds. It leaves
     // the shadow index stale, which is precisely what `vec0::usable` exists to
     // catch — see the assertion at the end. Note the shape deliberately: one
@@ -203,6 +254,16 @@ fn a_corpus_with_a_shadow_index_stays_readable_and_writable_without_the_module()
     old.execute("DELETE FROM chunks WHERE file_id=8", [])
         .unwrap();
     old.execute("DELETE FROM files WHERE id=8", []).unwrap();
+    // And it writes into `faces` too — including the delete-then-insert an older
+    // build's own row replacement performs — without knowing what the rows mean.
+    old.execute("DELETE FROM faces WHERE file_id=2", [])
+        .unwrap();
+    old.execute(
+        "INSERT INTO faces(file_id,face_index,x,y,width,height,quality,embedding,dimensions,\
+         model,frame) VALUES(3,0,1,2,30,40,0.5,NULL,NULL,'yunet-sface',7)",
+        [],
+    )
+    .unwrap();
 
     // 4. The ONE thing it cannot do is query the virtual tables — which it
     //    never would, because nothing in a build without this feature mentions
@@ -234,6 +295,16 @@ fn a_corpus_with_a_shadow_index_stays_readable_and_writable_without_the_module()
         .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
         .unwrap();
     assert_eq!(chunks, 8, "7 files' chunks plus the one it added");
+    // The faces the older binary left behind are exactly what it left: two it
+    // never touched, one it deleted, one it wrote.
+    let faces: Vec<(i64, i64, Option<i64>)> = connection
+        .prepare("SELECT file_id,face_index,frame FROM faces ORDER BY file_id,face_index")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(faces, vec![(1, 0, None), (1, 1, None), (3, 0, Some(7))]);
     for slot in vec0::Slot::ALL {
         assert_eq!(
             chunks as usize,
