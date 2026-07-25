@@ -81,7 +81,11 @@ fn indexes_and_searches_english_and_vietnamese() {
     let discovered = llm_indexing::store::read_meta(&connection, "last_discovered_files")
         .unwrap()
         .and_then(|value| value.parse::<i64>().ok());
-    assert_eq!(discovered, Some(3), "all 3 discovered files, not just the 3 processed");
+    assert_eq!(
+        discovered,
+        Some(3),
+        "all 3 discovered files, not just the 3 processed"
+    );
 
     let normalizer = Normalizer::load(&config);
     assert!(!search(&connection, &normalizer, "launder", 5, false)
@@ -673,7 +677,8 @@ fn page_boundaries_survive_from_pdf_extraction_into_stored_chunks() {
         "the padded pages must produce more than one chunk: {rows:?}"
     );
     assert!(
-        rows.iter().all(|(_, start, end)| start.is_some() && end.is_some()),
+        rows.iter()
+            .all(|(_, start, end)| start.is_some() && end.is_some()),
         "every chunk of a page-segmented PDF must carry a page range: {rows:?}"
     );
     assert_eq!(
@@ -821,4 +826,78 @@ fn a_model_change_that_keeps_an_old_row_leaves_the_upgrade_gate_open() {
         current,
         "once every file is migrated the marker finally advances to the current model"
     );
+}
+
+/// The other half of P0-8, and the one a live deployment actually depends on:
+/// `SCHEMA_V2` adds `chunks.page_start`/`page_end` NULLABLE and backfills
+/// nothing, so every chunk of an ALREADY-INDEXED corpus reads back NULL — the
+/// migration migrates the schema, not the data. Without a per-file signal the
+/// only way to make an existing corpus citable would be a destructive
+/// `{overwrite:true}` re-index of the whole thing, which is not something a
+/// deploy should have to do.
+///
+/// Reproduces the live shape exactly (index, then blank the anchors, which is
+/// what a pre-migration corpus looks like once the columns are added) and
+/// asserts an ORDINARY resume repairs it — and then, just as importantly, that
+/// the next resume leaves it alone. A rule that re-schedules an unanchored file
+/// it cannot anchor would redo those files on every run for the life of the
+/// corpus.
+#[test]
+fn an_unanchored_corpus_regains_its_page_anchors_on_an_ordinary_resume() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let destination = temp.path().join("corpus.sqlite");
+
+    write_pdf(
+        &input.join("report.pdf"),
+        &[padded_lines("alpha", 2000), padded_lines("bravo", 2000)],
+    );
+    assert_eq!(
+        index(&input, &destination, false, None, None, None)
+            .unwrap()
+            .files,
+        1
+    );
+    assert!(anchored_chunks(&destination) > 0, "indexed with anchors");
+
+    // Become a corpus indexed before page attribution existed.
+    rusqlite::Connection::open(&destination)
+        .unwrap()
+        .execute_batch("UPDATE chunks SET page_start=NULL, page_end=NULL")
+        .unwrap();
+    assert_eq!(anchored_chunks(&destination), 0);
+
+    // Nothing about the FILE changed — same size, same mtime, complete method,
+    // chunks present — so every pre-existing resume rule would skip it. Only
+    // the missing anchors schedule it.
+    let repaired = index(&input, &destination, true, None, None, None).unwrap();
+    assert_eq!(
+        repaired.files, 1,
+        "an unanchored PDF must be redone by a plain resume"
+    );
+    assert!(
+        anchored_chunks(&destination) > 0,
+        "and must come back with its page anchors"
+    );
+
+    // Termination: the file is anchored now, so the signal is gone and the
+    // next resume skips it like any other unchanged file.
+    let settled = index(&input, &destination, true, None, None, None).unwrap();
+    assert_eq!(
+        (settled.files, settled.skipped),
+        (0, 1),
+        "a repaired file must not be re-scheduled forever"
+    );
+}
+
+fn anchored_chunks(destination: &Path) -> i64 {
+    connect(destination)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM chunks WHERE page_start IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
