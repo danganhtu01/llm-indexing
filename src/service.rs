@@ -26,12 +26,12 @@ use crate::pipeline::{run_index, IndexRequest};
 use crate::runtime::RuntimeKnobs;
 use crate::settings::{
     installed_tessdata_langs, tessdata_sources, OcrSettings, VisionSettings, CAPTIONERS, DETECTORS,
-    OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE, TAGGERS,
+    FACE_MODELS, OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE, TAGGERS,
 };
 use crate::store::{grouped, journal_path, BUSY_TIMEOUT, READ_BUSY_TIMEOUT};
 use crate::vision::{
-    available_tiers, captioner_present, corrupt_models, detector_present, missing_vision_prereqs,
-    tagger_present, VisionMode,
+    available_tiers, captioner_present, corrupt_face_models, corrupt_models, detector_present,
+    faces_present, missing_vision_prereqs, tagger_present, VisionMode,
 };
 use crate::VERSION;
 
@@ -353,10 +353,19 @@ fn build_settings(
             "detectors": sub_models(DETECTORS, detector_present(&models_dir)),
             "taggers": sub_models(TAGGERS, tagger_present(&models_dir)),
             "captioners": sub_models(CAPTIONERS, captioner_present(&models_dir)),
+            // Faces is enumerated exactly like the other sub-models, and for the
+            // same reason: an app must be able to tell "this box cannot do
+            // faces" from "this box will not", without guessing. `present` is
+            // false on every box that has not deliberately staged the pair, and
+            // the default below is `off` on every box.
+            "faces": sub_models(FACE_MODELS, faces_present(&models_dir)),
             "defaults": {
                 "detector_conf": config.vision.detector_conf,
                 "tag_threshold": config.vision.tag_score,
                 "tag_top_k": config.vision.tag_top_k,
+                "faces": config.vision.faces,
+                "face_score": config.vision.face_score,
+                "max_faces": config.vision.max_faces,
                 "max_frames": config.vision.max_frames,
                 "timeout_secs": config.vision.timeout_secs,
             },
@@ -1065,6 +1074,19 @@ fn run_job(
             anyhow::bail!(
                 "vision model integrity check failed (corrupt/truncated/tampered); \
                  re-run llm-index fetch-data --vision --force: {corrupt:?}"
+            )
+        }
+    }
+    // Faces gets the integrity half of that gate but NOT the presence half. An
+    // absent pair means the capability is absent and the job runs without it;
+    // a pair that is present but does not match its pinned hash is bytes nobody
+    // vouched for computing claims about people's identities, so the job stops.
+    if config.vision.max != VisionMode::Off && config.vision.faces_enabled() {
+        let corrupt = corrupt_face_models(&config.vision_models_dir());
+        if !corrupt.is_empty() {
+            anyhow::bail!(
+                "face model integrity check failed (corrupt/truncated/tampered); \
+                 re-run llm-index fetch-data --faces --force: {corrupt:?}"
             )
         }
     }
@@ -2250,13 +2272,47 @@ mod tests {
         // Vision block: cap, gated tiers, per-sub-model present flags, defaults.
         assert_eq!(value["vision"]["max_tier"], "off");
         assert!(value["vision"]["tiers_available"].is_array());
-        for category in ["detectors", "taggers", "captioners"] {
+        for category in ["detectors", "taggers", "captioners", "faces"] {
             let list = value["vision"][category].as_array().unwrap();
             assert_eq!(list.len(), 1, "{category}");
             assert!(list[0]["id"].is_string());
             assert!(list[0]["present"].is_boolean());
         }
         assert!(value["vision"]["defaults"]["detector_conf"].is_number());
+        // Faces is discoverable and its advertised default is `off` — an app
+        // reading this can offer the control without ever pre-selecting it.
+        assert_eq!(value["vision"]["faces"][0]["id"], "yunet-sface");
+        assert_eq!(value["vision"]["defaults"]["faces"], "off");
+        assert!(value["vision"]["defaults"]["face_score"].is_number());
+        assert!(value["vision"]["defaults"]["max_faces"].is_number());
+    }
+
+    /// The capability half of the faces opt-in: a box that has not staged the
+    /// pair says so, a box with a wrongly-hashed one still says so, and neither
+    /// changes which vision TIERS are on offer.
+    #[test]
+    fn faces_presence_is_reported_without_touching_the_tier_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_pointing_at(temp.path());
+        let vision_dir = temp.path().join("vision");
+        std::fs::create_dir_all(&vision_dir).unwrap();
+
+        let value = build_settings(Some(&config), VisionMode::Captions, 4).unwrap();
+        assert_eq!(value["vision"]["faces"][0]["present"], false);
+        let tiers = value["vision"]["tiers_available"].clone();
+
+        // Half a pair is not a capability.
+        std::fs::write(vision_dir.join("yunet.onnx"), b"bogus").unwrap();
+        let value = build_settings(Some(&config), VisionMode::Captions, 4).unwrap();
+        assert_eq!(value["vision"]["faces"][0]["present"], false);
+        // Both halves present but unpinned-hash bogus: still absent.
+        std::fs::write(vision_dir.join("sface.onnx"), b"bogus").unwrap();
+        let value = build_settings(Some(&config), VisionMode::Captions, 4).unwrap();
+        assert_eq!(value["vision"]["faces"][0]["present"], false);
+        assert_eq!(
+            value["vision"]["tiers_available"], tiers,
+            "face models must never move the tier gates"
+        );
     }
 
     #[test]

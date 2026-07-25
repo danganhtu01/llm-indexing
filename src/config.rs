@@ -212,6 +212,25 @@ fn default_tagger() -> String {
 fn default_captioner() -> String {
     crate::settings::CAPTIONER_DEFAULT.into()
 }
+/// The faces sub-tier is the ONE vision sub-model whose default is `off` rather
+/// than its model id. It produces biometric identifiers for people who never
+/// opted in, so the operator has to say so — twice, in fact: this toggle AND
+/// `fetch-data --faces` to put the models on the box at all.
+fn default_faces() -> String {
+    crate::settings::FACES_OFF.into()
+}
+fn default_face_score() -> f32 {
+    // OpenCV `FaceDetectorYN`'s own default. High on purpose: a false face is
+    // worse than a missed one here, because it enters a person's cluster as
+    // somebody's face and has to be disowned by hand.
+    0.9
+}
+fn default_max_faces() -> usize {
+    // Faces kept per file. Twenty covers group photos without letting one
+    // pathological frame (a stadium crowd, a wall of portraits) write thousands
+    // of rows and thousands of 512-byte vectors into a corpus.
+    20
+}
 fn default_tag_score() -> f32 {
     0.22
 }
@@ -414,6 +433,17 @@ pub struct VisionConfig {
     /// Captioner selection: `florence2`, or `off` to skip captioning.
     #[serde(default = "default_captioner")]
     pub captioner: String,
+    /// Face detection + embedding selection: `off` (the default) or
+    /// `yunet-sface`. Privacy-sensitive and therefore the one sub-model that is
+    /// off unless asked for — see [`default_faces`] and `vision::faces`.
+    #[serde(default = "default_faces")]
+    pub faces: String,
+    /// Minimum YuNet detection score to keep a face (`0.05..=0.99`).
+    #[serde(default = "default_face_score")]
+    pub face_score: f32,
+    /// Maximum faces kept per file (`1..=200`).
+    #[serde(default = "default_max_faces")]
+    pub max_faces: usize,
     /// Minimum CLIP zero-shot tag score to keep.
     #[serde(default = "default_tag_score")]
     pub tag_score: f32,
@@ -449,6 +479,9 @@ impl Default for VisionConfig {
             detector: default_detector(),
             tagger: default_tagger(),
             captioner: default_captioner(),
+            faces: default_faces(),
+            face_score: default_face_score(),
+            max_faces: default_max_faces(),
             tag_score: default_tag_score(),
             tag_top_k: default_tag_top_k(),
             detector_conf: default_detector_conf(),
@@ -476,6 +509,14 @@ impl VisionConfig {
     /// Whether the captioner sub-tier runs (`captioner != "off"`).
     pub fn captioner_enabled(&self) -> bool {
         !self.captioner.eq_ignore_ascii_case("off")
+    }
+    /// Whether the faces sub-tier was ASKED for (`faces != "off"`). Whether it
+    /// can actually run is the separate question `VisionAnalyzer` settles once
+    /// per job by also checking that the models are staged — asking for a
+    /// capability the box does not have is not an error, it just leaves the
+    /// faces table empty.
+    pub fn faces_enabled(&self) -> bool {
+        !self.faces.eq_ignore_ascii_case("off")
     }
 }
 
@@ -651,8 +692,8 @@ impl Config {
         // default outside its own min/max. Idempotent (finalize may run twice).
         use crate::settings::{
             OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE, VISION_DETECTOR_CONF_RANGE,
-            VISION_MAX_FRAMES_RANGE, VISION_TAG_THRESHOLD_RANGE, VISION_TAG_TOP_K_RANGE,
-            VISION_TIMEOUT_RANGE,
+            VISION_FACE_SCORE_RANGE, VISION_MAX_FACES_RANGE, VISION_MAX_FRAMES_RANGE,
+            VISION_TAG_THRESHOLD_RANGE, VISION_TAG_TOP_K_RANGE, VISION_TIMEOUT_RANGE,
         };
         self.ocr_dpi = self.ocr_dpi.clamp(OCR_DPI_RANGE.0, OCR_DPI_RANGE.1);
         self.ocr_max_pages = self
@@ -674,6 +715,14 @@ impl Config {
             .vision
             .tag_top_k
             .clamp(VISION_TAG_TOP_K_RANGE.0, VISION_TAG_TOP_K_RANGE.1);
+        self.vision.face_score = self
+            .vision
+            .face_score
+            .clamp(VISION_FACE_SCORE_RANGE.0, VISION_FACE_SCORE_RANGE.1);
+        self.vision.max_faces = self
+            .vision
+            .max_faces
+            .clamp(VISION_MAX_FACES_RANGE.0, VISION_MAX_FACES_RANGE.1);
         self.vision.max_frames = self
             .vision
             .max_frames

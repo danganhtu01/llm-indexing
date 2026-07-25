@@ -25,6 +25,14 @@ struct Cli {
     command: Command,
 }
 
+// `IndexArgs` is the widest variant by a long way — it carries every `index`
+// flag, and the three faces knobs pushed the spread past clippy's threshold.
+// Boxing it, the lint's own suggestion, is not available: `clap`'s `Subcommand`
+// derive requires the variant to hold a type implementing `Args`, which
+// `Box<IndexArgs>` does not. The enum is built exactly once, on the stack, from
+// `Cli::parse()` in `main`, so the size it warns about is a few hundred bytes
+// that exist for the length of one move.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     Index(IndexArgs),
@@ -107,6 +115,15 @@ struct IndexArgs {
     vision_tag_top_k: Option<usize>,
     #[arg(long)]
     vision_captioner: Option<String>,
+    /// Face detection + embedding: `off` (default) or `yunet-sface`. Opt-in and
+    /// privacy-sensitive; the pair also has to be staged by
+    /// `fetch-data --faces`, and is simply absent (not an error) if it is not.
+    #[arg(long)]
+    vision_faces: Option<String>,
+    #[arg(long)]
+    vision_face_score: Option<f32>,
+    #[arg(long)]
+    vision_max_faces: Option<usize>,
     #[arg(long)]
     vision_max_frames: Option<usize>,
     #[arg(long)]
@@ -260,6 +277,17 @@ struct FetchDataArgs {
     /// SHA-256 verification instead of dictionaries/OCR data.
     #[arg(long, conflicts_with_all = ["dictionaries_only", "ocr_only"])]
     vision: bool,
+    /// Also fetch the OPT-IN face pair (YuNet detector + SFace embedder), with
+    /// the same pinned SHA-256 verification.
+    ///
+    /// Separate from `--vision` on purpose. Face embeddings are biometric
+    /// identifiers for people who never opted in, so putting the models on a box
+    /// is its own deliberate act rather than a side effect of staging the vision
+    /// stack — and a box that never runs this command reports the faces
+    /// capability as absent, which is the honest answer. Usable with or without
+    /// `--vision`.
+    #[arg(long, conflicts_with_all = ["dictionaries_only", "ocr_only"])]
+    faces: bool,
 }
 
 #[derive(Args)]
@@ -409,6 +437,9 @@ fn index(args: IndexArgs) -> Result<()> {
         tag_threshold: args.vision_tag_threshold,
         tag_top_k: args.vision_tag_top_k,
         captioner: args.vision_captioner.clone(),
+        faces: args.vision_faces.clone(),
+        face_score: args.vision_face_score,
+        max_faces: args.vision_max_faces,
         max_frames: args.vision_max_frames,
         timeout_secs: args.vision_timeout_secs,
     };
@@ -620,7 +651,7 @@ fn request(args: RequestArgs) -> Result<()> {
 }
 
 fn fetch_data(args: FetchDataArgs) -> Result<()> {
-    if args.vision {
+    if args.vision || args.faces {
         return fetch_vision_models(&args);
     }
     const RAW: &str = "https://raw.githubusercontent.com";
@@ -701,6 +732,18 @@ fn fetch_vision_models(args: &FetchDataArgs) -> Result<()> {
     let directory = args.data_dir.join("vision");
     let client = reqwest::blocking::Client::new();
     for model in VISION_MODELS {
+        // Two independent opt-ins over ONE registry: `--vision` stages the
+        // artifacts the tiers require, `--faces` stages the optional face pair.
+        // Neither implies the other, so a deployment that wants tags never
+        // acquires biometric models it did not ask for.
+        let wanted = if model.optional {
+            args.faces
+        } else {
+            args.vision
+        };
+        if !wanted {
+            continue;
+        }
         let destination = directory.join(model.relative);
         // Re-verify an already-present pinned file rather than trusting mere
         // existence. The atomic write below means an interrupted download never
@@ -758,10 +801,14 @@ fn fetch_vision_models(args: &FetchDataArgs) -> Result<()> {
     // CLIP is served from fastembed's own cache (there is no single pinned file),
     // so stage it here — the ONLY sanctioned network fetch of CLIP (VISION-SPEC
     // §1) — so index-time tags jobs load it locally and the submit pre-flight can
-    // require it instead of fastembed silently downloading it mid-job.
-    println!("staging CLIP encoders under {} …", directory.display());
-    llm_indexing::vision::prefetch_clip(&directory)?;
-    println!("CLIP encoders staged under {}", directory.display());
+    // require it instead of fastembed silently downloading it mid-job. Skipped
+    // for a faces-only fetch: ~350 MB of tag encoders is not what
+    // `fetch-data --faces` was asked for.
+    if args.vision {
+        println!("staging CLIP encoders under {} …", directory.display());
+        llm_indexing::vision::prefetch_clip(&directory)?;
+        println!("CLIP encoders staged under {}", directory.display());
+    }
     Ok(())
 }
 
