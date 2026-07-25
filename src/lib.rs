@@ -1,6 +1,7 @@
 pub mod config;
 pub mod embedding;
 pub mod extract;
+pub mod failure;
 pub mod media;
 pub mod model;
 pub mod normalize;
