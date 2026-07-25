@@ -1412,22 +1412,48 @@ fn corpus_status(path: &Path) -> Result<Value, ReadError> {
     let pending_files = discovered
         .map(|total| (total - indexed_files).max(0))
         .unwrap_or(0);
+    // A corpus predating the `chunks` table (or a hand-built fixture that
+    // never ran through `migrate`) simply has nothing embedded yet — that
+    // reads as 0, not as a fault, the same way a fresh `meta` table does above.
+    let embedded_chunks = if table_exists(&connection, "chunks")? {
+        count("SELECT COUNT(*) FROM chunks")?
+    } else {
+        0
+    };
     Ok(json!({
         "indexed_files": indexed_files,
         "pending_files": pending_files,
         "total_characters": count("SELECT COALESCE(SUM(chars),0) FROM files")?,
         "total_bytes": count("SELECT COALESCE(SUM(size),0) FROM files")?,
         "ocr_files": count("SELECT COALESCE(SUM(ocr_used),0) FROM files")?,
+        "embedded_chunks": embedded_chunks,
         "languages": grouped(&connection, "lang", 10)?,
         "methods": grouped(&connection, "method", 20)?,
         "schema_version": crate::store::schema_version(&connection).map_err(ReadError::from)?,
     }))
 }
 
+/// Whether `name` exists as a table in this connection's schema. Guards
+/// aggregates over tables that a corpus might simply not have yet — added
+/// after schema version 1, or absent from a hand-built test fixture — so
+/// `/corpus/status` reads that as "nothing there" rather than failing the
+/// whole response the way a bare `SELECT COUNT(*)` against a missing table
+/// would (`ReadError::Unreadable`, indistinguishable from real corruption).
+fn table_exists(connection: &Connection, name: &str) -> Result<bool, ReadError> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .map_err(ReadError::from)
+}
+
 fn empty_status() -> Value {
     json!({
         "indexed_files": 0, "pending_files": 0, "total_characters": 0, "total_bytes": 0,
-        "ocr_files": 0, "languages": Vec::<(String, i64)>::new(),
+        "ocr_files": 0, "embedded_chunks": 0, "languages": Vec::<(String, i64)>::new(),
         "methods": Vec::<(String, i64)>::new(), "schema_version": 0,
     })
 }

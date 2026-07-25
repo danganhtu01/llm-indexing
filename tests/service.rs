@@ -574,6 +574,59 @@ async fn corpus_status_reports_pending_files_from_meta_not_a_tree_walk() {
     // `user_version` is 0 — distinct from what this binary would write. That
     // gap IS the version-skew signal a consumer's health banner reads.
     assert_eq!(status["schema_version"], 0, "{status}");
+    // The fixture's `write_fixture_corpus` never creates a `chunks` table
+    // either (it predates the migration harness) — that must read as "0
+    // embedded" rather than fail the whole status read.
+    assert_eq!(status["embedded_chunks"], 0, "{status}");
+}
+
+#[tokio::test]
+async fn corpus_status_reports_embedded_chunks_when_the_table_exists() {
+    // The fix this proves: a consumer (da-academic's Search tab semantic
+    // diagnostic) reads `embedded_chunks` off `/corpus/status` to tell "no
+    // chunks embedded yet" apart from "this build doesn't report the count at
+    // all". Before this, the field never appeared in the response no matter
+    // how many rows `chunks` held.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    let app = router(ServiceConfig {
+        output_root: output.clone(),
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input.clone()],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers: 1,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
+    })
+    .unwrap();
+
+    write_fixture_corpus(&output, input.join("indexed.txt").to_str().unwrap());
+    let connection = rusqlite::Connection::open(output.join("corpus.sqlite")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE chunks(
+                id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL, embedding BLOB NOT NULL, dimensions INTEGER NOT NULL,
+                model TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO chunks(id,file_id,chunk_index,content,embedding,dimensions,model)
+             VALUES (1,1,0,'chunk one',x'00',4,'test-model'),
+                    (2,1,1,'chunk two',x'00',4,'test-model')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let status = get_json(&app, "/corpus/status").await;
+    assert_eq!(status["embedded_chunks"], 2, "{status}");
 }
 
 #[tokio::test]
