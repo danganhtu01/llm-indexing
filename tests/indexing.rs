@@ -752,3 +752,117 @@ fn retry_errors_reopens_a_capped_row() {
         "the extra attempt is counted like any other"
     );
 }
+
+/// B2: the encrypted-PDF fast path. `pdfinfo` must actually be on `PATH` for
+/// any of this to exercise real detection instead of the harmless "binary
+/// missing" fallback `parse_pdf_info` also has to handle — see
+/// `pdf_info_classification::empty_output_from_a_missing_pdfinfo_binary_is_not_password_required`
+/// in `extract.rs` for that case covered in isolation. Skips cleanly (like
+/// the vision live tests) rather than failing on a box without poppler
+/// installed.
+mod encrypted_pdf_fast_path {
+    use super::*;
+
+    fn pdfinfo_available() -> bool {
+        std::process::Command::new("pdfinfo")
+            .arg("-v")
+            .output()
+            .is_ok()
+    }
+
+    /// Three fixtures, all built from the SAME one-page PDF with the text
+    /// "Owner password only test": `pdf-plain.pdf` unencrypted,
+    /// `pdf-owner-password-only.pdf` re-saved with `user_password=""` (opens
+    /// under poppler's default password, permissions fully denied),
+    /// `pdf-user-password-required.pdf` re-saved with a real user password.
+    /// Verified against Calibre's bundled poppler 25.11.0 while writing this
+    /// test: `pdftotext` reads the first two and fails identically to
+    /// `pdfinfo` on the third with "Command Line Error: Incorrect password".
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn an_encrypted_pdf_becomes_an_honest_error_row_and_counts_separately() {
+        if !pdfinfo_available() {
+            eprintln!("skipping encrypted-PDF live test: pdfinfo not on PATH");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        fs::copy(
+            fixture("pdf-user-password-required.pdf"),
+            input.join("locked.pdf"),
+        )
+        .unwrap();
+
+        let stats = index(&input, &destination, false, None, None, None).unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(stats.errors, 1, "a password-required PDF is an error row");
+        assert_eq!(
+            stats.encrypted, 1,
+            "the operator-visible encrypted counter, separate from stats.errors"
+        );
+        let (method, _) = only_file_row(&destination);
+        assert_eq!(
+            method, "error:encrypted",
+            "honest error:encrypted, not a silent empty pdf-text-partial"
+        );
+    }
+
+    /// The must-not-block case: an owner-password-only PDF, with EVERY
+    /// permission bit denied in the fixture, still has its text pulled by
+    /// `pdftotext` under poppler's default empty user password. B2 must not
+    /// mistake `Encrypted: yes` for a reason to bail.
+    #[test]
+    fn an_owner_password_only_pdf_still_extracts() {
+        if !pdfinfo_available() {
+            eprintln!("skipping encrypted-PDF live test: pdfinfo not on PATH");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        fs::copy(
+            fixture("pdf-owner-password-only.pdf"),
+            input.join("restricted.pdf"),
+        )
+        .unwrap();
+
+        let stats = index(&input, &destination, false, None, None, None).unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(
+            stats.errors, 0,
+            "owner-password-only must not be treated as blocking"
+        );
+        assert_eq!(stats.encrypted, 0);
+        let (method, _) = only_file_row(&destination);
+        assert!(!method.starts_with("error:"), "must extract, got {method}");
+    }
+
+    /// Control: an ordinary unencrypted PDF is unaffected by the fast path.
+    #[test]
+    fn a_normal_pdf_is_unaffected() {
+        if !pdfinfo_available() {
+            eprintln!("skipping encrypted-PDF live test: pdfinfo not on PATH");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        fs::copy(fixture("pdf-plain.pdf"), input.join("plain.pdf")).unwrap();
+
+        let stats = index(&input, &destination, false, None, None, None).unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(stats.errors, 0);
+        assert_eq!(stats.encrypted, 0);
+        let (method, _) = only_file_row(&destination);
+        assert_eq!(method, "pdf-text");
+    }
+}

@@ -43,6 +43,11 @@ pub struct IndexStats {
     pub bytes: u64,
     pub ocr_files: usize,
     pub errors: usize,
+    /// The subset of `errors` that are password-protected PDFs (B2's
+    /// `error:encrypted` rows) — broken out so the operator can see "N
+    /// encrypted PDFs skipped" without a SQL query, same motivation as
+    /// `capped` being split out from `skipped` below.
+    pub encrypted: usize,
     pub skipped: usize,
     /// The subset of `skipped` that resume declined because the row has already
     /// burned its attempt budget rather than because it is finished. Reported
