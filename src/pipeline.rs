@@ -115,6 +115,18 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     } else {
         HashMap::new()
     };
+    // P0-8 backfill signal. `SCHEMA_V2` added `chunks.page_start`/`page_end`
+    // nullable and backfills nothing, so every file already in a live corpus
+    // keeps reporting no locator no matter how many times it is resumed —
+    // migrating the schema does NOT migrate the data. Reading which files are
+    // unanchored, fresh each run, turns that into an ordinary per-file upgrade
+    // (like the OCR-exhaustive and vision-tier rules below) instead of
+    // requiring a destructive `overwrite` re-index of the whole corpus.
+    let unanchored = if request.resume {
+        store.paths_without_page_anchors()?
+    } else {
+        HashSet::new()
+    };
     let mut records = walk(request.paths, &request.config);
     let current = records
         .iter()
@@ -160,6 +172,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
                         || (request.config.ocr == "exhaustive"
                             && record.ext == ".pdf"
                             && !method.starts_with("pdf-exhaustive"))
+                        || (page_anchorable_pdf_method(method) && unanchored.contains(&record.path))
                         || needs_vision_reprocess(
                             request.config.vision.max,
                             vision_modes
@@ -659,6 +672,35 @@ fn keep_old_on_error(
         && !incomplete_method(method)
 }
 
+/// Whether a stored `method` means "this file's text CAN be attributed to
+/// pages, so a corpus row with no page anchors is stale rather than simply
+/// unattributable".
+///
+/// Exactly the three PDF extraction paths that emit `Extracted::page_segments`
+/// (see `extract::pdf` and `extract::pdf_exhaustive`). Everything else is
+/// excluded on purpose, and the exclusions are what keep this rule from
+/// re-scheduling the same file every single run forever:
+///
+/// - every non-PDF method has no page structure to recover;
+/// - `pdf-ocr` — the merged text-layer + OCR branch — is page-agnostic BY
+///   DESIGN upstream (its stored text no longer lines up with the per-page
+///   split), so it will never produce anchors however often it is redone;
+/// - any `-partial` / `error:` variant is already scheduled by
+///   `incomplete_method`, and its extraction is empty, which is precisely the
+///   case that yields no page segments.
+///
+/// What is left terminates: these methods are recorded only for a non-empty
+/// extraction, a non-empty extraction always yields at least one page segment,
+/// and `embedding::chunk_spans` anchors every chunk it builds from page
+/// segments. So a file scheduled here comes back anchored and is not
+/// scheduled again.
+fn page_anchorable_pdf_method(method: &str) -> bool {
+    matches!(
+        method,
+        "pdf-text" | "pdf-exhaustive-text" | "pdf-exhaustive-ocr"
+    )
+}
+
 /// Whether the corpus-level `embed_model` marker may be advanced to the current
 /// model at the END of a run.
 ///
@@ -856,6 +898,58 @@ mod tests {
     fn nfc_leaves_precomposed_unchanged() {
         let precomposed = "tiếng Việt".to_string();
         assert_eq!(nfc(precomposed.clone()), precomposed);
+    }
+
+    /// The P0-8 page-backfill schedule rule. A live corpus indexed before
+    /// `chunks.page_start` existed reads back NULL for every chunk — the
+    /// migration adds columns, not data — so this predicate is what makes an
+    /// ordinary resume repair it. It must schedule the recoverable PDFs and,
+    /// just as importantly, must NOT schedule anything that can never come
+    /// back anchored, which would redo those files on every run forever.
+    mod page_backfill {
+        use super::super::page_anchorable_pdf_method;
+
+        #[test]
+        fn the_page_attributing_pdf_methods_are_schedulable() {
+            for method in ["pdf-text", "pdf-exhaustive-text", "pdf-exhaustive-ocr"] {
+                assert!(
+                    page_anchorable_pdf_method(method),
+                    "{method} emits page segments, so an unanchored row is stale"
+                );
+            }
+        }
+
+        #[test]
+        fn the_page_agnostic_pdf_method_is_never_rescheduled() {
+            // `extract::pdf`'s merged text-layer + OCR branch deliberately
+            // returns no page segments: its stored text no longer lines up
+            // with the per-page split. Redoing it would produce NULL anchors
+            // again, so scheduling it would loop on every resume.
+            assert!(!page_anchorable_pdf_method("pdf-ocr"));
+        }
+
+        #[test]
+        fn nothing_pageless_or_incomplete_is_rescheduled() {
+            for method in [
+                "text",
+                "ocr",
+                "doc",
+                "email",
+                "docx-ocr",
+                // Incomplete rows are already scheduled by `incomplete_method`,
+                // and their extraction is empty — the very case that yields no
+                // page segments.
+                "pdf-text-partial",
+                "pdf-exhaustive-text-partial",
+                "name-only",
+                "error:extract:pdf",
+            ] {
+                assert!(
+                    !page_anchorable_pdf_method(method),
+                    "{method} must not be scheduled for page backfill"
+                );
+            }
+        }
     }
 
     /// The keep-old-on-error truth table. The stored entry is the same shape
