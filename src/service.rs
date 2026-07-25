@@ -1537,8 +1537,17 @@ async fn corpus_search(
             // Embed under the lock, then drop it before the scan: the scan is
             // the long half, and holding the single embedder across it would
             // serialize every concurrent search on the wrong resource.
+            //
+            // A panic inside `embed_query` (never observed, but the ONNX call
+            // is not something this code controls) would otherwise poison the
+            // mutex and brick every later search behind an opaque 503 with no
+            // way back short of a restart — unlike a failed *load*, which
+            // explicitly re-arms. `embed_query` only reads the model to
+            // produce a `Result`, so the guarded data is not left structurally
+            // broken by a panic while holding it; recovering the guard keeps
+            // this failure mode self-healing like the rest of this surface.
             let query_vector = {
-                let mut guard = embedder.lock().expect("query embedder mutex");
+                let mut guard = embedder.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 guard.embed_query(&text)
             };
             let query_vector = match query_vector {
