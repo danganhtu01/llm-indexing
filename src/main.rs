@@ -79,6 +79,10 @@ struct IndexArgs {
     vision: Option<VisionMode>,
     #[arg(long)]
     resume: bool,
+    /// With `--resume`, also re-attempt rows that have already failed the maximum
+    /// number of times. OFF by default; see `IndexRequest::retry_errors`.
+    #[arg(long, requires = "resume")]
+    retry_errors: bool,
     // Per-job OCR quality overrides (feed the SAME settings merge as the HTTP
     // `ocr_opts`); language selection stays on the legacy `--ocr-langs` above.
     #[arg(long)]
@@ -204,6 +208,10 @@ struct RequestArgs {
     resume: bool,
     #[arg(long)]
     overwrite: bool,
+    /// Re-attempt rows that have already failed the maximum number of times.
+    /// OFF by default; see `IndexRequest::retry_errors`.
+    #[arg(long)]
+    retry_errors: bool,
 }
 
 #[derive(Args)]
@@ -325,6 +333,7 @@ fn index(args: IndexArgs) -> Result<()> {
         resume: args.resume,
         overwrite: false,
         artifacts: true,
+        retry_errors: args.retry_errors,
         include_paths: None,
         cancellation: None,
         runtime: None,
@@ -471,6 +480,7 @@ fn request(args: RequestArgs) -> Result<()> {
         workers: args.workers,
         resume: args.resume,
         overwrite: args.overwrite,
+        retry_errors: args.retry_errors,
         include_paths: None,
         vision: Some(args.vision.as_str().to_string()),
         ocr_opts: None,

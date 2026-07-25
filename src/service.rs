@@ -72,6 +72,14 @@ pub struct JobRequest {
     pub resume: bool,
     #[serde(default)]
     pub overwrite: bool,
+    /// Re-attempt rows that have already burned `MAX_ATTEMPTS` without
+    /// finishing. Default FALSE, and left that way except when the reason those
+    /// rows failed has been fixed outside the engine: a resume with this set
+    /// re-runs extraction, OCR and embedding over every file that has failed
+    /// everything so far — ~69% of the rows on the live corpus. It changes which
+    /// rows are attempted, never how one is processed.
+    #[serde(default)]
+    pub retry_errors: bool,
     #[serde(default)]
     pub include_paths: Option<Vec<String>>,
     /// Requested vision tier (`off`|`meta`|`tags`|`captions`); `None` means
@@ -898,6 +906,7 @@ fn run_job(
         resume: request.resume,
         overwrite,
         artifacts: false,
+        retry_errors: request.retry_errors,
         include_paths,
         cancellation: Some(cancellation),
         runtime: Some(runtime),
@@ -912,7 +921,7 @@ fn run_job(
     Ok(json!({
         "id":id,"status":"complete","output":request.output,"database":destination,"files":stats.files,
         "ocr_files":stats.ocr_files,"errors":stats.errors,"skipped":stats.skipped,
-        "incomplete":stats.incomplete,"embedded_chunks":stats.embedded_chunks,"removed":stats.removed,
+        "capped":stats.capped,"incomplete":stats.incomplete,"embedded_chunks":stats.embedded_chunks,"removed":stats.removed,
         "vision_files":stats.vision_files,"vision":config.vision.max.as_str(),
         "elapsed_seconds":stats.elapsed_seconds,"ocr_langs":config.ocr_langs,"completed_at":now()
     }))

@@ -33,13 +33,16 @@ frames every 30 seconds.
 An extraction method ending in `-partial`, beginning `error:`, or equal to
 `name-only` is counted as incomplete. Empty extraction is partial. Unsupported
 or failed content is therefore visible to the caller and is not treated as a
-complete searchable document.
+complete searchable document. A method beginning `excluded:` is the opposite: a
+decision not to process the file — an Office lock file, an extension no extractor
+in this build handles — so it is terminal and resume never revisits it.
 
 ## Retrieval schema
 
 ```sql
 files(id, path UNIQUE, drive, dir, name, ext, size, mtime,
-      lang, method, ocr_used, pages, chars, sha1, indexed_at)
+      lang, method, ocr_used, pages, chars, sha1, indexed_at,
+      attempts, last_attempt_at, elapsed_ms)
 fts USING fts5(name, path, content, tokens,
                tokenize="unicode61 remove_diacritics 2 tokenchars '_'")
 chunks(id, file_id, chunk_index, content, embedding BLOB, dimensions)
@@ -59,6 +62,13 @@ in-process scan, keeping the database portable and avoiding a second vector DB.
 
 Resume skips an unchanged path only when its size/mtime match, its extraction is
 complete, required exhaustive methods are present, and it has vector chunks.
+An unfinished row is also skipped once it has failed three times, since
+re-extracting a file this build cannot read costs the same on every resume and
+produces the same row. `files.attempts` counts those failures and
+`files.last_attempt_at`/`files.elapsed_ms` record when the last one ran and what
+it cost. Changed bytes, an available upgrade, a changed embedding model, a moved
+extraction-capability revision (`meta.extractor_revision`, derived from the
+extension tables) and an explicit `retry_errors` each reopen a capped row.
 An optional, validated `include_paths` set narrows extraction to an exact list
 selected by the caller; the full walk still drives deletion pruning.
 The writer replaces each changed file's FTS row and chunks atomically. At the end
@@ -67,7 +77,7 @@ all three tables — except when the walk found nothing at all, which is far mor
 often an unmounted or mistyped root than a tree whose every file was deleted,
 and pruning is no longer reversible now that it lands in the published corpus.
 Rebuilding from empty is what `overwrite` is for. Job metrics expose files, OCR files, errors, incomplete files,
-embedded chunks, removed files and elapsed time. A cooperative cancellation flag
+embedded chunks, removed files, capped files and elapsed time. A cooperative cancellation flag
 is checked around extraction and embedding; a cancelled job commits what it
 finished and leaves it in the destination corpus, so resubmitting with `resume`
 continues from there.

@@ -12,17 +12,34 @@ use sha1::{Digest, Sha1};
 
 use crate::config::{Config, MAX_WORKERS};
 use crate::embedding::Embedder;
-use crate::extract::extract;
+use crate::extract::{extract, extractor_revision};
 use crate::media::Transcriber;
 use crate::model::{FileRec, IndexStats, ProcessedFile};
 use crate::normalize::Normalizer;
 use crate::ocr::TesseractOcr;
 use crate::runtime::{Admission, EmbedderPool, RuntimeKnobs, EMBED_RANGE};
-use crate::store::{analyze, connect, database_path, remove_database, IndexStore};
+use crate::store::{analyze, connect, database_path, remove_database, ExistingRow, IndexStore};
 use crate::vision::{
     is_video_ext, is_vision_ext, needs_vision_reprocess, VisionAnalyzer, VisionMode, VisionResult,
 };
 use crate::walker::walk;
+
+/// How many times a row that will not finish may be re-attempted before resume
+/// leaves it alone.
+///
+/// Resume selects work by "is this row unfinished", which is true forever for a
+/// file this build cannot read: on the live corpus that is ~181k of 263k rows
+/// re-extracted, re-OCR'd and re-embedded on EVERY resume, producing the same
+/// `error:`/`-partial` row each time. Three is enough to ride out the failures
+/// that are actually transient — a locked file, a subprocess that died under
+/// memory pressure, an embedder that flaked — and small enough that a genuinely
+/// unreadable file stops costing anything after the first run of a resume series.
+///
+/// The cap is the LAST thing consulted (see [`needs_reprocess`]): a changed file,
+/// an available upgrade, a changed embedding model, a moved
+/// [`crate::extract::extractor_revision`] and `retry_errors` all reprocess a row
+/// no matter how many attempts it has burned.
+pub const MAX_ATTEMPTS: u32 = 3;
 
 pub struct IndexRequest<'a> {
     pub paths: &'a [PathBuf],
@@ -36,6 +53,17 @@ pub struct IndexRequest<'a> {
     /// there.
     pub overwrite: bool,
     pub artifacts: bool,
+    /// Re-attempt rows that have already burned [`MAX_ATTEMPTS`] without
+    /// finishing. OFF by default: on the live corpus this is the difference
+    /// between a resume that walks the unfinished ~69% of the rows and one that
+    /// walks what is actually new, and turning it on re-runs extraction, OCR and
+    /// embedding over every file that has failed everything so far. It changes
+    /// only WHICH rows are attempted — a file processed under it is processed
+    /// identically. Set it when the reason for the failures has been fixed
+    /// outside the engine (a mounted drive, an installed dependency, repaired
+    /// files); a fix INSIDE the engine moves `extractor_revision` and re-opens
+    /// them without this.
+    pub retry_errors: bool,
     pub include_paths: Option<HashSet<String>>,
     pub cancellation: Option<Arc<AtomicBool>>,
     /// Live stage settings for this run, shared with whoever may retune it
@@ -97,6 +125,26 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
             request.config.embedding_model
         );
     }
+    // The extraction-capability gate, the attempt cap's counterpart to the
+    // embedding-model gate above. A row capped after failing three times was
+    // capped on the verdict of the build that failed it; a build that has since
+    // learned the format (a decoder added, a dispatch arm added, a release that
+    // reworked an extractor) must be allowed to try it, or every `.heic` on the
+    // drive stays frozen on the answer of the code that had no decoder for it.
+    // Unlike `embed_model_changed` this does not force a re-process of anything
+    // — it only stops the cap from suppressing rows the normal predicate already
+    // wants. A corpus predating the marker (`None`) is left alone and gains it at
+    // the end of the run.
+    let extractor_changed = request.resume
+        && store
+            .get_meta("extractor_revision")?
+            .is_some_and(|recorded| recorded != extractor_revision());
+    if extractor_changed {
+        eprintln!(
+            "extraction capability changed to {} — unfinished rows get another attempt",
+            extractor_revision()
+        );
+    }
     // The `embed_model` marker itself is written at the END of the run, not
     // here — see `may_record_embed_model` at the tail. Advancing it before a
     // single file has been reprocessed permanently CLOSES this gate: a file
@@ -137,27 +185,39 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         records.retain(|record| include_paths.contains(&record.path));
     }
     let before = records.len();
+    // Rows the cap held back — counted here because it is the only place that
+    // knows the difference between "skipped, it is finished" and "skipped, it has
+    // failed too often to keep paying for".
+    let mut capped = 0_usize;
     if request.resume && !embed_model_changed {
+        // A single un-capped retry for the whole run: `retry_errors` is the
+        // operator asking, `extractor_changed` is the build having something new
+        // to offer. Neither selects a row on its own.
+        let uncapped = request.retry_errors || extractor_changed;
         records.retain(|record| {
-            existing
-                .get(&record.path)
-                .map(|(size, mtime, method, has_chunks)| {
-                    *size != record.size
-                        || *mtime != record.mtime as i64
-                        || !*has_chunks
-                        || incomplete_method(method)
-                        || (request.config.ocr == "exhaustive"
-                            && record.ext == ".pdf"
-                            && !method.starts_with("pdf-exhaustive"))
-                        || needs_vision_reprocess(
-                            request.config.vision.max,
-                            vision_modes
-                                .get(&record.path)
-                                .and_then(|mode| mode.parse().ok()),
-                            &record.ext,
-                        )
-                })
-                .unwrap_or(true)
+            let Some(row) = existing.get(&record.path) else {
+                return true;
+            };
+            // Pure upgrades: the stored row is intact, a better one is now
+            // available. Never subject to the cap — an exhaustive-OCR or
+            // higher-vision pass is a different piece of work from the one the
+            // attempts were spent on.
+            let upgrade = (request.config.ocr == "exhaustive"
+                && record.ext == ".pdf"
+                && !row.method.starts_with("pdf-exhaustive"))
+                || needs_vision_reprocess(
+                    request.config.vision.max,
+                    vision_modes
+                        .get(&record.path)
+                        .and_then(|mode| mode.parse().ok()),
+                    &record.ext,
+                );
+            let selected =
+                needs_reprocess(row, record.size, record.mtime as i64, upgrade, uncapped);
+            if !selected && !row_complete(&row.method, row.has_chunks) {
+                capped += 1;
+            }
+            selected
         });
     }
     let skipped = before - records.len();
@@ -195,6 +255,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     let progress = request.progress.clone();
     let mut stats = IndexStats {
         skipped,
+        capped,
         ..Default::default()
     };
     // Old rows KEPT by keep-on-failure — the file's reprocess errored but the
@@ -344,6 +405,10 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
                     file.rec.path, file.method
                 );
                 kept_complete_rows += 1;
+                // The row's content is deliberately untouched, so the attempt
+                // columns are the only record that this run spent the file's
+                // extraction and embedding cost again and threw the result away.
+                store.record_failed_attempt(&file.rec.path, file.elapsed_ms, now())?;
                 continue;
             }
             store.add(&file, now())?;
@@ -378,6 +443,15 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     } else {
         Ok(())
     };
+    // Same gate, same reason as `last_job_finished_at`: only a run that walked
+    // everything has given every capped row the extra attempt this build's
+    // capability change entitles it to. Advancing it after a cancelled run would
+    // spend the entitlement on the files the run happened to reach first.
+    let revised = if matches!(&outcome, Ok(false)) {
+        store.set_meta("extractor_revision", &extractor_revision())
+    } else {
+        Ok(())
+    };
     // Advance the corpus `embed_model` marker only now, and only when it is safe
     // to CLOSE the upgrade gate — see `may_record_embed_model`. Writing it up
     // front (as an earlier version did) closed the gate the instant the run
@@ -407,6 +481,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     committed?;
     stats.removed = pruned?;
     stamped?;
+    revised?;
     recorded?;
     if cancelled {
         anyhow::bail!("indexing cancelled; {} file(s) committed", stats.files)
@@ -467,12 +542,19 @@ fn embed_worker(
                 // Cancelled while parked for an instance.
                 Ok(None) => return,
                 Ok(Some(mut embedder)) => {
+                    let started = Instant::now();
                     let embedded = embedder.embed_document(&file.content);
                     // Explicitly BEFORE the send below: a worker blocked on
                     // backpressure must not hold a pooled instance, or shrinking
                     // the pool cannot reclaim it and other workers park behind a
                     // model nobody is using.
                     drop(embedder);
+                    // Counted on both branches: an inference that failed cost the
+                    // same as one that succeeded, and it is the failures whose
+                    // price this column exists to expose.
+                    file.elapsed_ms = file
+                        .elapsed_ms
+                        .saturating_add(started.elapsed().as_millis() as u64);
                     match embedded {
                         Ok(chunks) => {
                             file.chunks = chunks;
@@ -517,6 +599,10 @@ fn process(
     analyzer: &VisionAnalyzer,
 ) -> ProcessedFile {
     let path = Path::new(&record.path);
+    // Extraction, OCR and vision, i.e. everything this stage can burn on a file
+    // that ends up producing an error row. The embed stage adds its own share to
+    // the same counter before the row is written.
+    let started = Instant::now();
     match extract(path, &record.ext, record.size, config, ocr, transcriber) {
         Ok(extracted) => {
             let empty = extracted.text.trim().is_empty();
@@ -556,6 +642,7 @@ fn process(
                 sha1: hash,
                 chunks: Vec::new(),
                 vision,
+                elapsed_ms: started.elapsed().as_millis() as u64,
             }
         }
         Err(error) => ProcessedFile {
@@ -568,6 +655,7 @@ fn process(
             sha1: None,
             chunks: Vec::new(),
             vision: None,
+            elapsed_ms: started.elapsed().as_millis() as u64,
             rec: record,
         },
     }
@@ -597,6 +685,46 @@ fn incomplete_method(method: &str) -> bool {
     method == "name-only" || method.starts_with("error:") || method.ends_with("-partial")
 }
 
+/// Whether a stored row is FINISHED — there is no further attempt that would
+/// improve it, so resume must leave it alone.
+///
+/// Chunk presence is the completeness signal for everything that has content to
+/// embed, which is why a chunkless row is normally redone: it is a file whose
+/// vectors never landed. `excluded:` is the exception, and it is the whole reason
+/// this is a function rather than the inline `!has_chunks || incomplete_method`
+/// it replaced. An excluded row is a DECISION not to process the file — an Office
+/// lock file, an extension no extractor in this build handles — so it has no
+/// chunks by design and always will not, and the chunkless test alone put every
+/// one of them back in the queue on every single resume. Terminal means terminal.
+pub(crate) fn row_complete(method: &str, has_chunks: bool) -> bool {
+    method.starts_with("excluded:") || (has_chunks && !incomplete_method(method))
+}
+
+/// The resume skip predicate: whether this run must process `row`'s file again.
+///
+/// Four reasons, in the order they are trusted. The file's own bytes changed, so
+/// the row describes something that no longer exists. An upgrade is available
+/// that the row predates. The row never finished — and that last one, the only
+/// one that can repeat forever, is the one the attempt cap governs.
+///
+/// `uncapped` is the run-wide override (`retry_errors`, or a moved extractor
+/// revision); it lifts the cap but selects nothing on its own, so a finished row
+/// stays finished under it. The embedding-model change is not here because it
+/// bypasses this predicate entirely — nothing in the corpus is trustworthy after
+/// it, so the whole walk is reprocessed.
+fn needs_reprocess(
+    row: &ExistingRow,
+    size: u64,
+    mtime: i64,
+    upgrade: bool,
+    uncapped: bool,
+) -> bool {
+    row.size != size
+        || row.mtime != mtime
+        || upgrade
+        || (!row_complete(&row.method, row.has_chunks) && (uncapped || row.attempts < MAX_ATTEMPTS))
+}
+
 /// Whether an incoming `error:` row must be DROPPED to keep a still-valid stored
 /// row instead of replacing it.
 ///
@@ -620,16 +748,16 @@ fn keep_old_on_error(
     new_method: &str,
     new_size: u64,
     new_mtime: i64,
-    existing: Option<&(u64, i64, String, bool)>,
+    existing: Option<&ExistingRow>,
 ) -> bool {
-    let Some((size, mtime, method, has_chunks)) = existing else {
+    let Some(row) = existing else {
         return false;
     };
     new_method.starts_with("error:")
-        && *size == new_size
-        && *mtime == new_mtime
-        && *has_chunks
-        && !incomplete_method(method)
+        && row.size == new_size
+        && row.mtime == new_mtime
+        && row.has_chunks
+        && !incomplete_method(&row.method)
 }
 
 /// Whether the corpus-level `embed_model` marker may be advanced to the current
@@ -770,6 +898,7 @@ mod tests {
             sha1: None,
             chunks: Vec::new(),
             vision: None,
+            elapsed_ms: 0,
         }
     }
 
@@ -817,6 +946,18 @@ mod tests {
         );
     }
 
+    /// A stored row for the 12-byte file at mtime 100 that every predicate test
+    /// below compares against.
+    fn stored(method: &str, has_chunks: bool, attempts: u32) -> ExistingRow {
+        ExistingRow {
+            size: 12,
+            mtime: 100,
+            method: method.to_string(),
+            has_chunks,
+            attempts,
+        }
+    }
+
     #[test]
     fn nfc_precomposes_decomposed_vietnamese() {
         // "tiếng Việt" typed with combining marks, as OCR would emit it.
@@ -830,14 +971,15 @@ mod tests {
         assert_eq!(nfc(precomposed.clone()), precomposed);
     }
 
-    /// The keep-old-on-error truth table. The stored entry is the same shape
-    /// `store.existing_keys()` yields — `(size, mtime, method, has_chunks)`.
+    /// The keep-old-on-error truth table, over the same [`ExistingRow`]
+    /// `store.existing_keys()` yields.
     mod keep_old {
         use super::super::keep_old_on_error;
+        use super::stored;
 
         /// A COMPLETE stored row for a 12-byte file at mtime 100.
-        fn complete() -> (u64, i64, String, bool) {
-            (12, 100, "text".to_string(), true)
+        fn complete() -> crate::store::ExistingRow {
+            stored("text", true, 0)
         }
 
         #[test]
@@ -875,18 +1017,13 @@ mod tests {
                 "error:extract:pdf",
                 12,
                 100,
-                Some(&(12, 100, "text".to_string(), false))
+                Some(&stored("text", false, 0))
             ));
             // A complete-looking method but still incomplete by `incomplete_method`
             // (partial / name-only / a prior error) never counts as worth keeping.
             for method in ["text-partial", "name-only", "error:extract:zip"] {
                 assert!(
-                    !keep_old_on_error(
-                        "error:embed:oom",
-                        12,
-                        100,
-                        Some(&(12, 100, method.to_string(), true))
-                    ),
+                    !keep_old_on_error("error:embed:oom", 12, 100, Some(&stored(method, true, 0))),
                     "incomplete stored method {method:?} must be replaceable"
                 );
             }
@@ -910,6 +1047,133 @@ mod tests {
             // No stored row at this path (a genuinely new file): an error is just
             // recorded, there being no old row to preserve.
             assert!(!keep_old_on_error("error:extract:pdf", 12, 100, None));
+        }
+    }
+
+    /// Which rows a resume selects, and — the point of the cap — which it finally
+    /// stops selecting. The stored row is the 12-byte file at mtime 100 that
+    /// `stored` builds; a resume that sees the same 12/100 on disk is the
+    /// unchanged case.
+    mod attempt_cap {
+        use super::super::{needs_reprocess, row_complete, MAX_ATTEMPTS};
+        use super::stored;
+
+        /// The unchanged, no-upgrade, cap-in-force resume — the loop this
+        /// workstream exists to terminate.
+        fn resumed(method: &str, has_chunks: bool, attempts: u32) -> bool {
+            needs_reprocess(&stored(method, has_chunks, attempts), 12, 100, false, false)
+        }
+
+        #[test]
+        fn an_unfinished_row_is_retried_until_it_hits_the_cap() {
+            for attempts in 0..MAX_ATTEMPTS {
+                assert!(
+                    resumed("error:extract:pdf", false, attempts),
+                    "attempt {attempts} of {MAX_ATTEMPTS} must still be tried"
+                );
+            }
+            assert!(
+                !resumed("error:extract:pdf", false, MAX_ATTEMPTS),
+                "a row that has failed {MAX_ATTEMPTS} times is left alone"
+            );
+            // And it stays left alone; nothing counts back down.
+            assert!(!resumed("error:extract:pdf", false, MAX_ATTEMPTS + 9));
+        }
+
+        #[test]
+        fn every_unfinished_shape_is_capped_the_same_way() {
+            // The live corpus's whole re-attempted population: extraction errors,
+            // embed errors, the `-partial` rows a `.heic` or an empty PDF leaves,
+            // and rows whose chunks never landed.
+            for (method, has_chunks) in [
+                ("error:extract:pdf", false),
+                ("error:embed:oom", false),
+                ("name-only-partial", false),
+                ("pdf-partial", false),
+                ("text", false),
+            ] {
+                assert!(resumed(method, has_chunks, 0), "{method} at 0 attempts");
+                assert!(
+                    !resumed(method, has_chunks, MAX_ATTEMPTS),
+                    "{method} must be capped like every other unfinished row"
+                );
+            }
+        }
+
+        #[test]
+        fn a_changed_file_is_reprocessed_however_many_attempts_it_has_burned() {
+            let burned = stored("error:extract:pdf", false, MAX_ATTEMPTS + 5);
+            // Size changed …
+            assert!(needs_reprocess(&burned, 13, 100, false, false));
+            // … or mtime changed. Either way these are different bytes, and the
+            // attempts were spent on the ones they replaced.
+            assert!(needs_reprocess(&burned, 12, 101, false, false));
+        }
+
+        #[test]
+        fn an_available_upgrade_is_never_capped() {
+            // Exhaustive OCR over a PDF that was read the cheap way, or a higher
+            // vision tier: a different piece of work from the one that failed, so
+            // the failures do not pay for it.
+            assert!(needs_reprocess(
+                &stored("error:extract:pdf", false, MAX_ATTEMPTS + 5),
+                12,
+                100,
+                true,
+                false
+            ));
+        }
+
+        #[test]
+        fn the_uncapped_override_reopens_burned_rows_but_selects_nothing_else() {
+            // `retry_errors`, or an extractor revision that moved.
+            assert!(needs_reprocess(
+                &stored("error:extract:pdf", false, MAX_ATTEMPTS + 5),
+                12,
+                100,
+                false,
+                true
+            ));
+            // A finished row stays finished: the override lifts the cap, it does
+            // not re-index the corpus.
+            assert!(!needs_reprocess(
+                &stored("text", true, 0),
+                12,
+                100,
+                false,
+                true
+            ));
+        }
+
+        #[test]
+        fn a_finished_row_is_never_reprocessed() {
+            for attempts in [0, MAX_ATTEMPTS, MAX_ATTEMPTS + 5] {
+                assert!(!resumed("text", true, attempts), "attempts={attempts}");
+            }
+        }
+
+        #[test]
+        fn an_excluded_row_is_terminal_despite_having_no_chunks() {
+            // The defect this pins: `excluded:` means "deliberately not processed",
+            // so the row has no chunks and never will — and the bare chunkless test
+            // it replaced put every Office lock file and every unsupported
+            // extension back in the queue on every single resume, forever, without
+            // even spending an attempt to get there.
+            for method in ["excluded:office-lock", "excluded:unsupported"] {
+                assert!(
+                    row_complete(method, false),
+                    "{method} must read as finished"
+                );
+                assert!(!resumed(method, false, 0), "{method} at zero attempts");
+            }
+        }
+
+        #[test]
+        fn completeness_needs_both_a_finished_method_and_its_chunks() {
+            assert!(row_complete("text", true));
+            assert!(!row_complete("text", false), "vectors never landed");
+            assert!(!row_complete("error:extract:pdf", true));
+            assert!(!row_complete("name-only-partial", true));
         }
     }
 

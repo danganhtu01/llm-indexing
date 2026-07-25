@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::model::{ProcessedFile, SearchHit};
 use crate::normalize::{fold, words, Normalizer};
+use crate::pipeline::{row_complete, MAX_ATTEMPTS};
 use crate::vision::VisionResult;
 
 const SCHEMA: &str = r#"
@@ -29,7 +30,10 @@ CREATE TABLE IF NOT EXISTS files(
   pages INTEGER,
   chars INTEGER,
   sha1 TEXT,
-  indexed_at REAL
+  indexed_at REAL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at REAL,
+  elapsed_ms INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_files_dir ON files(dir);
 CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext);
@@ -64,6 +68,23 @@ CREATE TABLE IF NOT EXISTS vision(
 CREATE INDEX IF NOT EXISTS idx_vision_phash ON vision(phash);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
+
+/// Columns added to `files` after the corpus format's first release, in the order
+/// they must be applied.
+///
+/// [`SCHEMA`] is all `IF NOT EXISTS`, which is why new TABLES appear on a live
+/// corpus by themselves — but it never touches a `files` table that already
+/// exists, so a corpus keeps whatever column set it was created with. Every
+/// column added since therefore has to be re-added here, per corpus, at open.
+/// Kept as data rather than a script so the check is `PRAGMA table_info` and the
+/// migration is a no-op on a corpus that already has them: re-running is free,
+/// and a corpus written by a NEWER build than the one opening it keeps its extra
+/// columns untouched.
+const ADDED_FILE_COLUMNS: &[(&str, &str)] = &[
+    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_attempt_at", "REAL"),
+    ("elapsed_ms", "INTEGER"),
+];
 
 /// How long a WRITER waits for a lock before giving up. An indexing job now
 /// writes into the same file readers open, and a batch commit holds an exclusive
@@ -135,6 +156,100 @@ pub fn remove_database(out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Bring an existing `files` table up to the current column set.
+///
+/// Runs on every open, straight after [`SCHEMA`], and is a no-op once the columns
+/// are there — `ALTER TABLE ADD COLUMN` is a schema-only edit in SQLite, so on a
+/// corpus with hundreds of thousands of rows the columns themselves cost nothing
+/// and existing rows simply read back the declared default.
+///
+/// The one-off cost is the backfill, and it runs EXACTLY when the `attempts`
+/// column is first created — the column's own absence is the "this corpus has
+/// never been counted" evidence, so no separate marker can drift from it. All of
+/// it lands in one transaction: an ALTER that committed without its backfill
+/// would look counted while claiming every unfinished row had never been tried,
+/// and the whole corpus would be re-attempted [`MAX_ATTEMPTS`] more times before
+/// converging.
+///
+/// See [`attempts_backfill`] for what the stamped value means.
+fn migrate_files_table(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(files)")?;
+    let present = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .flatten()
+        .collect::<HashSet<_>>();
+    drop(statement);
+    let missing = ADDED_FILE_COLUMNS
+        .iter()
+        .filter(|(name, _)| !present.contains(*name))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut script = String::from("BEGIN IMMEDIATE;\n");
+    for (name, declaration) in &missing {
+        script.push_str(&format!(
+            "ALTER TABLE files ADD COLUMN {name} {declaration};\n"
+        ));
+    }
+    if missing.iter().any(|(name, _)| *name == "attempts") {
+        script.push_str(&attempts_backfill());
+    }
+    script.push_str("COMMIT;");
+    connection
+        .execute_batch(&script)
+        .context("migrating the files table")?;
+    Ok(())
+}
+
+/// What a corpus that predates the attempt counter is stamped with.
+///
+/// Every row it matches is one the resume predicate would re-process — the
+/// unfinished ones — and every one of them is the durable record of at least one
+/// completed attempt, timestamped by `indexed_at`. On the live corpora these rows
+/// have been re-attempted on every resume for as long as the corpus has existed;
+/// starting them at zero would assert the opposite and mandate
+/// [`MAX_ATTEMPTS`] more full passes over exactly the files that have never once
+/// succeeded. They are stamped as spent instead, so the first resume after this
+/// migration converges rather than re-burning them.
+///
+/// Nothing is closed off by that. A row re-opens when its file changes (size or
+/// mtime), when an upgrade makes a better extraction available (exhaustive OCR, a
+/// higher vision tier), when the embedding model changes, when
+/// [`crate::extract::extractor_revision`] moves because the build learned a new
+/// format, or when a run is submitted with `retry_errors`.
+///
+/// `excluded:` rows are left alone: they are terminal by decision, not by
+/// exhaustion, and stamping them as burned attempts would misreport why they were
+/// never processed.
+fn attempts_backfill() -> String {
+    format!(
+        "UPDATE files \
+            SET attempts = {MAX_ATTEMPTS}, last_attempt_at = indexed_at \
+          WHERE method NOT LIKE 'excluded:%' \
+            AND (method = 'name-only' \
+                 OR method LIKE 'error:%' \
+                 OR method LIKE '%-partial' \
+                 OR NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = files.id));"
+    )
+}
+
+/// One stored row as resume sees it: everything the skip predicate compares,
+/// nothing else. Returned by [`IndexStore::existing_keys`] keyed by path.
+#[derive(Debug, Clone)]
+pub struct ExistingRow {
+    pub size: u64,
+    /// Truncated to whole seconds (`mtime as i64`), the comparison every caller
+    /// makes; the column itself is a float.
+    pub mtime: i64,
+    pub method: String,
+    pub has_chunks: bool,
+    /// Attempts that have ended without finishing this row. Reset to 0 by a
+    /// finished outcome and by a change to the file's bytes, so it counts
+    /// CONSECUTIVE failures on the file as it stands rather than lifetime ones.
+    pub attempts: u32,
+}
+
 pub struct IndexStore {
     out: PathBuf,
     connection: Connection,
@@ -184,6 +299,9 @@ impl IndexStore {
         connection
             .execute_batch(SCHEMA)
             .context("creating SQLite FTS5 schema")?;
+        // Only ever a no-op for a corpus this build created; the live ones were
+        // created by builds whose `files` table stops at `indexed_at`.
+        migrate_files_table(&connection)?;
         // Self-description (previously the corpus was anonymous — after a
         // restart nothing recorded what produced it): created_at once, plus
         // per-job values the pipeline stamps via `set_meta`. `IF NOT EXISTS`
@@ -244,28 +362,27 @@ impl IndexStore {
         })
     }
 
-    pub fn existing_keys(&self) -> Result<HashMap<String, (u64, i64, String, bool)>> {
+    pub fn existing_keys(&self) -> Result<HashMap<String, ExistingRow>> {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT f.path,f.size,f.mtime,f.method,EXISTS(SELECT 1 FROM chunks c WHERE c.file_id=f.id) \
+                "SELECT f.path,f.size,f.mtime,f.method,EXISTS(SELECT 1 FROM chunks c WHERE c.file_id=f.id),\
+                 f.attempts \
                  FROM files f",
             )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)? as u64,
-                row.get::<_, f64>(2)? as i64,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)? != 0,
+                ExistingRow {
+                    size: row.get::<_, i64>(1)? as u64,
+                    mtime: row.get::<_, f64>(2)? as i64,
+                    method: row.get::<_, String>(3)?,
+                    has_chunks: row.get::<_, i64>(4)? != 0,
+                    attempts: row.get::<_, i64>(5)?.clamp(0, i64::from(u32::MAX)) as u32,
+                },
             ))
         })?;
-        Ok(rows
-            .flatten()
-            .map(|(path, size, mtime, method, has_chunks)| {
-                (path, (size, mtime, method, has_chunks))
-            })
-            .collect())
+        Ok(rows.flatten().collect())
     }
 
     /// The highest vision tier recorded per file path, for the resume
@@ -376,6 +493,25 @@ impl IndexStore {
         Ok(())
     }
 
+    /// Count an attempt that produced nothing to store.
+    ///
+    /// The keep-on-failure path drops its result entirely to preserve a still
+    /// valid stored row, so without this the work it burned leaves no trace at
+    /// all: the row's `indexed_at` still points at the successful run that wrote
+    /// it, and a file whose upgrade fails on every resume looks, from the corpus,
+    /// like a file nobody has touched since it succeeded. Only the attempt
+    /// columns move; the row's content and `indexed_at` describe what is stored
+    /// and must keep describing it.
+    ///
+    /// Rides the store's open transaction like every other write here.
+    pub fn record_failed_attempt(&mut self, path: &str, elapsed_ms: u64, at: f64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE files SET attempts=attempts+1,last_attempt_at=?2,elapsed_ms=?3 WHERE path=?1",
+            params![path, at, elapsed_ms as i64],
+        )?;
+        Ok(())
+    }
+
     /// Every database row one file contributes, run inside the caller's
     /// savepoint so the set lands whole or not at all.
     fn write_rows(&mut self, file: &ProcessedFile, indexed_at: f64) -> Result<()> {
@@ -390,18 +526,36 @@ impl IndexStore {
         let old = self
             .connection
             .query_row(
-                "SELECT id,size,mtime FROM files WHERE path=?1",
+                "SELECT id,size,mtime,attempts FROM files WHERE path=?1",
                 [&file.rec.path],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, f64>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )
             .ok();
-        let old_id = old.map(|(id, _, _)| id);
+        let old_id = old.map(|(id, _, _, _)| id);
+        // Byte-for-byte identical to the stored row, by the same truncated-mtime
+        // comparison resume uses. Needed twice below: the attempt counter and the
+        // vision carry-forward both key on it.
+        let unchanged = old.is_some_and(|(_, size, mtime, _)| {
+            size == file.rec.size as i64 && mtime as i64 == file.rec.mtime as i64
+        });
+        // A CHANGED file is a different file, whatever the path says, so it opens
+        // with a full budget rather than inheriting the failures of the bytes it
+        // replaced.
+        let attempts = if row_complete(&file.method, !file.chunks.is_empty()) {
+            0
+        } else if unchanged {
+            old.map_or(0, |(_, _, _, attempts)| attempts)
+                .saturating_add(1)
+        } else {
+            1
+        };
         // Capture the old vision row BEFORE the INSERT OR REPLACE below: the
         // bundled SQLite runs with foreign_keys ON, so replacing the files row
         // cascade-deletes its vision row. A carry-forward therefore has to
@@ -428,11 +582,12 @@ impl IndexStore {
                 .execute("DELETE FROM fts WHERE rowid=?1", [old_id])?;
         }
         self.connection.execute(
-            "INSERT OR REPLACE INTO files(path,drive,dir,name,ext,size,mtime,lang,method,ocr_used,pages,chars,sha1,indexed_at) \
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            "INSERT OR REPLACE INTO files(path,drive,dir,name,ext,size,mtime,lang,method,ocr_used,pages,chars,sha1,indexed_at,attempts,last_attempt_at,elapsed_ms) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![file.rec.path, file.rec.drive, file.rec.dir, file.rec.name, file.rec.ext,
                 file.rec.size as i64, file.rec.mtime, file.lang, file.method, file.ocr_used as i64,
-                file.pages as i64, file.content.chars().count() as i64, file.sha1, indexed_at])?;
+                file.pages as i64, file.content.chars().count() as i64, file.sha1, indexed_at,
+                attempts, indexed_at, file.elapsed_ms as i64])?;
         let id = self.connection.last_insert_rowid();
         self.connection.execute(
             "INSERT INTO fts(rowid,name,path,content,tokens) VALUES(?1,?2,?3,?4,?5)",
@@ -474,9 +629,6 @@ impl IndexStore {
                 // survive under the stale id, so clear it before re-attaching.
                 self.connection
                     .execute("DELETE FROM vision WHERE file_id=?1", [old_id])?;
-                let unchanged = old.is_some_and(|(_, size, mtime)| {
-                    size == file.rec.size as i64 && mtime as i64 == file.rec.mtime as i64
-                });
                 if let (true, Some(values)) = (unchanged, carried_vision) {
                     let mut row: Vec<rusqlite::types::Value> = Vec::with_capacity(16);
                     row.push(rusqlite::types::Value::Integer(id));
@@ -524,10 +676,15 @@ impl IndexStore {
                 &file.content.chars().count().to_string(),
             ])?;
         }
+        // `excluded:` rows carry the name+dir fallback as content, same as
+        // `name-only`, and nothing was extracted from the file itself — a sidecar
+        // for one would be a `.txt` restating the filename next to every object
+        // file on the drive.
         if self.sidecar != "none"
             && !file.content.trim().is_empty()
             && !matches!(file.method.as_str(), "text" | "name-only")
             && !file.method.starts_with("error:")
+            && !file.method.starts_with("excluded:")
         {
             self.write_sidecar(file);
         }
@@ -815,6 +972,7 @@ mod tests {
             sha1: None,
             chunks: Vec::new(),
             vision: None,
+            elapsed_ms: 0,
         }
     }
 
@@ -1013,12 +1171,23 @@ mod tests {
 
         let store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
         let existing = store.existing_keys().unwrap();
-        let (_, _, method, has_chunks) = existing.get("/a/done.txt").unwrap();
-        assert_eq!(method, "text");
-        assert!(has_chunks, "a completed file is not redone on resume");
-        let (_, _, method, has_chunks) = existing.get("/a/broken.pdf").unwrap();
-        assert_eq!(method, "error:poppler");
-        assert!(!has_chunks, "an unfinished file must be visible as such");
+        let done = existing.get("/a/done.txt").unwrap();
+        assert_eq!(done.method, "text");
+        assert!(done.has_chunks, "a completed file is not redone on resume");
+        assert_eq!(
+            done.attempts, 0,
+            "a finished row carries no failed attempts"
+        );
+        let broken = existing.get("/a/broken.pdf").unwrap();
+        assert_eq!(broken.method, "error:poppler");
+        assert!(
+            !broken.has_chunks,
+            "an unfinished file must be visible as such"
+        );
+        assert_eq!(
+            broken.attempts, 1,
+            "the failure that wrote it counts as one"
+        );
     }
 
     #[test]
@@ -1133,5 +1302,284 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "vision row carried forward on unchanged bytes");
         assert_eq!(phash, "aaaaaaaaaaaaaaaa");
+    }
+
+    /// The `files` table exactly as every corpus on disk was created: no attempt
+    /// columns, because the release that wrote them had none. Written out in full
+    /// rather than derived from [`SCHEMA`] — the whole point of the migration is
+    /// the gap between the two, and a fixture that tracks the current schema
+    /// would close that gap silently.
+    const LEGACY_SCHEMA: &str = "\
+CREATE TABLE files(
+  id INTEGER PRIMARY KEY, path TEXT UNIQUE, drive TEXT, dir TEXT, name TEXT, ext TEXT,
+  size INTEGER, mtime REAL, lang TEXT, method TEXT, ocr_used INTEGER, pages INTEGER,
+  chars INTEGER, sha1 TEXT, indexed_at REAL
+);
+CREATE TABLE chunks(
+  id INTEGER PRIMARY KEY,
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL, content TEXT NOT NULL, embedding BLOB NOT NULL,
+  dimensions INTEGER NOT NULL, model TEXT NOT NULL, UNIQUE(file_id, chunk_index)
+);
+";
+
+    /// A pre-migration corpus holding one row of every shape the live corpora
+    /// hold: a finished file with its chunk, the three unfinished shapes that are
+    /// re-attempted on every resume, and a terminal `excluded:` row.
+    fn legacy_corpus(destination: &Path) {
+        let connection = Connection::open(destination).unwrap();
+        connection.execute_batch(LEGACY_SCHEMA).unwrap();
+        for (id, path, method) in [
+            (1, "/a/done.txt", "text"),
+            (2, "/a/broken.pdf", "error:poppler"),
+            (3, "/a/photo.heic", "name-only-partial"),
+            (4, "/a/build.o", "name-only"),
+            (5, "/a/~$memo.docx", "excluded:office-lock"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO files(id,path,method,size,mtime,indexed_at) \
+                     VALUES(?1,?2,?3,10,0.0,1700.0)",
+                    params![id, path, method],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model) \
+                 VALUES(1,0,'text',X'00',2,'m')",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn attempt_columns(destination: &Path) -> Vec<(String, i64, Option<f64>)> {
+        let connection = connect(destination).unwrap();
+        let mut statement = connection
+            .prepare("SELECT path,attempts,last_attempt_at FROM files ORDER BY id")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows
+    }
+
+    #[test]
+    fn opening_a_legacy_corpus_adds_the_attempt_columns_and_stamps_the_unfinished_rows() {
+        // The migration a live corpus gets on its first open by this build. The
+        // unfinished rows — the ~69% re-attempted on every resume — are stamped as
+        // spent, so the resume right after the deploy converges instead of
+        // re-burning them MAX_ATTEMPTS more times. Finished and `excluded:` rows
+        // are left at zero: neither has ever failed.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        legacy_corpus(&destination);
+
+        IndexStore::open(&destination, &off_config(), true, false)
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        assert_eq!(
+            attempt_columns(&destination),
+            vec![
+                ("/a/done.txt".into(), 0, None),
+                (
+                    "/a/broken.pdf".into(),
+                    i64::from(MAX_ATTEMPTS),
+                    Some(1700.0)
+                ),
+                (
+                    "/a/photo.heic".into(),
+                    i64::from(MAX_ATTEMPTS),
+                    Some(1700.0)
+                ),
+                ("/a/build.o".into(), i64::from(MAX_ATTEMPTS), Some(1700.0)),
+                ("/a/~$memo.docx".into(), 0, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_migration_is_idempotent_across_reopens() {
+        // Every open runs it, so it has to be free the second time AND must not
+        // re-stamp: a row that has since succeeded is back at zero attempts, and a
+        // backfill that fired again would declare it spent.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        legacy_corpus(&destination);
+        IndexStore::open(&destination, &off_config(), true, false)
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        // The repair a later resume performs: the file finally extracted, so its
+        // row is finished and its counter reset.
+        connect(&destination)
+            .unwrap()
+            .execute(
+                "UPDATE files SET method='pdf',attempts=0,last_attempt_at=NULL \
+                 WHERE path='/a/broken.pdf'",
+                [],
+            )
+            .unwrap();
+
+        for _ in 0..2 {
+            IndexStore::open(&destination, &off_config(), true, false)
+                .unwrap()
+                .finish()
+                .unwrap();
+        }
+
+        let after = attempt_columns(&destination);
+        assert_eq!(
+            after[1],
+            ("/a/broken.pdf".into(), 0, None),
+            "a repaired row must not be re-stamped by a later open"
+        );
+        assert_eq!(
+            after[2],
+            (
+                "/a/photo.heic".into(),
+                i64::from(MAX_ATTEMPTS),
+                Some(1700.0)
+            ),
+            "and the rows stamped once must not climb on every open"
+        );
+    }
+
+    #[test]
+    fn a_corpus_this_build_created_needs_no_migration() {
+        // The other half of idempotency: SCHEMA already carries the columns, so a
+        // fresh corpus must come out of open with nothing stamped — the backfill
+        // fires on the column's creation, and here it was never absent.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        let mut failed = sample_file("/a/broken.pdf");
+        failed.method = "error:poppler".into();
+        store.add(&failed, 1700.0).unwrap();
+        store.finish().unwrap();
+
+        IndexStore::open(&destination, &off_config(), true, false)
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        assert_eq!(
+            attempt_columns(&destination),
+            vec![("/a/broken.pdf".into(), 1, Some(1700.0))],
+            "the row's own single failure, not a backfill"
+        );
+    }
+
+    #[test]
+    fn attempts_accumulate_on_failure_and_reset_on_success() {
+        // What makes the cap reachable at all. A file that keeps failing counts
+        // up; the run that finally reads it puts the counter back to zero so a
+        // later failure gets the full budget again.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut failed = sample_file("/a/broken.pdf");
+        failed.method = "error:poppler".into();
+        failed.elapsed_ms = 4200;
+        for expected in 1..=3 {
+            let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+            store.add(&failed, 1700.0).unwrap();
+            store.finish().unwrap();
+            assert_eq!(
+                attempt_columns(&destination)[0].1,
+                expected,
+                "each failing attempt counts once"
+            );
+        }
+        let elapsed: i64 = connect(&destination)
+            .unwrap()
+            .query_row("SELECT elapsed_ms FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(elapsed, 4200, "an error row carries what it cost");
+
+        let mut fixed = sample_file("/a/broken.pdf");
+        fixed.method = "pdf".into();
+        fixed.chunks = vec![chunk(0)];
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store.add(&fixed, 1800.0).unwrap();
+        store.finish().unwrap();
+        assert_eq!(attempt_columns(&destination)[0].1, 0);
+    }
+
+    #[test]
+    fn changed_bytes_open_a_fresh_attempt_budget() {
+        // The row's failures belong to the bytes that produced them. A file that
+        // has since been rewritten is a different file at the same path, so it
+        // starts its own count rather than inheriting a spent one.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut failed = sample_file("/a/broken.pdf");
+        failed.method = "error:poppler".into();
+        for _ in 0..3 {
+            let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+            store.add(&failed, 1700.0).unwrap();
+            store.finish().unwrap();
+        }
+        assert_eq!(attempt_columns(&destination)[0].1, 3);
+
+        let mut rewritten = failed.clone();
+        rewritten.rec.size = 999;
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store.add(&rewritten, 1800.0).unwrap();
+        store.finish().unwrap();
+        assert_eq!(
+            attempt_columns(&destination)[0].1,
+            1,
+            "new bytes, first failure"
+        );
+    }
+
+    #[test]
+    fn a_kept_row_still_records_the_attempt_that_was_thrown_away() {
+        // Keep-on-failure writes nothing, so without this the run that re-read,
+        // re-OCR'd and re-embedded the file and then discarded the result leaves
+        // no trace of having spent anything. The row's own content and
+        // `indexed_at` must not move — they describe what is stored.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut good = sample_file("/a/report.pdf");
+        good.method = "pdf".into();
+        good.chunks = vec![chunk(0)];
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&good, 1700.0).unwrap();
+        store.finish().unwrap();
+
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store
+            .record_failed_attempt("/a/report.pdf", 9000, 1800.0)
+            .unwrap();
+        store.finish().unwrap();
+
+        let (method, indexed_at, attempts, last, elapsed): (String, f64, i64, f64, i64) =
+            connect(&destination)
+                .unwrap()
+                .query_row(
+                    "SELECT method,indexed_at,attempts,last_attempt_at,elapsed_ms FROM files",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+        assert_eq!(method, "pdf", "the kept row keeps its content");
+        assert_eq!(indexed_at, 1700.0, "and the time that content was indexed");
+        assert_eq!(attempts, 1);
+        assert_eq!(last, 1800.0);
+        assert_eq!(elapsed, 9000, "the burned time is now measurable");
     }
 }
