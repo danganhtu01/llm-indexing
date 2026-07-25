@@ -137,6 +137,17 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         records.retain(|record| include_paths.contains(&record.path));
     }
     let before = records.len();
+    // The corpus's own "how many files are there to index" snapshot, refreshed
+    // by every job that walks these paths. `/corpus/status` derives
+    // `pending_files` from it against a plain `COUNT(*) FROM files` instead of
+    // re-walking the filesystem on every poll (see `service::corpus_status`) —
+    // a point-in-time count taken here, not a live one, which is the whole
+    // point. It therefore trails a running job by definition (it settles to 0
+    // once indexing catches up to what this walk found) and, when
+    // `include_paths` narrows this job to a subset, describes only that
+    // subset rather than the whole corpus — an intentional trade for staying
+    // out of the poll path entirely.
+    store.set_meta("last_discovered_files", &before.to_string())?;
     if request.resume && !embed_model_changed {
         records.retain(|record| {
             existing

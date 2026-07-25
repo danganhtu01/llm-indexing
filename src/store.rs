@@ -13,7 +13,22 @@ use crate::model::{ProcessedFile, SearchHit};
 use crate::normalize::{fold, words, Normalizer};
 use crate::vision::VisionResult;
 
-const SCHEMA: &str = r#"
+/// One entry per schema version, applied in order starting from wherever the
+/// database's own `PRAGMA user_version` says it is. Index 0 is version 1 — the
+/// schema every corpus has always had, expressed with `IF NOT EXISTS` so it is
+/// a no-op on a database that already carries these tables and simply stamps
+/// the version onto it; a genuinely fresh database gets the same tables from
+/// the same statement. Later versions are appended as new entries — never
+/// edit one that has shipped, since a live corpus may already be stamped past
+/// it.
+const MIGRATIONS: &[&str] = &[SCHEMA_V1];
+
+/// The schema version this binary knows how to write. Advertised via
+/// `schema_version` (surfaced in `/corpus/status`) so a consumer sees version
+/// skew as a signal rather than a query failing obscurely later.
+pub const CURRENT_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
+const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS files(
   id INTEGER PRIMARY KEY,
   path TEXT UNIQUE,
@@ -64,6 +79,76 @@ CREATE TABLE IF NOT EXISTS vision(
 CREATE INDEX IF NOT EXISTS idx_vision_phash ON vision(phash);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
+
+/// Bring `connection`'s schema up to `MIGRATIONS.len()`, one version at a time
+/// inside its own transaction, then stamp `user_version`. Refuses a database
+/// stamped past every version this binary knows — an older binary silently
+/// "succeeding" against a newer schema (skipping columns/tables it has never
+/// heard of) is how a downgrade quietly corrupts a corpus instead of failing
+/// loudly at the one point that could catch it.
+fn migrate(connection: &Connection) -> Result<()> {
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let current = current.max(0) as usize;
+    if current > MIGRATIONS.len() {
+        anyhow::bail!(
+            "corpus database is at schema version {current}, newer than this binary knows \
+             (version {}); refusing to open it — upgrade llm-indexing before touching this corpus",
+            MIGRATIONS.len()
+        );
+    }
+    for (index, statement) in MIGRATIONS.iter().enumerate().skip(current) {
+        let version = index + 1;
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .with_context(|| format!("opening the transaction for migration {version}"))?;
+        if let Err(error) = connection.execute_batch(statement) {
+            // Best effort: if the rollback itself fails the connection is
+            // already in an unknown state and the error below is what surfaces.
+            let _ = connection.execute_batch("ROLLBACK");
+            return Err(error).with_context(|| format!("applying migration {version}"));
+        }
+        // Inside the same transaction as the statement it stamps: a crash
+        // between the two would otherwise leave a database whose tables are
+        // version N but whose `user_version` still reads N-1, which would
+        // then try to re-apply migration N (harmless here, since every entry
+        // is `IF NOT EXISTS`-idempotent, but not a guarantee future entries
+        // can make).
+        connection
+            .pragma_update(None, "user_version", version as i64)
+            .with_context(|| format!("stamping user_version {version}"))?;
+        connection
+            .execute_batch("COMMIT")
+            .with_context(|| format!("committing migration {version}"))?;
+    }
+    Ok(())
+}
+
+/// The corpus's own schema version (`PRAGMA user_version`), read fresh —
+/// unlike [`CURRENT_SCHEMA_VERSION`], which is what this binary would write.
+/// The two differing is exactly the version-skew signal `/corpus/status`
+/// exists to surface.
+pub fn schema_version(connection: &Connection) -> Result<i64> {
+    Ok(connection.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+/// Read one `meta` key from an arbitrary connection — the read-only surface
+/// (`/corpus/status` and friends) opens a bare `Connection`, never an
+/// `IndexStore`, so this is free-standing rather than a method. A `meta` table
+/// that does not exist yet (a corpus predating it, or a hand-built test
+/// fixture) reads as "key absent", the same as a present table with no such
+/// row: either way the caller has no value to trust, not a fault to report.
+pub fn read_meta(connection: &Connection, key: &str) -> Result<Option<String>> {
+    match connection.query_row("SELECT value FROM meta WHERE key=?1", [key], |row| row.get(0)) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref message)))
+            if message.contains("no such table") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 
 /// How long a WRITER waits for a lock before giving up. An indexing job now
 /// writes into the same file readers open, and a batch commit holds an exclusive
@@ -181,9 +266,7 @@ impl IndexStore {
         if config.sync_normal {
             connection.pragma_update(None, "synchronous", "NORMAL")?;
         }
-        connection
-            .execute_batch(SCHEMA)
-            .context("creating SQLite FTS5 schema")?;
+        migrate(&connection).context("applying schema migrations")?;
         // Self-description (previously the corpus was anonymous — after a
         // restart nothing recorded what produced it): created_at once, plus
         // per-job values the pipeline stamps via `set_meta`. `IF NOT EXISTS`
@@ -334,13 +417,7 @@ impl IndexStore {
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        use rusqlite::OptionalExtension;
-        Ok(self
-            .connection
-            .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
-                row.get(0)
-            })
-            .optional()?)
+        read_meta(&self.connection, key)
     }
 
     pub fn add(&mut self, file: &ProcessedFile, indexed_at: f64) -> Result<()> {
@@ -835,6 +912,79 @@ mod tests {
             database_path(Path::new("/out")),
             PathBuf::from("/out/index.sqlite")
         );
+    }
+
+    #[test]
+    fn a_fresh_database_lands_on_the_current_schema_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        assert_eq!(
+            schema_version(&store.connection).unwrap(),
+            CURRENT_SCHEMA_VERSION,
+            "a brand-new database must be stamped, not left at the SQLite default of 0"
+        );
+    }
+
+    #[test]
+    fn an_existing_pre_migration_database_reaches_the_same_version_and_keeps_its_rows() {
+        // A database written before this harness existed: the same tables
+        // (created by hand here, the way an old binary's `execute_batch(SCHEMA)`
+        // would have), but never stamped — `PRAGMA user_version` defaults to 0.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        {
+            let raw = Connection::open(&destination).unwrap();
+            raw.execute_batch(SCHEMA_V1).unwrap();
+            raw.execute(
+                "INSERT INTO files(path,drive,dir,name,ext,size,mtime,lang,method,ocr_used,pages,chars,sha1,indexed_at) \
+                 VALUES ('/a/old.txt','/','a','old.txt','.txt',3,0.0,'en','text',0,1,3,NULL,0.0)",
+                [],
+            )
+            .unwrap();
+            assert_eq!(schema_version(&raw).unwrap(), 0);
+        }
+
+        // Opening it through the harness must migrate it up WITHOUT touching the
+        // row that was already there — identical destination shape to a fresh
+        // open, but the pre-existing data survives.
+        let store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        assert_eq!(schema_version(&store.connection).unwrap(), CURRENT_SCHEMA_VERSION);
+        let existing = store.existing_keys().unwrap();
+        assert!(existing.contains_key("/a/old.txt"), "{existing:?}");
+    }
+
+    #[test]
+    fn opening_a_database_stamped_past_the_known_schema_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        {
+            let raw = Connection::open(&destination).unwrap();
+            raw.execute_batch(SCHEMA_V1).unwrap();
+            raw.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+
+        let error = IndexStore::open(&destination, &off_config(), false, false)
+            .err()
+            .expect("a newer-than-known user_version must refuse to open, not silently proceed");
+        assert!(
+            format!("{error:#}").contains("newer than this binary knows"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn read_meta_tolerates_a_database_with_no_meta_table() {
+        // The read-only corpus surface opens a bare Connection (never an
+        // IndexStore), including against hand-built test fixtures that predate
+        // `meta` entirely — that must read as "no value", not an error.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let raw = Connection::open(&destination).unwrap();
+        raw.execute_batch("CREATE TABLE files(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        assert_eq!(read_meta(&raw, "last_discovered_files").unwrap(), None);
     }
 
     #[test]

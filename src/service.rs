@@ -1340,8 +1340,11 @@ fn document_text(corpus_db: &Path, id: i64) -> Result<Option<String>, ReadError>
 
 /// GET /corpus/status[?output=corpus.sqlite]
 ///
-/// Cheap corpus-wide aggregates: total indexed files/characters/bytes, OCR
-/// count, and language/method breakdowns. Zeroed when the database is absent.
+/// Cheap corpus-wide aggregates: indexed/pending file counts, total
+/// characters/bytes, OCR count, language/method breakdowns, and the corpus's
+/// schema version. Every one of these is a single `COUNT`/`meta` lookup —
+/// deliberately, so a consumer polling this on a tight tick never pays for a
+/// tree walk. Zeroed when the database is absent.
 async fn corpus_status_handler(
     State(state): State<AppState>,
     Query(query): Query<OutputQuery>,
@@ -1394,20 +1397,38 @@ fn corpus_status(path: &Path) -> Result<Value, ReadError> {
             .query_row(sql, [], |row| row.get(0))
             .map_err(ReadError::from)
     };
+    let indexed_files = count("SELECT COUNT(*) FROM files")?;
+    // `pending_files` used to cost the caller a full `/corpus/tree` walk (sorted
+    // recursive `fs::read_dir` plus a snippet-carrying join) just to count entries
+    // whose `document_id` came back null. Deriving it from the pipeline's own
+    // last-discovery snapshot (`crate::pipeline::run_index` stamps
+    // `last_discovered_files` into `meta` before it filters down to what actually
+    // needs work) turns that into one more `COUNT(*)` here — no tree walk, no
+    // snippets. A corpus with no recorded discovery yet (never indexed through
+    // this harness, or a bare test fixture) reads as 0 pending rather than an error.
+    let discovered = crate::store::read_meta(&connection, "last_discovered_files")
+        .map_err(ReadError::from)?
+        .and_then(|value| value.parse::<i64>().ok());
+    let pending_files = discovered
+        .map(|total| (total - indexed_files).max(0))
+        .unwrap_or(0);
     Ok(json!({
-        "indexed_files": count("SELECT COUNT(*) FROM files")?,
+        "indexed_files": indexed_files,
+        "pending_files": pending_files,
         "total_characters": count("SELECT COALESCE(SUM(chars),0) FROM files")?,
         "total_bytes": count("SELECT COALESCE(SUM(size),0) FROM files")?,
         "ocr_files": count("SELECT COALESCE(SUM(ocr_used),0) FROM files")?,
         "languages": grouped(&connection, "lang", 10)?,
         "methods": grouped(&connection, "method", 20)?,
+        "schema_version": crate::store::schema_version(&connection).map_err(ReadError::from)?,
     }))
 }
 
 fn empty_status() -> Value {
     json!({
-        "indexed_files": 0, "total_characters": 0, "total_bytes": 0, "ocr_files": 0,
-        "languages": Vec::<(String, i64)>::new(), "methods": Vec::<(String, i64)>::new(),
+        "indexed_files": 0, "pending_files": 0, "total_characters": 0, "total_bytes": 0,
+        "ocr_files": 0, "languages": Vec::<(String, i64)>::new(),
+        "methods": Vec::<(String, i64)>::new(), "schema_version": 0,
     })
 }
 
