@@ -525,11 +525,15 @@ pub struct PooledEmbedder<'a> {
 }
 
 impl PooledEmbedder<'_> {
-    pub fn embed_document(&mut self, content: &str) -> Result<Vec<EmbeddedChunk>> {
+    pub fn embed_document(
+        &mut self,
+        content: &str,
+        page_segments: &[(usize, String)],
+    ) -> Result<Vec<EmbeddedChunk>> {
         self.embedder
             .as_mut()
             .expect("embedder is taken only in Drop")
-            .embed_document(content)
+            .embed_document(content, page_segments)
     }
 }
 
