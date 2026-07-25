@@ -38,6 +38,14 @@ serde_json = "1"
 serde_yaml = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"
+# The vec0 shadow index. Compiles the sqlite-vec amalgamation with SQLITE_CORE
+# and links it into the SAME bundled SQLite rusqlite already carries, so there is
+# no loadable extension to ship and no second SQLite in the process. Pinned to
+# 0.1.9 — the version measured against this crate's rusqlite 0.32 (bundled
+# SQLite 3.46.0) in docs/ARCHITECTURE.md. Registering the module is opt-in per
+# process (`embedding::vec0::register`); a corpus without the virtual table is
+# untouched by its presence.
+sqlite-vec = "=0.1.9"
 strsim = "0.11"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }

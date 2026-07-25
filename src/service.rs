@@ -1079,6 +1079,11 @@ fn is_busy(error: &rusqlite::Error) -> bool {
 /// `/corpus/status` during a long index wants a prompt "busy, retry" far more
 /// than it wants to block for the writer's whole commit window.
 fn read_only(path: &Path) -> Result<Connection, rusqlite::Error> {
+    // Before the open, or a corpus carrying a `vec0` shadow index would be
+    // served by the scan forever: the module reaches a connection through
+    // SQLite's auto-extension list, consulted once as the connection is
+    // created. See [`crate::vec0::register`].
+    crate::vec0::register();
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.busy_timeout(READ_BUSY_TIMEOUT)?;
     connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
@@ -1439,8 +1444,13 @@ fn empty_status() -> Value {
 // of that. `llm-search` holds every chunk vector RESIDENT to serve a
 // search-as-you-type socket — 2.68 M x 384 floats plus their text is a
 // multi-gigabyte process, which is why the hub app does not run one. What is
-// added back here is the streaming, nothing-resident half: one exhaustive scan
-// per request, `O(limit)` memory, and no second service to deploy.
+// added back here is the streaming, nothing-resident half: one ranking pass per
+// request, `O(limit)` memory, and no second service to deploy.
+//
+// That pass is a k-NN lookup when the corpus carries a `vec0` shadow index and
+// an exhaustive scan when it does not (`crate::vec0`, `crate::embedding`). The
+// choice is read off the corpus rather than configured here: this route stays
+// read-only, and nothing it does can create, repair or invalidate an index.
 
 /// Modes `/corpus/search` accepts. Only `semantic` today; the list is what a
 /// rejected request is told, so adding a keyword mode later stays a one-line
@@ -1477,6 +1487,12 @@ struct SearchQuery {
 /// model, and a model that has not finished loading are three different
 /// `status`/`reason` pairs, not three empty lists. Only a corpus that exists and
 /// cannot be read is an error (`503`, shared with the rest of this surface).
+///
+/// It also carries `path`, because the ranking runs over a `vec0` shadow index
+/// when the corpus has a usable one and over an exhaustive scan when it does
+/// not. The two return the same hits; they do not take the same time, so which
+/// one ran is a fact the caller is owed rather than one to infer from a
+/// stopwatch.
 async fn corpus_search(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
@@ -1547,7 +1563,9 @@ async fn corpus_search(
             // broken by a panic while holding it; recovering the guard keeps
             // this failure mode self-healing like the rest of this surface.
             let query_vector = {
-                let mut guard = embedder.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut guard = embedder
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 guard.embed_query(&text)
             };
             let query_vector = match query_vector {
@@ -1678,6 +1696,15 @@ fn search_response(query: &str, limit: usize, outcome: SearchOutcome) -> Value {
             body["compared_chunks"] = json!(scan.compared);
             body["skipped_chunks"] = json!(scan.skipped);
             body["elapsed_ms"] = json!(elapsed_ms);
+            // Which of the two ranking paths served this. The hits and their
+            // scores are the same either way; the latency is not, by more than
+            // an order of magnitude on a large corpus, so a consumer that sees
+            // a slow answer can tell "this corpus has no shadow index" from
+            // "this corpus has one and it was not used" without guessing.
+            body["path"] = json!(scan.path.as_str());
+            if let Some(note) = scan.index_note {
+                body["index_note"] = json!(note);
+            }
         }
         SearchOutcome::NoEmbeddings {
             reason,
@@ -2167,10 +2194,12 @@ mod tests {
         /// vector)`. `chunks: None` writes a corpus with no chunks TABLE at all
         /// — what a build older than embeddings left behind.
         fn corpus(path: &Path, chunks: Option<&[(&str, Vec<f32>)]>) {
+            crate::vec0::register();
             let connection = Connection::open(path).unwrap();
             connection
                 .execute_batch(
-                    "CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, name TEXT);
+                    "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, name TEXT);
                      INSERT INTO files(id,path,name) VALUES(1,'/corpus/a.txt','a.txt');",
                 )
                 .unwrap();
@@ -2302,6 +2331,76 @@ mod tests {
             assert!((hits[0]["score"].as_f64().unwrap() - 1.0).abs() < 0.0001);
             assert!(hits[1]["score"].as_f64().unwrap().abs() < 0.0001);
             assert!(body["elapsed_ms"].is_number(), "{body}");
+            // No shadow index, so the scan served it — stated, not implied, and
+            // with nothing to say about an index that is not there.
+            assert_eq!(body["path"], "scan");
+            assert!(body.get("index_note").is_none(), "{body}");
+        }
+
+        /// The same corpus after `llm-index vector-index`.
+        fn with_shadow_index(path: &Path, dimensions: usize) {
+            let mut connection = Connection::open(path).unwrap();
+            crate::vec0::build(&mut connection, EMBEDDING_MODEL, dimensions, |_, _| {}).unwrap();
+        }
+
+        #[test]
+        fn a_shadow_index_answers_the_same_request_and_the_response_says_so() {
+            // Same fixture, same query, same hits and scores as the scan test
+            // above — the only difference a consumer can see is `path`.
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(
+                &path,
+                Some(&[
+                    (EMBEDDING_MODEL, vec![0.0, 1.0, 0.0]),
+                    (EMBEDDING_MODEL, vec![1.0, 0.0, 0.0]),
+                    ("clip-vit-b32", vec![1.0, 0.0, 0.0]),
+                ]),
+            );
+            with_shadow_index(&path, 3);
+            let body = body(scan(&path));
+            assert_eq!(body["status"], "ready");
+            assert_eq!(body["path"], "vec0");
+            assert_eq!(body["compared_chunks"], 2);
+            assert_eq!(body["skipped_chunks"], 1);
+            let hits = body["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0]["content"], "chunk 1");
+            assert!((hits[0]["score"].as_f64().unwrap() - 1.0).abs() < 0.0001);
+            assert!(body.get("index_note").is_none(), "{body}");
+        }
+
+        #[test]
+        fn a_corpus_whose_index_cannot_be_trusted_says_which_path_served_it() {
+            // The capability fallback as a consumer sees it: still `ready`, still
+            // the right hits, but `path: scan` with the reason attached — the
+            // difference between "no index here" and "the index is stale".
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(&path, Some(&[(EMBEDDING_MODEL, vec![1.0, 0.0, 0.0])]));
+            with_shadow_index(&path, 3);
+            Connection::open(&path)
+                .unwrap()
+                .execute(
+                    "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model) \
+                     VALUES(1,9,'written behind the index',?1,3,?2)",
+                    rusqlite::params![vector_to_bytes(&[1.0, 0.0, 0.0]), EMBEDDING_MODEL],
+                )
+                .unwrap();
+
+            let body = body(scan(&path));
+            assert_eq!(body["status"], "ready");
+            assert_eq!(body["path"], "scan");
+            assert!(
+                body["index_note"].as_str().unwrap().contains("stale"),
+                "{body}"
+            );
+            // And the row the index never saw is in the answer.
+            let hits = body["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 2);
+            assert!(hits
+                .iter()
+                .any(|hit| hit["content"] == "written behind the index"));
         }
 
         #[test]

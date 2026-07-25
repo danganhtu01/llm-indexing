@@ -23,7 +23,8 @@ this component.
   diacritic-insensitive FTS5 search
 - 384-dimensional `multilingual-e5-small` embeddings and cosine vector search,
   over the `vector-search` CLI subcommand and `GET /corpus/search?mode=semantic`
-  alike
+  alike, with an optional `vec0` k-NN shadow index (`vector-index`) that an
+  existing corpus can gain without re-embedding anything
 - Crash-safe batched writes, resume/change detection, removal pruning, authentic
   incomplete/error counts, folder aggregation, manifests, reports and optional
   sidecars
@@ -77,8 +78,18 @@ cargo build --release --locked
 ./target/release/llm-index search "know your customer" --index index_out
 ./target/release/llm-index vector-search "customer due diligence" \
   --index index_out/index.sqlite
+./target/release/llm-index vector-index --index index_out/index.sqlite
 ./target/release/llm-index top-folder "hoa don" --index index_out --limit 10
 ```
+
+`vector-index` builds the optional `vec0` shadow index from the vectors a corpus
+already holds — nothing is re-embedded — and turns semantic search from an
+exhaustive scan into a k-NN lookup. It is opt-in per corpus: without it,
+`vector-search` and `/corpus/search` scan exactly as before, and the response
+says which path served it. `--status` reports what a corpus has, `--rebuild`
+replaces it after a build that does not maintain it has written to the corpus,
+and `--drop` removes it. See
+[Cost of the vector scan](docs/ARCHITECTURE.md#cost-of-the-vector-scan).
 
 Copy `config.example.yaml` to override OCR, extraction, Whisper, embedding,
 worker, sidecar and skip settings.

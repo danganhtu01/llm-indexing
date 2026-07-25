@@ -30,6 +30,7 @@ enum Command {
     Index(IndexArgs),
     Search(SearchArgs),
     VectorSearch(VectorSearchArgs),
+    VectorIndex(VectorIndexArgs),
     TopFolder(TopFolderArgs),
     Analyze(AnalyzeArgs),
     Serve(ServeArgs),
@@ -132,6 +133,37 @@ struct VectorSearchArgs {
     index: PathBuf,
     #[arg(long, default_value_t = 10)]
     limit: usize,
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+/// `vector-index` — build, rebuild, inspect or drop a corpus' OPTIONAL `vec0`
+/// shadow index.
+///
+/// The index is a derived copy of `chunks.embedding` that makes
+/// `/corpus/search?mode=semantic` a k-NN lookup instead of a full scan. It is
+/// built from the BLOBs a corpus already holds: an existing corpus gains one
+/// without re-embedding a single document, and dropping it loses nothing.
+///
+/// Nothing here is implicit. A corpus has no index until this is run against it,
+/// and an index that exists is maintained by later index jobs. Rebuilding is the
+/// repair for one that a build without that maintenance has written behind.
+#[derive(Args)]
+struct VectorIndexArgs {
+    #[arg(long, default_value = "index_out/index.sqlite")]
+    index: PathBuf,
+    /// Replace an existing index. Without it, an already-indexed corpus is
+    /// reported and left alone — a rebuild reads every vector in the corpus and
+    /// is not something to trigger by re-running a command.
+    #[arg(long)]
+    rebuild: bool,
+    /// Remove the index and its `meta` record, leaving the corpus exactly as it
+    /// was before it had one. Semantic search falls back to the scan.
+    #[arg(long, conflicts_with = "rebuild")]
+    drop: bool,
+    /// Report what the corpus holds and change nothing.
+    #[arg(long, conflicts_with_all = ["rebuild", "drop"])]
+    status: bool,
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -241,6 +273,7 @@ fn main() -> Result<()> {
         Command::Index(args) => index(args),
         Command::Search(args) => search_command(args),
         Command::VectorSearch(args) => vector_search_command(args),
+        Command::VectorIndex(args) => vector_index_command(args),
         Command::TopFolder(args) => top_folder_command(args),
         Command::Analyze(args) => analyze_command(args),
         Command::Serve(args) => serve(args),
@@ -254,6 +287,74 @@ fn vector_search_command(args: VectorSearchArgs) -> Result<()> {
     let config = Config::load(args.config.as_deref())?;
     let hits = vector_search(&args.index, &config, &args.query, args.limit)?;
     println!("{}", serde_json::to_string_pretty(&hits)?);
+    Ok(())
+}
+
+/// Build / rebuild / drop / report the `vec0` shadow index of one corpus.
+///
+/// Opens the corpus read-WRITE and is the only surface in this crate that
+/// does so outside an index job — which is why it is a CLI subcommand rather
+/// than a route: everything under `/corpus/*` is a read-only surface by
+/// construction, and a rebuild over 2.68 M vectors runs for minutes, so
+/// bolting it on there would mean either a write on the read surface or a
+/// second job machinery for one command.
+///
+/// The build never writes `chunks`, so it is safe against the corpus in the
+/// sense that matters: an interrupted one leaves the corpus exactly as it was
+/// plus a table no query will use.
+fn vector_index_command(args: VectorIndexArgs) -> Result<()> {
+    let config = Config::load(args.config.as_deref())?;
+    let mut connection = connect(&args.index)?;
+    let describe = |connection: &_| -> Result<()> {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&llm_indexing::vec0::describe(connection)?)?
+        );
+        Ok(())
+    };
+    if args.status {
+        return describe(&connection);
+    }
+    if args.drop {
+        llm_indexing::vec0::drop_index(&connection)?;
+        return describe(&connection);
+    }
+    if llm_indexing::vec0::present(&connection)? && !args.rebuild {
+        eprintln!("this corpus already has a shadow index; pass --rebuild to replace it");
+        return describe(&connection);
+    }
+    // 384 for `multilingual-e5-small` — read out of the corpus, not out of a
+    // model: the index mirrors what is stored, and learning the number this way
+    // keeps a rebuild from loading 448 MB of ONNX weights it has no use for.
+    let Some(dimensions) =
+        llm_indexing::vec0::corpus_dimensions(&connection, &config.embedding_model)?
+    else {
+        anyhow::bail!(
+            "this corpus holds no {} vectors; there is nothing to index",
+            config.embedding_model
+        )
+    };
+    let started = std::time::Instant::now();
+    let report = llm_indexing::vec0::build(
+        &mut connection,
+        &config.embedding_model,
+        dimensions,
+        |written, total| {
+            eprintln!(
+                "  {written}/{total} vectors indexed ({:.0}s)",
+                started.elapsed().as_secs_f64()
+            );
+        },
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "vectors": report.vectors,
+            "skipped": report.skipped,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "state": report.state,
+        }))?
+    );
     Ok(())
 }
 

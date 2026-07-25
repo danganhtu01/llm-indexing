@@ -400,7 +400,8 @@ with the same model the corpus rows were embedded with
   ],
   "compared_chunks": 100000,
   "skipped_chunks": 0,
-  "elapsed_ms": 1204
+  "elapsed_ms": 1204,
+  "path": "scan"
 }
 ```
 
@@ -409,11 +410,26 @@ are one shape. `score` is cosine similarity in `-1.0..=1.0`; ordering is
 descending score, ties broken by ascending `chunks.id`, so the same query over
 the same corpus always returns the same list in the same order.
 
+**`path` says how the answer was produced**, because the two ways differ by more
+than an order of magnitude in latency and by nothing else:
+
+| `path` | meaning |
+|---|---|
+| `scan` | the exhaustive cosine scan over every stored vector |
+| `vec0` | a k-NN lookup against the corpus' `vec0` shadow index, with the candidates re-scored from the same BLOBs — same hits, same scores, same order |
+
+A corpus has a shadow index only after `llm-index vector-index` has been run
+against it; without one, `path` is always `scan` and nothing else changes. When a
+corpus HAS one that was not used, `index_note` says why — an interrupted build,
+another model's vectors, or an index that a build without index maintenance has
+written behind (`--rebuild` is the repair). A missing `index_note` on
+`path: scan` means there is no index to talk about.
+
 **`status` is the field to branch on.** An empty `hits` is never ambiguous:
 
 | `status` | meaning |
 |---|---|
-| `ready` | the scan ran; `compared_chunks`/`skipped_chunks` say over what |
+| `ready` | the ranking ran; `compared_chunks`/`skipped_chunks` say over what and `path` says how |
 | `no_embeddings` | nothing to rank, and `reason` says why: no corpus written yet, a corpus with no `chunks` table, a corpus indexed without embeddings, or one whose vectors came from another model (then `other_models` names them) |
 | `warming` | the query embedding model is still loading; `warming_ms` is how long it has been at it |
 | `unavailable` | the model could not be loaded, or could not embed this query; `reason` carries the failure and `retrying` says whether a fresh load is already in flight |
@@ -434,5 +450,10 @@ throwaway search at startup.
 
 **Per-query cost.** The scan is exhaustive, so latency scales with the corpus:
 measured 0.24 s per 100 k vectors and 13.7 s over the live 2.68 M-vector /
-15.6 GB corpus (see `docs/ARCHITECTURE.md` for the full table and why there is
-no ANN index yet). It is not a search-as-you-type endpoint.
+15.6 GB corpus. A corpus with a `vec0` shadow index reads the vectors only and
+answers roughly an order of magnitude faster — best warm passes 1.32 s at 869 k
+vectors and 3.9 s at 2.68 M, against 13.9 s and 45.6 s for the scan measured back
+to back on the same loaded workstation. That is a large improvement and still not
+interactive at 2.68 M vectors; see `docs/ARCHITECTURE.md` for the full table, the
+build cost and why `vec0` 0.1.9 is a faster brute force rather than an ANN.
+Either way this is not a search-as-you-type endpoint.
