@@ -90,6 +90,7 @@ Queues one job and returns `202 Accepted` with an `id`.
   "include_paths": ["Customers/new.pdf", "Meetings/changed.mp4"],
   "resume": true,
   "overwrite": true,
+  "retry_errors": false,
   "vision": "tags",
   "ocr_opts": {
     "dpi": 300,
@@ -134,6 +135,16 @@ the job writes into directly (there is no staged copy renamed in at the end):
   that leaves a partial new corpus, not the one it replaced, so keep a copy
   first if the previous corpus still matters;
 - both set → `resume` wins.
+
+`retry_errors` (default `false`) applies only to a `resume`. A row that has
+failed three times without finishing is left alone, because re-extracting a file
+the engine cannot read costs the same on every resume and produces the same row;
+setting this reopens those rows for one run. It changes which rows are attempted,
+never how one is processed. Leave it off unless the reason for the failures has
+been fixed OUTSIDE the engine (a drive that was not mounted, a dependency that
+was not installed, files that have since been repaired) — a fix inside the engine
+moves the extraction-capability revision and reopens them by itself. The
+completed job reports how many rows were held back as `capped`.
 
 A job that fails part-way leaves what it had committed, so a database now exists
 where a failed job used to publish nothing — including the empty one a job that
@@ -193,7 +204,8 @@ Unknown top-level fields anywhere in the job body remain permissively ignored
 
 Returns `queued`, `running`, `cancelling`, `cancelled`, `complete` or `error`.
 Running jobs include live `processed` and `total` file counters. A completed job includes the
-database path, file/OCR/error/incomplete counts, embedded chunk count, removed
+database path, file/OCR/error/incomplete counts, the `capped` count of rows resume
+declined because they have failed too often, embedded chunk count, removed
 source count, elapsed time and OCR languages.
 
 ## `POST /jobs/{id}/cancel`
