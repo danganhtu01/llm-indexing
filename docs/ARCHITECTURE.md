@@ -50,6 +50,9 @@ vision(file_id, mode, width, height, phash, exif_json, quality_json,
        objects_json, tags_json, caption,
        embedding BLOB, embedding_model, dimensions, frames, elapsed_ms, error)
 meta(key, value)
+
+-- OPTIONAL, created only by `llm-index vector-index`:
+chunks_vec USING vec0(embedding float[384] distance_metric=cosine)
 ```
 
 Normalization combines lowercased words, Unicode diacritic folding, English
@@ -92,10 +95,89 @@ cost contention with the extraction pool a concurrent index job is using.
 crate's rusqlite 0.32 (bundled SQLite 3.46.0) and its `vec_distance_cosine()`
 reads the existing BLOBs with no schema change — but at 4.09-6.81 s per million
 it is the same I/O-bound pass, and it agreed with this scan's ranking to the
-last decimal on a million live vectors. Its ANN half (`vec0` virtual tables)
-*would* be the real win, and is the reason this stays revisitable: it requires
-WRITING shadow tables into the corpus, which is a corpus-format change and
-impossible over the read-only surface these routes are built on.
+last decimal on a million live vectors. Its `vec0` half is a corpus-format
+change: it needs shadow tables WRITTEN into the corpus, which the read-only
+`/corpus/*` surface cannot do. That is what the optional shadow index below is,
+and why building one is a CLI subcommand rather than a route.
+
+### The optional vec0 shadow index
+
+`llm-index vector-index` adds a `chunks_vec` virtual table holding a second copy
+of every `chunks.embedding` BLOB. Semantic search then asks it for the k nearest
+candidates instead of reading the whole `chunks` table. It is off until an
+operator builds it, per corpus, and nothing creates it implicitly.
+
+It buys latency and only latency. The k-NN nominates candidates; their scores are
+recomputed from `chunks.embedding` with the scan's own `cosine_bytes` and ordered
+by the scan's own comparison, so a `score` is the same number and the top-k is the
+same list whichever path ran. `scan_latency_over_a_real_corpus` asserts that over
+the live corpus, not just over fixtures, and `/corpus/search` reports which path
+served each request (`path: "scan" | "vec0"`).
+
+Measured on BOTH live corpora with `scan_latency_over_a_real_corpus` (release
+build, copies of the live files, each pair back to back in one session on one
+workstation — a GPU recovery job was running throughout, which is why the spreads
+are wide and why the *ratio* within a row is worth more than any single number):
+
+| vectors | corpus | scan reads | scan, warm passes | k-NN reads | `vec0` k-NN, warm passes |
+|---|---|---|---|---|---|
+| 869,267 | 5.35 GB | 5.35 GB | 13.9 - 22.9 s (4) | 1.34 GB | 1.32 - 5.57 s (4) |
+| 2,684,125 | 15.6 GB | 15.6 GB | 45.6 - 74.9 s (9) | 4.12 GB | 3.9 - 16.1 s (9) |
+
+**This is not the sub-second answer.** `vec0` 0.1.9 has no ANN structure: the
+speedup is layout, not algorithm — vectors packed into contiguous chunk blobs
+instead of one row per chunk, so a query reads only the vectors and skips
+`content` entirely. It still visits every vector, and the cost is still the bytes.
+Best observed is 1.32 s at 869 k vectors and 3.9 s at 2.68 M, so on this hardware
+the index buys roughly an order of magnitude and crosses into interactive
+territory somewhere below a million vectors — not at the scale of the largest
+live corpus. Sub-second at 2.68 M would need quantised vectors (`int8`/`bit`),
+which change which rows come back: a different feature with a different bar, and
+deliberately not this one.
+
+The absolute scan numbers above are three to four times the 13.7 s in the earlier
+table. Nothing regressed: that row was measured on a differently warmed page
+cache. Each row here comes from one session so its two halves can be compared
+with each other, which is the only comparison this section is making.
+
+Cost of having one:
+
+| | 869,267 vectors | 2,684,125 vectors |
+|---|---|---|
+| first build from the stored BLOBs | 84.4 s, 0 skipped | 84.6 s, 0 skipped |
+| corpus growth | 5.35 -> 6.70 GB (+1.34 GB) | 15.6 -> 19.8 GB (+4.19 GB) |
+| documents re-embedded | none | none |
+
+The growth is exactly one `f32` copy per vector; a build reads `chunks` and
+writes only `chunks_vec`, so nothing is re-embedded and no model is loaded. A
+`--rebuild` over the existing 2.68 M-vector index took 207.8 s — slower than the
+first build because it reuses the pages the dropped index freed and overwritten
+pages are journaled — with a peak rollback journal of 4.1 MB.
+
+A build commits every 50,000 vectors and writes its `meta.vec0_index` marker
+last, so an interrupted one leaves a part-filled table that no query will use and
+`--rebuild` starts over. That batching is what keeps the journal at megabytes: a
+single-transaction rebuild would have to journal the pre-image of every page the
+dropped index freed and the new one reuses, i.e. a journal the size of the index.
+`files`, `fts`, `chunks` and `vision` are read-only to a build.
+
+**Staleness.** Index jobs maintain the index as they write, but only jobs run by
+a build that has this feature: every earlier release writes `chunks` rows
+underneath it, and so does anything editing the corpus directly. `vec0::usable`
+therefore re-proves the index on every query against two witnesses recorded in
+`meta.vec0_index` — `meta.last_job_started_at` (moved by any job, whether or not
+it maintained the index) and the `chunks` row count (moved by an edit that
+bypassed the pipeline). Either mismatch falls back to the scan and puts the
+reason in `index_note`; neither is expensive, since both are indexed lookups
+against a k-NN that reads gigabytes.
+
+**Old readers.** The virtual table is inert to a build without `sqlite-vec`.
+SQLite records a virtual table's declaration in `sqlite_master` and instantiates
+its module only when a statement names the table, so an older `llm-index` reads,
+writes, migrates and prunes a corpus that has an index, and fails only on the one
+query it would never issue (`no such module: vec0`). `tests/old_binary.rs`
+asserts exactly that by cancelling this process' module registration and then
+running the older build's statements.
 
 ## Incremental consistency
 

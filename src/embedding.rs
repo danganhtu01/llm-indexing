@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -123,6 +123,10 @@ pub fn vector_search(
 ) -> Result<Vec<VectorHit>> {
     let mut embedder = Embedder::new(config)?;
     let query_vector = embedder.embed_query(query)?;
+    // Before the open, never after: `vec0` reaches a connection through
+    // SQLite's auto-extension list, which is consulted once as the connection
+    // is created. See [`crate::vec0::register`].
+    crate::vec0::register();
     let connection = Connection::open(index)?;
     Ok(rank_chunks(&connection, &config.embedding_model, &query_vector, limit)?.hits)
 }
@@ -131,7 +135,7 @@ pub fn vector_search(
 /// either way, so this bounds the RESPONSE, never the work.
 pub const MAX_HITS: usize = 100;
 
-/// The outcome of one exhaustive cosine scan over a corpus' `chunks` table.
+/// The outcome of one ranking pass over a corpus' `chunks` table.
 ///
 /// `compared` and `skipped` exist so an empty `hits` can be explained. "No
 /// matches" over a corpus with no vectors at all, and "no matches" over a
@@ -142,23 +146,155 @@ pub const MAX_HITS: usize = 100;
 pub struct VectorScan {
     pub hits: Vec<VectorHit>,
     /// Chunks actually ranked: those whose stored vector came from the model
-    /// the query was embedded with, at the same width.
+    /// the query was embedded with, at the same width. On the [`RankPath::Vec0`]
+    /// path these were ranked by the shadow index rather than read one by one,
+    /// so this is the index's row count — the same set, counted from the
+    /// recorded state instead of from the pass.
     pub compared: usize,
     /// Chunks passed over because another model (or another width) wrote them.
     /// Cosine across two embedding spaces is a meaningless number, so they are
     /// never scored — but they are counted.
     pub skipped: usize,
     /// The `model (Nd)` labels behind `skipped`, deduplicated and capped. What
-    /// turns "everything was skipped" into an actionable message.
+    /// turns "everything was skipped" into an actionable message. Empty on the
+    /// [`RankPath::Vec0`] path, which never reads the rows it excludes.
     pub other_models: Vec<String>,
+    /// Which of the two ranking paths produced `hits`.
+    pub path: RankPath,
+    /// Set only when a corpus HAS a shadow index that was not used, and says
+    /// why. A search that quietly stops being fast is indistinguishable from
+    /// one that was never made fast, and the two need completely different
+    /// operator responses — see [`crate::vec0::usable`].
+    pub index_note: Option<String>,
+}
+
+/// How a [`VectorScan`] was ranked.
+///
+/// Both paths return the same top-k with the same scores; they differ only in
+/// what they read to get there — the whole `chunks` table against just the
+/// vectors, 15.6 GB against 4.12 GB on the live corpus and roughly an order of
+/// magnitude in latency (`docs/ARCHITECTURE.md`). Reported to the caller because
+/// a 50 s answer and a 4 s one are otherwise the same JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankPath {
+    /// The exhaustive cosine scan. Always available; the only path a corpus
+    /// without a shadow index has.
+    Scan,
+    /// k-NN over the `vec0` shadow index, with the candidates re-scored against
+    /// the stored BLOBs.
+    Vec0,
+}
+
+impl RankPath {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scan => "scan",
+            Self::Vec0 => "vec0",
+        }
+    }
 }
 
 /// Rank a corpus' chunk embeddings against `query` by cosine similarity.
 ///
-/// An exhaustive streaming scan: every stored vector is scored where SQLite
-/// hands it over, so the top-k is exact rather than approximate and the whole
-/// pass allocates nothing per row. Three things keep that affordable on the
-/// live corpora (2.68 M vectors / 4.1 GB of BLOB in the largest):
+/// The entry point for every ranking surface, and the one place that decides
+/// which path a corpus can be ranked by. A corpus carrying a usable `vec0`
+/// shadow index is ranked by [`rank_by_index`]; every other corpus — which is
+/// every corpus that has not been through `llm-index vector-index`, and every
+/// corpus whose index cannot be vouched for — is ranked by [`scan_chunks`],
+/// exactly as before the index existed.
+///
+/// The capability is discovered from the corpus itself rather than configured:
+/// there is no flag to get wrong, and a corpus that loses (or never gains) its
+/// index degrades in latency and in nothing else. Both paths return the same
+/// hits with the same scores in the same order; [`VectorScan::path`] reports
+/// which one ran.
+pub fn rank_chunks(
+    connection: &Connection,
+    model: &str,
+    query: &[f32],
+    limit: usize,
+) -> Result<VectorScan> {
+    match crate::vec0::usable(connection, model, query.len())? {
+        crate::vec0::Usable::Ready(state) => rank_by_index(connection, &state, query, limit),
+        crate::vec0::Usable::Absent => scan_chunks(connection, model, query, limit, None),
+        crate::vec0::Usable::Declined(reason) => {
+            scan_chunks(connection, model, query, limit, Some(reason))
+        }
+    }
+}
+
+/// Rank through the `vec0` shadow index.
+///
+/// Two steps, and the second is what keeps this path honest: the index picks
+/// the CANDIDATES, and their scores are then recomputed from
+/// `chunks.embedding` with [`cosine_bytes`] — the scan's own arithmetic, on the
+/// scan's own bytes — and ordered by the scan's own [`Ranked`] comparison. So a
+/// `score` in a response is the same number whichever path produced it, and the
+/// index can never introduce a ranking of its own.
+///
+/// The candidate list is deliberately wider than `limit` ([`KNN_TIE_MARGIN`]).
+/// A k-NN returns SOME k nearest rows; where several vectors tie at the k-th
+/// distance, which of them it returns is its traversal order rather than the
+/// scan's "lower `chunks.id` wins". Over-fetching lets the re-score resolve
+/// those ties the scan's way, and costs nothing — a `vec0` k-NN's work is
+/// reading the vectors, not the size of its heap. Ties running deeper than the
+/// margin (more than 100 chunks at exactly the boundary distance, i.e. that
+/// many byte-identical vectors) can still pick a different member of the tie
+/// than the scan would; the hits are equally correct, and the alternative is
+/// giving up the index.
+fn rank_by_index(
+    connection: &Connection,
+    state: &crate::vec0::IndexState,
+    query: &[f32],
+    limit: usize,
+) -> Result<VectorScan> {
+    let limit = limit.clamp(1, MAX_HITS);
+    let width = query.len() * 4;
+    let query_norm = norm(query);
+    let candidates = crate::vec0::knn(connection, &vector_to_bytes(query), limit + KNN_TIE_MARGIN)?;
+    let mut best = TopK::new(limit);
+    let mut statement = connection.prepare("SELECT embedding FROM chunks WHERE id=?1")?;
+    for id in candidates {
+        // A candidate whose row has gone, or whose vector no longer has the
+        // query's width, is dropped rather than scored — the index is a copy,
+        // and this is the pass that treats `chunks` as the truth.
+        let scored = statement
+            .query_row([id], |row| {
+                let blob = row.get_ref(0)?.as_blob()?;
+                Ok((blob.len() == width).then(|| cosine_bytes(query, query_norm, blob)))
+            })
+            .optional()?
+            .flatten();
+        if let Some(score) = scored {
+            best.push(id, score);
+        }
+    }
+    let hits = hydrate(connection, &best.into_sorted())?;
+    Ok(VectorScan {
+        hits,
+        // The index holds exactly the rows the scan would have compared, and
+        // excludes exactly the rows it would have skipped — that is what
+        // `vec0::build` filters on. Reporting the recorded counts keeps the two
+        // paths' responses the same shape without reading 2.7 M rows to
+        // recount what the corpus already knows.
+        compared: state.vectors,
+        skipped: state.chunks.saturating_sub(state.vectors),
+        other_models: Vec::new(),
+        path: RankPath::Vec0,
+        index_note: None,
+    })
+}
+
+/// Candidates fetched beyond `limit` so boundary ties resolve the scan's way.
+/// See [`rank_by_index`].
+const KNN_TIE_MARGIN: usize = MAX_HITS;
+
+/// Rank a corpus' chunk embeddings by an exhaustive cosine scan.
+///
+/// Every stored vector is scored where SQLite hands it over, so the top-k is
+/// exact rather than approximate and the whole pass allocates nothing per row.
+/// Three things keep that affordable on the live corpora (2.68 M vectors /
+/// 4.1 GB of BLOB in the largest):
 ///
 /// * `content` is NOT selected. It is the bulk of a chunk row, it is needed for
 ///   at most `limit` of them, and pulling it for all 2.7 M would materialise
@@ -178,11 +314,16 @@ pub struct VectorScan {
 ///
 /// Ordering is deterministic: descending score, ties broken by ascending
 /// `chunks.id`.
-pub fn rank_chunks(
+///
+/// `index_note` is carried straight through onto the result: this function is
+/// reached with one set whenever a corpus HAS a shadow index that [`rank_chunks`]
+/// declined, and the caller is owed that reason.
+fn scan_chunks(
     connection: &Connection,
     model: &str,
     query: &[f32],
     limit: usize,
+    index_note: Option<String>,
 ) -> Result<VectorScan> {
     let limit = limit.clamp(1, MAX_HITS);
     let width = query.len() * 4;
@@ -213,6 +354,8 @@ pub fn rank_chunks(
         compared,
         skipped,
         other_models: other_models.into_iter().collect(),
+        path: RankPath::Scan,
+        index_note,
     })
 }
 
@@ -521,10 +664,12 @@ mod tests {
     /// A corpus holding only what ranking reads: one `chunks` row per
     /// `(id, file_id, model, vector)`, and a `files` row per distinct file id.
     fn corpus(rows: &[(i64, i64, &str, Vec<f32>)]) -> Connection {
+        crate::vec0::register();
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, name TEXT);
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, name TEXT);
                  CREATE TABLE chunks(
                    id INTEGER PRIMARY KEY,
                    file_id INTEGER NOT NULL,
@@ -701,13 +846,20 @@ mod tests {
         }
     }
 
-    /// Live scan latency over a real corpus — runs only when
+    /// Live ranking latency over a real corpus — runs only when
     /// `LLM_INDEX_BENCH_CORPUS` names one, otherwise it skips, so CI needs no
     /// multi-GB fixture. `LLM_INDEX_BENCH_PASSES` (default 3) bounds how many
     /// full scans it costs; every pass reads the whole `chunks` table, so keep
     /// it at 1 when pointing this at something big. Build with `--release`: a
     /// debug build measures rustc's bounds checks, not the scan. The numbers
     /// this produced on the live corpora are in `docs/ARCHITECTURE.md`.
+    ///
+    /// When the corpus carries a `vec0` shadow index this measures BOTH paths,
+    /// back to back on the same machine in the same session — the only way the
+    /// two numbers are comparable, since the absolute cost of either is mostly
+    /// the page cache. It then asserts they returned the same hits with the same
+    /// scores, so the equivalence claim is checked against 2.68 M live vectors
+    /// and not only against the fixtures above.
     #[test]
     fn scan_latency_over_a_real_corpus() {
         let Ok(path) = std::env::var("LLM_INDEX_BENCH_CORPUS") else {
@@ -718,6 +870,7 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(3);
+        crate::vec0::register();
         let connection = rusqlite::Connection::open_with_flags(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -753,7 +906,7 @@ mod tests {
         );
         for pass in 1..=passes {
             let started = std::time::Instant::now();
-            let scan = rank_chunks(&connection, EMBEDDING_MODEL, &query, 20).unwrap();
+            let scan = scan_chunks(&connection, EMBEDDING_MODEL, &query, 20, None).unwrap();
             eprintln!(
                 "pass {pass}: compared {} skipped {} -> {} hits in {:?}; best {:?}",
                 scan.compared,
@@ -765,6 +918,210 @@ mod tests {
                     .map(|hit| (hit.path.clone(), hit.chunk_index, hit.score)),
             );
         }
+        // The other half of the same measurement, when the corpus has a shadow
+        // index (`llm-index vector-index`): the k-NN path over the SAME corpus
+        // and the SAME query, so the two numbers are comparable and the hits can
+        // be checked against each other rather than merely timed.
+        match crate::vec0::usable(&connection, EMBEDDING_MODEL, query.len()).unwrap() {
+            crate::vec0::Usable::Absent => {
+                eprintln!("no vec0 shadow index in this corpus; scan numbers only")
+            }
+            crate::vec0::Usable::Declined(reason) => eprintln!("shadow index not used: {reason}"),
+            crate::vec0::Usable::Ready(state) => {
+                eprintln!(
+                    "shadow index: {} vectors over {} chunks, built by {}",
+                    state.vectors, state.chunks, state.builder
+                );
+                let mut ranked = None;
+                for pass in 1..=passes {
+                    let started = std::time::Instant::now();
+                    let indexed = rank_chunks(&connection, EMBEDDING_MODEL, &query, 20).unwrap();
+                    eprintln!(
+                        "vec0 pass {pass}: {} hits in {:?}; best {:?}",
+                        indexed.hits.len(),
+                        started.elapsed(),
+                        indexed.hits.first().map(|hit| (
+                            hit.path.clone(),
+                            hit.chunk_index,
+                            hit.score
+                        )),
+                    );
+                    ranked = Some(indexed);
+                }
+                // Equivalence on the live corpus, not just on a fixture: the
+                // same top-20, in the same order, with the same scores.
+                let indexed = ranked.expect("at least one pass");
+                let scanned = scan_chunks(&connection, EMBEDDING_MODEL, &query, 20, None).unwrap();
+                assert_eq!(
+                    indexed
+                        .hits
+                        .iter()
+                        .map(|hit| (hit.path.clone(), hit.chunk_index, hit.score.to_bits()))
+                        .collect::<Vec<_>>(),
+                    scanned
+                        .hits
+                        .iter()
+                        .map(|hit| (hit.path.clone(), hit.chunk_index, hit.score.to_bits()))
+                        .collect::<Vec<_>>(),
+                    "the index and the scan must agree over the live corpus"
+                );
+                eprintln!("index and scan agree on all {} hits", scanned.hits.len());
+            }
+        }
+    }
+
+    /// A corpus of `count` unit vectors spread over a half-circle, so no two
+    /// share a score and the exact top-k is unambiguous, plus a handful of rows
+    /// the index must exclude. Deterministic: no RNG, so a failure here is
+    /// always reproducible.
+    fn indexable_corpus(count: i64) -> Connection {
+        let mut rows = (1..=count)
+            .map(|id| {
+                let angle = id as f32 * std::f32::consts::PI / (count as f32 + 1.0);
+                (id, id, MODEL, vec![angle.cos(), angle.sin(), 0.0])
+            })
+            .collect::<Vec<_>>();
+        rows.push((count + 1, count + 1, "clip-vit-b32", vec![1.0, 0.0, 0.0]));
+        rows.push((count + 2, count + 2, MODEL, vec![1.0, 0.0, 0.0, 0.0]));
+        corpus(&rows)
+    }
+
+    /// The query used by the equivalence tests. Off-axis on purpose: an axis
+    /// query would put the winner at exactly 1.0 and hide any drift.
+    const PROBE: [f32; 3] = [0.8, 0.6, 0.0];
+
+    #[test]
+    fn the_shadow_index_returns_exactly_what_the_scan_returns() {
+        // The claim the whole index rests on: it changes how long a query takes
+        // and nothing else. Same hits, same order, same scores to the bit —
+        // which they must be, because the index only nominates candidates and
+        // the scores are recomputed from the same BLOBs by the same cosine.
+        let mut connection = indexable_corpus(500);
+        let scanned = scan_chunks(&connection, MODEL, &PROBE, 20, None).unwrap();
+        crate::vec0::build(&mut connection, MODEL, 3, |_, _| {}).unwrap();
+        let indexed = rank_chunks(&connection, MODEL, &PROBE, 20).unwrap();
+
+        assert_eq!(scanned.path, RankPath::Scan);
+        assert_eq!(indexed.path, RankPath::Vec0);
+        assert_eq!(indexed.index_note, None);
+        assert_eq!(
+            indexed
+                .hits
+                .iter()
+                .map(|hit| (hit.content.clone(), hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            scanned
+                .hits
+                .iter()
+                .map(|hit| (hit.content.clone(), hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+        );
+        // And the counts stay comparable: the index covers exactly the rows the
+        // scan compared, and excludes exactly the ones it skipped.
+        assert_eq!(indexed.compared, scanned.compared);
+        assert_eq!(indexed.skipped, scanned.skipped);
+    }
+
+    #[test]
+    fn a_rebuilt_index_agrees_with_the_scan_it_was_rebuilt_from() {
+        // Rebuild-from-BLOBs is how the live corpora gain an index: nothing is
+        // re-embedded, so the rebuilt index has to reproduce the scan's answer
+        // over the vectors already stored. Rebuilt twice, because a rebuild
+        // over an existing index is the repair path an operator actually runs.
+        let mut connection = indexable_corpus(300);
+        crate::vec0::build(&mut connection, MODEL, 3, |_, _| {}).unwrap();
+        crate::vec0::build(&mut connection, MODEL, 3, |_, _| {}).unwrap();
+        for limit in [1, 5, 20, MAX_HITS] {
+            let indexed = rank_chunks(&connection, MODEL, &PROBE, limit).unwrap();
+            let scanned = scan_chunks(&connection, MODEL, &PROBE, limit, None).unwrap();
+            assert_eq!(indexed.path, RankPath::Vec0);
+            assert_eq!(
+                indexed
+                    .hits
+                    .iter()
+                    .map(|hit| hit.content.clone())
+                    .collect::<Vec<_>>(),
+                scanned
+                    .hits
+                    .iter()
+                    .map(|hit| hit.content.clone())
+                    .collect::<Vec<_>>(),
+                "limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_corpus_without_an_index_ranks_by_the_scan_and_says_nothing_about_it() {
+        // The default, and the capability fallback in its quiet form: no index,
+        // no note, no difference from the release before this one.
+        let connection = indexable_corpus(50);
+        let scan = rank_chunks(&connection, MODEL, &PROBE, 5).unwrap();
+        assert_eq!(scan.path, RankPath::Scan);
+        assert_eq!(scan.index_note, None);
+        assert_eq!(scan.hits.len(), 5);
+    }
+
+    #[test]
+    fn a_stale_index_is_bypassed_and_the_answer_is_still_right() {
+        // What an older build writing into an indexed corpus leaves behind. The
+        // fallback is not a formality: the row it wrote is a genuine top hit,
+        // and a k-NN over the index could not have found it.
+        let mut connection = indexable_corpus(100);
+        crate::vec0::build(&mut connection, MODEL, 3, |_, _| {}).unwrap();
+        connection
+            .execute(
+                "INSERT INTO files(id,path,name) VALUES(9001,'/corpus/late.txt','late.txt')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO chunks(id,file_id,chunk_index,content,embedding,dimensions,model) \
+                 VALUES(9001,9001,0,'written behind the index',?1,3,?2)",
+                rusqlite::params![vector_to_bytes(&PROBE), MODEL],
+            )
+            .unwrap();
+
+        let scan = rank_chunks(&connection, MODEL, &PROBE, 5).unwrap();
+        assert_eq!(scan.path, RankPath::Scan);
+        assert!(
+            scan.index_note
+                .as_deref()
+                .is_some_and(|note| note.contains("stale")),
+            "{:?}",
+            scan.index_note
+        );
+        assert_eq!(scan.hits[0].content, "written behind the index");
+        assert!((scan.hits[0].score - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn the_index_drops_a_candidate_whose_chunk_row_has_gone() {
+        // `chunks` is the truth and the index is a copy, so a candidate the copy
+        // still knows about is dropped by the re-score rather than returned
+        // pathless or scored from the stale vector.
+        let mut connection = indexable_corpus(20);
+        crate::vec0::build(&mut connection, MODEL, 3, |_, _| {}).unwrap();
+        let top = rank_chunks(&connection, MODEL, &PROBE, 1).unwrap().hits[0]
+            .content
+            .clone();
+        // Delete the winner's chunk row without touching the index, then keep
+        // the staleness witness in step so the index is still used.
+        connection
+            .execute("DELETE FROM chunks WHERE content=?1", [&top])
+            .unwrap();
+        let mut state = crate::vec0::state(&connection).unwrap().unwrap();
+        state.chunks -= 1;
+        crate::vec0::write_state(&connection, &state).unwrap();
+
+        let scan = rank_chunks(&connection, MODEL, &PROBE, 5).unwrap();
+        assert_eq!(scan.path, RankPath::Vec0);
+        assert!(
+            scan.hits.iter().all(|hit| hit.content != top),
+            "a deleted chunk must not come back through the index"
+        );
+        assert_eq!(scan.hits.len(), 5, "and the page is still full");
     }
 
     #[test]
