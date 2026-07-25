@@ -9,6 +9,7 @@ use chardetng::EncodingDetector;
 use mailparse::{parse_mail, MailHeaderMap, ParsedMail};
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use sha1::{Digest, Sha1};
 use tempfile::tempdir;
 use zip::ZipArchive;
 
@@ -46,6 +47,47 @@ const EMAIL_EXTS: &[&str] = &[".eml", ".wdseml", ".emlx"];
 const AUDIO_EXTS: &[&str] = &[".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"];
 const VIDEO_EXTS: &[&str] = &[".mkv", ".mp4", ".mov", ".m4v", ".avi", ".webm"];
 const ARCHIVE_EXTS: &[&str] = &[".zip", ".rar", ".7z", ".tar", ".gz", ".tgz"];
+/// The extensions `extract_inner`'s dispatch handles by name. Duplicated out of
+/// that `match` so [`extractor_revision`] moves when the dispatch gains or loses
+/// a format; `dispatched_extensions_are_not_reported_unsupported` pins them
+/// together.
+const DOCUMENT_EXTS: &[&str] = &[
+    ".pdf", ".doc", ".docx", ".xlsx", ".xlsm", ".pptx", ".odt", ".ods", ".odp",
+];
+
+/// A fingerprint of what THIS BUILD is able to extract, recorded on the corpus
+/// so a resume can tell that the engine's capability changed since the rows it
+/// is looking at were written.
+///
+/// It exists for the attempt cap ([`crate::pipeline::MAX_ATTEMPTS`]). A row
+/// capped for a file the old build genuinely could not read must not stay capped
+/// once a build that CAN read it is deployed — the cap would otherwise freeze
+/// every `.heic`, every newly dispatched format, on the verdict of the code that
+/// had no decoder for it. Derived from the extension tables rather than
+/// hand-maintained so it moves on its own the moment one gains an entry, with
+/// the crate version folded in so a release that changes extraction some other
+/// way (a fixed OCR fallback, a new error path) also grants capped rows one more
+/// attempt. Cheap enough to call once per run; never on a per-file path.
+pub fn extractor_revision() -> String {
+    let mut hash = Sha1::new();
+    hash.update(env!("CARGO_PKG_VERSION"));
+    for table in [
+        TEXT_EXTS,
+        CODE_EXTS,
+        IMAGE_EXTS,
+        EMAIL_EXTS,
+        AUDIO_EXTS,
+        VIDEO_EXTS,
+        ARCHIVE_EXTS,
+        DOCUMENT_EXTS,
+    ] {
+        for ext in table {
+            hash.update(ext);
+        }
+    }
+    let digest = format!("{:x}", hash.finalize());
+    digest[..12].to_string()
+}
 
 #[derive(Debug, Clone)]
 pub struct Extracted {
@@ -56,10 +98,31 @@ pub struct Extracted {
 }
 
 impl Extracted {
+    /// Nothing was extracted, but something COULD have been: the file was over
+    /// `max_bytes`, or its extension is in `skip_exts`, or a stage that handles
+    /// it was switched off. Every one of those is a configuration verdict, so the
+    /// row stays retryable (`name-only-partial`) and a later run with a larger
+    /// budget or a stage enabled reprocesses it.
     fn empty() -> Self {
         Self {
             text: String::new(),
             method: "name-only".into(),
+            ocr_used: false,
+            pages: 0,
+        }
+    }
+
+    /// No extractor in this build handles this extension at all — object files,
+    /// game archives, compiler intermediates: 48k of the live corpus. TERMINAL,
+    /// not a failure. `excluded:` is the repo's "deliberately not processed"
+    /// marker and resume treats it as a finished row, so unlike the
+    /// `name-only-partial` this used to produce, it is not re-attempted on every
+    /// resume forever. A build that later grows a decoder for it moves
+    /// [`extractor_revision`], which is what re-opens these rows.
+    fn unsupported() -> Self {
+        Self {
+            text: String::new(),
+            method: "excluded:unsupported".into(),
             ocr_used: false,
             pages: 0,
         }
@@ -158,7 +221,18 @@ fn extract_inner(
         _ if ARCHIVE_EXTS.contains(&ext) && depth < 4 => {
             archive(path, config, ocr, transcriber, depth + 1, max_chars)
         }
-        _ => Ok(Extracted::empty()),
+        // A format this build DOES handle whose arm above declined on a runtime
+        // condition — OCR off or Tesseract absent for an image, an archive past
+        // the nesting limit. The capability exists, so the row must stay
+        // retryable rather than be written off as unsupported.
+        _ if IMAGE_EXTS.contains(&ext)
+            || AUDIO_EXTS.contains(&ext)
+            || VIDEO_EXTS.contains(&ext)
+            || ARCHIVE_EXTS.contains(&ext) =>
+        {
+            Ok(Extracted::empty())
+        }
+        _ => Ok(Extracted::unsupported()),
     }
 }
 
@@ -696,4 +770,117 @@ fn pdf_pages(path: &Path) -> usize {
                 .and_then(|n| n.parse().ok())
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extracted(name: &str) -> Extracted {
+        let mut config = Config::default();
+        config.ocr = "off".into();
+        config.finalize();
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(name);
+        fs::write(&path, b"not a real document").unwrap();
+        // Exactly how the walker derives `ext`, empty extension included — the
+        // 26,442 extensionless rows on the live corpus reach `extract` this way.
+        let ext = path
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
+            .unwrap_or_default();
+        extract(
+            &path,
+            &ext,
+            19,
+            &config,
+            &TesseractOcr::new(&config),
+            &Transcriber::new(&config),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_extension_no_extractor_handles_is_terminal_not_a_failure() {
+        // The 48k `.o`/`.xnb`/`.rlib` rows: nothing in this build reads them, and
+        // nothing ever will, so they must land on the terminal `excluded:` marker
+        // rather than the `name-only-partial` that resume re-attempted forever.
+        for name in ["build.o", "assets.xnb", "libcore.rlib", "no_extension"] {
+            assert_eq!(
+                extracted(name).method,
+                "excluded:unsupported",
+                "{name} has no extractor in this build"
+            );
+        }
+    }
+
+    #[test]
+    fn a_format_this_build_handles_stays_retryable_when_a_stage_declines() {
+        // OCR is off here, so the image arm declines — but the capability exists,
+        // and a later run with OCR on must read the file. Writing it off as
+        // unsupported would make a config choice permanent.
+        assert_eq!(extracted("scan.png").method, "name-only");
+    }
+
+    #[test]
+    fn dispatched_extensions_are_not_reported_unsupported() {
+        // DOCUMENT_EXTS is a copy of the dispatch's own arms, kept only so the
+        // capability fingerprint moves when a format is added. This is what stops
+        // the copy from drifting: every extension it claims must reach a real
+        // extractor, which on this junk input either errors or extracts nothing —
+        // never `excluded:unsupported`.
+        let mut config = Config::default();
+        config.ocr = "off".into();
+        config.finalize();
+        let temp = tempdir().unwrap();
+        for ext in DOCUMENT_EXTS {
+            let path = temp.path().join(format!("sample{ext}"));
+            fs::write(&path, b"not a real document").unwrap();
+            let method = extract(
+                &path,
+                ext,
+                19,
+                &config,
+                &TesseractOcr::new(&config),
+                &Transcriber::new(&config),
+            )
+            .map(|extracted| extracted.method)
+            .unwrap_or_else(|_| "error".into());
+            assert_ne!(
+                method, "excluded:unsupported",
+                "{ext} is dispatched by name"
+            );
+        }
+    }
+
+    #[test]
+    fn the_extractor_revision_is_stable_and_moves_with_the_capability_tables() {
+        // Stable, because a fingerprint that changed between two runs of the same
+        // binary would hand every capped row a free attempt on every resume.
+        assert_eq!(extractor_revision(), extractor_revision());
+        assert_eq!(extractor_revision().len(), 12);
+        // And it is derived from the tables rather than hand-maintained, so
+        // teaching this build a new format moves it without anyone remembering to.
+        let mut with_heic = Sha1::new();
+        with_heic.update(env!("CARGO_PKG_VERSION"));
+        for table in [
+            TEXT_EXTS,
+            CODE_EXTS,
+            IMAGE_EXTS,
+            EMAIL_EXTS,
+            AUDIO_EXTS,
+            VIDEO_EXTS,
+            ARCHIVE_EXTS,
+            DOCUMENT_EXTS,
+        ] {
+            for ext in table {
+                with_heic.update(ext);
+            }
+        }
+        with_heic.update(".heic");
+        assert_ne!(
+            extractor_revision(),
+            format!("{:x}", with_heic.finalize())[..12].to_string()
+        );
+    }
 }

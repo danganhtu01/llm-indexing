@@ -148,11 +148,16 @@ intact, but irreversibly once indexing has begun.
 
 Resume uses path, size and mtime and also repairs records missing vectors or
 marked partial/error. It reprocesses older PDF methods when exhaustive OCR is
-requested. Source files removed from the mounted tree are pruned from `files`,
-FTS and vector chunks — unless the walk found no files at all, which is treated
-as an unmounted or mistyped root rather than an instruction to empty the corpus.
-The job result reports `incomplete`, `embedded_chunks` and `removed`, allowing
-callers to show authentic state.
+requested. A record that has failed three times without finishing is then left
+alone: re-extracting a file the engine cannot read costs the same on every resume
+and produces the same row. Changed bytes, an available upgrade, a changed
+embedding model, a build whose extraction capability has moved, and the explicit
+`retry_errors` / `--retry-errors` flag (default off) each reopen it. Source files
+removed from the mounted tree are pruned from `files`, FTS and vector chunks —
+unless the walk found no files at all, which is treated as an unmounted or
+mistyped root rather than an instruction to empty the corpus. The job result
+reports `incomplete`, `capped`, `embedded_chunks` and `removed`, allowing callers
+to show authentic state.
 
 Service callers may additionally provide a confined `include_paths` list of
 relative file paths. The engine still scans the mounted tree to prune deletions,
