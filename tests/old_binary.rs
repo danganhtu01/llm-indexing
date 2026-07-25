@@ -162,8 +162,10 @@ fn a_corpus_with_a_shadow_index_stays_readable_and_writable_without_the_module()
                 )
                 .unwrap();
         }
-        let report = vec0::build(&mut connection, EMBEDDING_MODEL, 3, |_, _| {}).unwrap();
-        assert_eq!(report.vectors, 8);
+        for tier in [vec0::Tier::Float, vec0::Tier::Int8] {
+            let report = vec0::build(&mut connection, tier, EMBEDDING_MODEL, 3, |_, _| {}).unwrap();
+            assert_eq!(report.vectors, 8, "{tier:?}");
+        }
     }
 
     // 2. Become an older binary: no `vec0` module from here on.
@@ -263,19 +265,26 @@ fn a_corpus_with_a_shadow_index_stays_readable_and_writable_without_the_module()
     )
     .unwrap();
 
-    // 4. The ONE thing it cannot do is query the virtual table — which it never
-    //    would, because nothing in a build without this feature mentions it.
-    let refused = old
-        .prepare(&format!("SELECT rowid FROM {} LIMIT 1", vec0::SHADOW_TABLE))
-        .expect_err("a build with no vec0 module cannot read a vec0 table");
-    assert!(refused.to_string().contains("no such module"), "{refused}");
-    // Its shadow storage is ordinary tables, so even that is readable.
-    let shadow_rows: i64 = old
-        .query_row("SELECT COUNT(*) FROM chunks_vec_rowids", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(shadow_rows, 8);
+    // 4. The ONE thing it cannot do is query the virtual tables — which it
+    //    never would, because nothing in a build without this feature mentions
+    //    them. Both slots, because the quantised one is a second
+    //    `CREATE VIRTUAL TABLE` in the same published corpus and inherits none
+    //    of the first one's evidence.
+    for slot in vec0::Slot::ALL {
+        let refused = old
+            .prepare(&format!("SELECT rowid FROM {} LIMIT 1", slot.table()))
+            .expect_err("a build with no vec0 module cannot read a vec0 table");
+        assert!(refused.to_string().contains("no such module"), "{refused}");
+        // Their shadow storage is ordinary tables, so even that is readable.
+        let shadow_rows: i64 = old
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {}_rowids", slot.table()),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shadow_rows, 8, "{slot:?}");
+    }
     drop(old);
 
     // 5. Back in a build that HAS the module: the corpus the older binary wrote
@@ -296,26 +305,34 @@ fn a_corpus_with_a_shadow_index_stays_readable_and_writable_without_the_module()
         .map(Result::unwrap)
         .collect();
     assert_eq!(faces, vec![(1, 0, None), (1, 1, None), (3, 0, Some(7))]);
-    assert_eq!(
-        chunks as usize,
-        vec0::state(&connection).unwrap().unwrap().chunks,
-        "the row count is no help here — that is the point"
-    );
-    let vec0::Usable::Declined(reason) = vec0::usable(&connection, EMBEDDING_MODEL, 3).unwrap()
-    else {
-        panic!("an index written behind by an older binary must not be served from")
-    };
-    assert!(reason.contains("stale"), "{reason}");
-    assert!(reason.contains("--rebuild"), "{reason}");
+    for slot in vec0::Slot::ALL {
+        assert_eq!(
+            chunks as usize,
+            vec0::state(&connection, slot).unwrap().unwrap().chunks,
+            "the row count is no help here — that is the point"
+        );
+        let vec0::Usable::Declined(reason) =
+            vec0::usable(&connection, slot, EMBEDDING_MODEL, 3).unwrap()
+        else {
+            panic!("an index written behind by an older binary must not be served from")
+        };
+        assert!(reason.contains("stale"), "{reason}");
+        assert!(reason.contains("--rebuild"), "{reason}");
+    }
 
     // And the repair works from here: a rebuild reads the corpus the older
     // binary left and the index is trustworthy again — with nothing
     // re-embedded, because every vector it needs is already in `chunks`.
     let mut connection = connection;
-    let report = vec0::build(&mut connection, EMBEDDING_MODEL, 3, |_, _| {}).unwrap();
-    assert_eq!(report.vectors, 8);
-    assert!(matches!(
-        vec0::usable(&connection, EMBEDDING_MODEL, 3).unwrap(),
-        vec0::Usable::Ready(_)
-    ));
+    for tier in [vec0::Tier::Float, vec0::Tier::Int8] {
+        let report = vec0::build(&mut connection, tier, EMBEDDING_MODEL, 3, |_, _| {}).unwrap();
+        assert_eq!(report.vectors, 8, "{tier:?}");
+        assert!(
+            matches!(
+                vec0::usable(&connection, tier.slot(), EMBEDDING_MODEL, 3).unwrap(),
+                vec0::Usable::Ready(_)
+            ),
+            "{tier:?}"
+        );
+    }
 }

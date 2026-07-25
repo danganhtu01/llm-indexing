@@ -155,12 +155,18 @@ struct VectorSearchArgs {
 }
 
 /// `vector-index` — build, rebuild, inspect or drop a corpus' OPTIONAL `vec0`
-/// shadow index.
+/// shadow indexes.
 ///
-/// The index is a derived copy of `chunks.embedding` that makes
-/// `/corpus/search?mode=semantic` a k-NN lookup instead of a full scan. It is
-/// built from the BLOBs a corpus already holds: an existing corpus gains one
-/// without re-embedding a single document, and dropping it loses nothing.
+/// An index is a derived copy of `chunks.embedding` that makes
+/// `/corpus/search` a k-NN lookup instead of a full scan. It is built from the
+/// BLOBs a corpus already holds: an existing corpus gains one without
+/// re-embedding a single document, and dropping it loses nothing.
+///
+/// A corpus can carry two at once, and `--tier` picks which one this invocation
+/// touches. The `float` tier serves the default `mode=semantic` and returns
+/// exactly what the scan returns; the `int8` and `bit` tiers serve
+/// `mode=semantic_fast` only, and return an approximation whose measured
+/// recall is in `docs/ARCHITECTURE.md`.
 ///
 /// Nothing here is implicit. A corpus has no index until this is run against it,
 /// and an index that exists is maintained by later index jobs. Rebuilding is the
@@ -169,20 +175,54 @@ struct VectorSearchArgs {
 struct VectorIndexArgs {
     #[arg(long, default_value = "index_out/index.sqlite")]
     index: PathBuf,
-    /// Replace an existing index. Without it, an already-indexed corpus is
-    /// reported and left alone — a rebuild reads every vector in the corpus and
-    /// is not something to trigger by re-running a command.
+    /// Which representation to store the copy in.
+    ///
+    /// `float` is exact: its candidates re-score into the same top-k the scan
+    /// produces, which is why it is the only tier the default query path will
+    /// read. `int8` and `bit` are QUANTISED — smaller and faster, and they
+    /// change which rows come back, so they are reachable only from
+    /// `mode=semantic_fast`. A corpus holds at most one quantised index:
+    /// building `bit` over an `int8` corpus replaces it.
+    #[arg(long, value_enum, default_value_t = TierArg::Float)]
+    tier: TierArg,
+    /// Replace an existing index of this tier's slot. Without it, an
+    /// already-indexed corpus is reported and left alone — a rebuild reads
+    /// every vector in the corpus and is not something to trigger by re-running
+    /// a command.
     #[arg(long)]
     rebuild: bool,
-    /// Remove the index and its `meta` record, leaving the corpus exactly as it
-    /// was before it had one. Semantic search falls back to the scan.
+    /// Remove this tier's index and its `meta` record, leaving the corpus
+    /// exactly as it was before it had one. Semantic search falls back to the
+    /// remaining path.
     #[arg(long, conflicts_with = "rebuild")]
     drop: bool,
-    /// Report what the corpus holds and change nothing.
+    /// Report what the corpus holds, in both slots, and change nothing.
     #[arg(long, conflicts_with_all = ["rebuild", "drop"])]
     status: bool,
     #[arg(long)]
     config: Option<PathBuf>,
+}
+
+/// `--tier` as clap sees it.
+///
+/// A separate enum from [`llm_indexing::vec0::Tier`] so the library stays free
+/// of the CLI parser, which is the same separation `--ocr` and the other mode
+/// flags already keep.
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum TierArg {
+    Float,
+    Int8,
+    Bit,
+}
+
+impl From<TierArg> for llm_indexing::vec0::Tier {
+    fn from(tier: TierArg) -> Self {
+        match tier {
+            TierArg::Float => Self::Float,
+            TierArg::Int8 => Self::Int8,
+            TierArg::Bit => Self::Bit,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -318,7 +358,7 @@ fn vector_search_command(args: VectorSearchArgs) -> Result<()> {
     Ok(())
 }
 
-/// Build / rebuild / drop / report the `vec0` shadow index of one corpus.
+/// Build / rebuild / drop / report one tier of a corpus' `vec0` shadow indexes.
 ///
 /// Opens the corpus read-WRITE and is the only surface in this crate that
 /// does so outside an index job — which is why it is a CLI subcommand rather
@@ -330,13 +370,23 @@ fn vector_search_command(args: VectorSearchArgs) -> Result<()> {
 /// The build never writes `chunks`, so it is safe against the corpus in the
 /// sense that matters: an interrupted one leaves the corpus exactly as it was
 /// plus a table no query will use.
+///
+/// Every report describes BOTH slots, whichever one the invocation touched: the
+/// question an operator is actually asking is what this corpus can serve, and
+/// that is the pair.
 fn vector_index_command(args: VectorIndexArgs) -> Result<()> {
     let config = Config::load(args.config.as_deref())?;
+    let tier: llm_indexing::vec0::Tier = args.tier.into();
+    let slot = tier.slot();
     let mut connection = connect(&args.index)?;
     let describe = |connection: &_| -> Result<()> {
         println!(
             "{}",
-            serde_json::to_string_pretty(&llm_indexing::vec0::describe(connection)?)?
+            serde_json::to_string_pretty(&serde_json::json!({
+                "exact": llm_indexing::vec0::describe(connection, llm_indexing::vec0::Slot::Exact)?,
+                "quantised":
+                    llm_indexing::vec0::describe(connection, llm_indexing::vec0::Slot::Quantised)?,
+            }))?
         );
         Ok(())
     };
@@ -344,11 +394,14 @@ fn vector_index_command(args: VectorIndexArgs) -> Result<()> {
         return describe(&connection);
     }
     if args.drop {
-        llm_indexing::vec0::drop_index(&connection)?;
+        llm_indexing::vec0::drop_index(&connection, slot)?;
         return describe(&connection);
     }
-    if llm_indexing::vec0::present(&connection)? && !args.rebuild {
-        eprintln!("this corpus already has a shadow index; pass --rebuild to replace it");
+    if llm_indexing::vec0::present(&connection, slot)? && !args.rebuild {
+        eprintln!(
+            "this corpus already has a {} shadow index; pass --rebuild to replace it",
+            slot.table()
+        );
         return describe(&connection);
     }
     // 384 for `multilingual-e5-small` — read out of the corpus, not out of a
@@ -365,6 +418,7 @@ fn vector_index_command(args: VectorIndexArgs) -> Result<()> {
     let started = std::time::Instant::now();
     let report = llm_indexing::vec0::build(
         &mut connection,
+        tier,
         &config.embedding_model,
         dimensions,
         |written, total| {
@@ -377,8 +431,13 @@ fn vector_index_command(args: VectorIndexArgs) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
+            "tier": tier.as_str(),
             "vectors": report.vectors,
             "skipped": report.skipped,
+            // What this index cost the corpus, which is the question an
+            // operator is really asking and which the file size cannot answer
+            // for a REBUILD (it reuses the pages the dropped index freed).
+            "vector_bytes": report.vectors * tier.bytes_per_vector(dimensions),
             "elapsed_ms": started.elapsed().as_millis() as u64,
             "state": report.state,
         }))?

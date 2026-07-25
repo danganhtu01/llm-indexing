@@ -52,7 +52,9 @@ vision(file_id, mode, width, height, phash, exif_json, quality_json,
 meta(key, value)
 
 -- OPTIONAL, created only by `llm-index vector-index`:
-chunks_vec USING vec0(embedding float[384] distance_metric=cosine)
+chunks_vec   USING vec0(embedding float[384] distance_metric=cosine)  -- exact
+chunks_vec_q USING vec0(embedding bit[384])                           -- quantised
+             -- or int8[384] distance_metric=cosine, whichever tier was built
 ```
 
 Normalization combines lowercased words, Unicode diacritic folding, English
@@ -97,27 +99,41 @@ reads the existing BLOBs with no schema change — but at 4.09-6.81 s per millio
 it is the same I/O-bound pass, and it agreed with this scan's ranking to the
 last decimal on a million live vectors. Its `vec0` half is a corpus-format
 change: it needs shadow tables WRITTEN into the corpus, which the read-only
-`/corpus/*` surface cannot do. That is what the optional shadow index below is,
-and why building one is a CLI subcommand rather than a route.
+`/corpus/*` surface cannot do. That is what the optional shadow indexes below
+are, and why building one is a CLI subcommand rather than a route.
 
-### The optional vec0 shadow index
+### The optional vec0 shadow indexes
 
-`llm-index vector-index` adds a `chunks_vec` virtual table holding a second copy
-of every `chunks.embedding` BLOB. Semantic search then asks it for the k nearest
-candidates instead of reading the whole `chunks` table. It is off until an
-operator builds it, per corpus, and nothing creates it implicitly.
+`llm-index vector-index` adds a virtual table holding a derived copy of every
+`chunks.embedding` BLOB. Semantic search then asks it for the k nearest
+candidates instead of reading the whole `chunks` table. Both are off until an
+operator builds them, per corpus, and nothing creates either implicitly.
 
-It buys latency and only latency. The k-NN nominates candidates; their scores are
-recomputed from `chunks.embedding` with the scan's own `cosine_bytes` and ordered
-by the scan's own comparison, so a `score` is the same number and the top-k is the
-same list whichever path ran. `scan_latency_over_a_real_corpus` asserts that over
-the live corpus, not just over fixtures, and `/corpus/search` reports which path
-served each request (`path: "scan" | "vec0"`).
+A corpus can carry two, in two SLOTS with different promises:
 
-Measured on BOTH live corpora with `scan_latency_over_a_real_corpus` (release
-build, copies of the live files, each pair back to back in one session on one
-workstation — a GPU recovery job was running throughout, which is why the spreads
-are wide and why the *ratio* within a row is worth more than any single number):
+| slot | table | tier | who reads it | promise |
+|---|---|---|---|---|
+| exact | `chunks_vec` | `float` | `mode=semantic` (the default) and `mode=semantic_fast` as a fallback | the scan's own top-k, same scores, same order |
+| quantised | `chunks_vec_q` | `int8` or `bit` | `mode=semantic_fast` only | an approximation, measured below |
+
+`rank_chunks` looks in the exact slot and nowhere else, so building a fast index
+can never change what the default query path returns. `rank_chunks_fast` is the
+only function that reads the quantised slot, and `/corpus/search` reports both
+`path` (which one ran) and `exact` (whether the answer is the scan's).
+
+Every path re-scores its candidates from `chunks.embedding` with the scan's own
+`cosine_bytes` and orders them by the scan's own comparison, so a `score` is a
+true cosine against the stored vector whichever index nominated the row. What
+quantisation changes is which rows were scored at all — never what a score means.
+
+#### The exact tier
+
+It buys latency and only latency: `scan_latency_over_a_real_corpus` asserts the
+same hits, in the same order, with the same scores to the bit, over the live
+corpora rather than over fixtures. Measured on BOTH (release build, copies of the
+live files, each pair back to back in one session on one workstation — a GPU
+recovery job was running throughout, which is why the spreads are wide and why
+the *ratio* within a row is worth more than any single number):
 
 | vectors | corpus | scan reads | scan, warm passes | k-NN reads | `vec0` k-NN, warm passes |
 |---|---|---|---|---|---|
@@ -128,56 +144,173 @@ are wide and why the *ratio* within a row is worth more than any single number):
 speedup is layout, not algorithm — vectors packed into contiguous chunk blobs
 instead of one row per chunk, so a query reads only the vectors and skips
 `content` entirely. It still visits every vector, and the cost is still the bytes.
-Best observed is 1.32 s at 869 k vectors and 3.9 s at 2.68 M, so on this hardware
-the index buys roughly an order of magnitude and crosses into interactive
-territory somewhere below a million vectors — not at the scale of the largest
-live corpus. Sub-second at 2.68 M would need quantised vectors (`int8`/`bit`),
-which change which rows come back: a different feature with a different bar, and
-deliberately not this one.
 
 The absolute scan numbers above are three to four times the 13.7 s in the earlier
 table. Nothing regressed: that row was measured on a differently warmed page
 cache. Each row here comes from one session so its two halves can be compared
-with each other, which is the only comparison this section is making.
+with each other, which is the only comparison that section is making.
 
-Cost of having one:
+#### The quantised tier
+
+`int8` stores `round(v_i * 127 / max_j|v_j|)` — a quarter of the bytes. The
+divisor is per vector, which is what keeps it cosine-safe: cosine does not see a
+positive scale, so the only error is the rounding, and the rounding is as small
+as 8 bits allow because every vector's largest component lands on the rail.
+(`sqlite-vec`'s own `vec_quantize_int8(v,'unit')` is not used: it is affine over
+a fixed `[-1,1]`, and the components of a unit-norm 384-d embedding sit around
+±0.05, so it would spend about 13 of its 256 codes on the whole corpus.)
+
+`bit` stores one bit per dimension, set when `v_i > centre_i`, compared by
+Hamming distance — a thirty-second of the bytes. The `centre` is the corpus mean,
+measured once per build from a 50,000-vector sample, and it is the difference
+between a working index and a broken one: text embeddings carry a large shared
+mean direction, so a sign taken about the ORIGIN is the same in nearly every
+vector and its bit is a constant. That is not a theory — the last column of the
+first table below is the same tier built without a centre, and it is noise.
+
+Measured with `quantised_recall_over_a_real_corpus` on copies of both live
+corpora, 20 real `multilingual-e5-small` query embeddings of real prompts (EN and
+VI), `limit=10`, recall@10 against the exact path's own top-10, release build,
+same loaded workstation:
+
+**2,684,125 vectors**, exact path 3,787 / 4,032 / 4,375 ms (`int8` session) and
+3,746 / 3,933 / 4,965 ms (`bit` session), best / median / worst:
+
+| candidate pool | `int8` recall@10 | `int8` best - median | `bit` recall@10 | `bit` best - median | `bit` UNCENTRED recall@10 |
+|---|---|---|---|---|---|
+| 10 | 0.9750 | 1,748 - 1,799 ms | 0.1250 | 143 - 155 ms | 0.0100 |
+| 20 | **1.0000** | 1,726 - 1,788 ms | 0.1800 | 163 - 174 ms | 0.0150 |
+| 50 | **1.0000** | 1,792 - 1,845 ms | 0.2750 | 196 - 207 ms | 0.0350 |
+| 100 | **1.0000** | 1,889 - 1,946 ms | 0.3700 | 261 - 272 ms | 0.0550 |
+| 200 | **1.0000** | 2,022 - 2,052 ms | 0.4450 | 399 - 412 ms | 0.0600 |
+| 500 | **1.0000** | 2,380 - 2,437 ms | 0.5350 | 897 - 904 ms | 0.0800 |
+| 1,000 | **1.0000** | 3,116 - 3,197 ms | 0.6150 | 1,750 - 1,801 ms | 0.0900 |
+
+The `int8` column is the second of two runs of the same sweep, hours apart. The
+first, with the GPU job at full tilt, produced the SAME recall in every row and
+latencies of 1,655 - 3,024 ms at pool 10 and 3,257 - 8,448 ms at pool 1,000: the
+shape held, the medians did not. Recall is a property of the index; a millisecond
+on this machine is a property of the afternoon.
+
+**869,267 vectors**, exact path 1,142 / 1,209 / 1,282 ms (829 / 1,223 / 1,287 in
+the `bit` run and 916 / 1,021 / 1,085 in the shipped-path run — the same path,
+three times, an hour apart, which is the size of the noise on every number here):
+
+| candidate pool | `int8` recall@10 | `int8` best - median | `bit` recall@10 | `bit` best - median |
+|---|---|---|---|---|
+| 10 | 0.9800 | 533 - 545 ms | 0.1550 | 45 - 47 ms |
+| 20 | **1.0000** | 542 - 555 ms | 0.2650 | 47 - 48 ms |
+| 50 | **1.0000** | 560 - 585 ms | 0.3750 | 59 - 61 ms |
+| 100 | **1.0000** | 576 - 595 ms | 0.4900 | 82 - 86 ms |
+| 200 | **1.0000** | 622 - 644 ms | 0.5700 | 128 - 130 ms |
+| 500 | **1.0000** | 787 - 815 ms | 0.7400 | 285 - 290 ms |
+| 1,000 | **1.0000** | 1,072 - 1,095 ms | 0.7950 | 551 - 560 ms |
+
+The rerank is the whole design and the numbers say why. Pattern A — serve the
+quantised k-NN's own top-10 — is the `pool 10` row: `int8` gets 0.9750 on the
+2.68 M corpus and 0.9800 on the 869 k one, below the bar on both. Pattern B —
+nominate a wider pool and let the float re-score choose — is every row below it,
+and `int8` reaches 1.0000 from a pool of 20 upward and stays there.
+`crate::embedding::CANDIDATE_OVERSAMPLE` is therefore 10 (a pool of 100 for a
+10-hit page, 200 for the 20-hit `/corpus/search` default): the largest multiplier
+still on the flat part of the latency curve, since a wider pool costs one keyed
+`chunks` row read per candidate and nothing in the k-NN itself.
+
+That shipped configuration was then measured as itself — `rank_chunks_fast` at
+`limit=10`, the same call `mode=semantic_fast` makes — rather than inferred from
+the sweep: **recall@10 mean 1.0000, worst 1.0000** on both corpora, at
+571 / 586 / 615 ms over 869,267 vectors and 1,860 / 1,945 / 8,325 ms over
+2,684,125 (best / median / worst; the 8.3 s worst is the first query of the run,
+which pays the cold read the other nineteen do not).
+
+#### What the sub-second target actually costs
+
+The shipped pattern is `int8` + 10x oversample + float rerank. Against the goal
+of **< 1 s warm at 2.68 M vectors with recall@10 >= 0.95**:
+
+| corpus | recall@10 (mean / worst query) | best | median | under 1 s? |
+|---|---|---|---|---|
+| 869,267 vectors | **1.0000** / **1.0000** | 571 ms | 586 ms | **yes** |
+| 2,684,125 vectors | **1.0000** / **1.0000** | 1,860 ms | 1,945 ms | **no** |
+
+**At 2.68 M the target is missed, and the miss is not close enough to explain
+away.** Both halves were measured rather than assumed:
+
+- **`int8` cannot go faster here.** Its 1.03 GB is a quarter of the exact tier's
+  4.12 GB, yet it is only ~2.1x faster, because at this size the tier is bound by
+  arithmetic rather than by bytes: `sqlite-vec` 0.1.9 has SIMD paths for
+  `l2_sqr_float`/`l1_float` only, so `distance_cosine_int8` is a scalar loop over
+  2,684,125 x 384 elements doing three multiplies and three adds each. That is
+  also why its latency barely moves with the candidate pool (1,726 ms at 20,
+  2,022 ms at 200) and why the two sessions agreed on ~1.7 s as the floor while
+  disagreeing on everything above it.
+- **`bit` is fast enough and nowhere near accurate enough.** It answers in 143 -
+  399 ms — comfortably sub-second, three to twelve times faster than `int8` — and
+  its recall@10 tops out at 0.6150 with a pool of 1,000. 384 bits is 32x
+  compression; on this corpus that does not put the true top-10 into any pool the
+  re-score can afford. Centring multiplies its recall by three to six and does not
+  change the conclusion.
+
+So on this hardware, with this library and this 384-d model, sub-second and
+>= 0.95 recall are reachable **separately and not together at 2.68 M vectors**.
+They are reachable together below roughly a million, where `int8` does both. What
+would move the 2.68 M line is not a bigger candidate pool — it is an int8 distance
+kernel with SIMD, or an embedding with more bits per vector to binarise, or an
+actual ANN structure; none of those is a knob in `sqlite-vec` 0.1.9.
+
+#### Cost of having them
 
 | | 869,267 vectors | 2,684,125 vectors |
 |---|---|---|
-| first build from the stored BLOBs | 84.4 s, 0 skipped | 84.6 s, 0 skipped |
-| corpus growth | 5.35 -> 6.70 GB (+1.34 GB) | 15.6 -> 19.8 GB (+4.19 GB) |
+| `float` build from the stored BLOBs | 53.8 s, 0 skipped | 229.7 s, 0 skipped |
+| `int8` build | 72.3 s, 0 skipped | 92.8 s, 0 skipped |
+| `bit` build, incl. the centre sample | 31.9 s, 0 skipped | 154.0 s, 0 skipped |
+| corpus growth, `float` | 5.35 -> 6.70 GB (+1.34 GB) | 15.6 -> 19.8 GB (+4.19 GB) |
+| corpus growth, `float` + `int8` | -> 7.06 GB (+1.71 GB) | -> 20.9 GB (+5.29 GB) |
+| `bit` payload | 48 B x 869,267 = 42 MB | 48 B x 2,684,125 = 129 MB |
 | documents re-embedded | none | none |
 
-The growth is exactly one `f32` copy per vector; a build reads `chunks` and
-writes only `chunks_vec`, so nothing is re-embedded and no model is loaded. A
-`--rebuild` over the existing 2.68 M-vector index took 207.8 s — slower than the
-first build because it reuses the pages the dropped index freed and overwritten
-pages are journaled — with a peak rollback journal of 4.1 MB.
+Read the build row for its order of magnitude and not for its ordering: each was
+the next command in one session, so the first build of each corpus paid the cold
+read and the rest did not, and a GPU job was competing throughout. That is why
+`float` at 2.68 M (first, cold) is slower than `bit` there (third, warm) despite
+writing 32 times the bytes, and why W1 recorded 84.6 s for the same `float` build
+in its own session. What is stable across all of them: every build is minutes,
+and none re-embeds anything. A build reads `chunks` and writes only its own
+table, so `files`, `fts`, `chunks` and `vision` are read-only to it and the worst
+an interrupted one costs is the time it had spent.
+Reading `chunks.embedding` means walking past `chunks.content`, which is why a
+build costs minutes rather than the seconds its output would suggest — and why the
+`bit` centre is measured from a spread sample rather than from a second full pass.
 
-A build commits every 50,000 vectors and writes its `meta.vec0_index` marker
-last, so an interrupted one leaves a part-filled table that no query will use and
-`--rebuild` starts over. That batching is what keeps the journal at megabytes: a
+A build commits every 50,000 vectors and writes its `meta` marker last, so an
+interrupted one leaves a part-filled table that no query will use and `--rebuild`
+starts over. That batching is what keeps the journal at megabytes: a
 single-transaction rebuild would have to journal the pre-image of every page the
 dropped index freed and the new one reuses, i.e. a journal the size of the index.
-`files`, `fts`, `chunks` and `vision` are read-only to a build.
+A `--rebuild` over the existing 2.68 M-vector float index took 207.8 s with a peak
+rollback journal of 4.1 MB.
 
-**Staleness.** Index jobs maintain the index as they write, but only jobs run by
-a build that has this feature: every earlier release writes `chunks` rows
-underneath it, and so does anything editing the corpus directly. `vec0::usable`
-therefore re-proves the index on every query against two witnesses recorded in
-`meta.vec0_index` — `meta.last_job_started_at` (moved by any job, whether or not
-it maintained the index) and the `chunks` row count (moved by an edit that
-bypassed the pipeline). Either mismatch falls back to the scan and puts the
-reason in `index_note`; neither is expensive, since both are indexed lookups
-against a k-NN that reads gigabytes.
+**Staleness.** Index jobs maintain every index they find as they write, but only
+jobs run by a build that has this feature: every earlier release writes `chunks`
+rows underneath them, and so does anything editing the corpus directly.
+`vec0::usable` therefore re-proves an index on every query against two witnesses
+recorded in its `meta` marker — `meta.last_job_started_at` (moved by any job,
+whether or not it maintained the index) and the `chunks` row count (moved by an
+edit that bypassed the pipeline). A `bit` index is checked against a third: its
+`centre` must still be there and still be the right width, because an uncentred
+bit index is not a degraded one but a random one. Any mismatch falls back — to the
+exact path for `semantic`, and to the exact path with the reason in `index_note`
+for `semantic_fast` — and none of the checks is expensive, since all are indexed
+lookups against a k-NN that reads gigabytes.
 
-**Old readers.** The virtual table is inert to a build without `sqlite-vec`.
+**Old readers.** The virtual tables are inert to a build without `sqlite-vec`.
 SQLite records a virtual table's declaration in `sqlite_master` and instantiates
 its module only when a statement names the table, so an older `llm-index` reads,
-writes, migrates and prunes a corpus that has an index, and fails only on the one
-query it would never issue (`no such module: vec0`). `tests/old_binary.rs`
-asserts exactly that by cancelling this process' module registration and then
-running the older build's statements.
+writes, migrates and prunes a corpus that has both indexes, and fails only on the
+two queries it would never issue (`no such module: vec0`). `tests/old_binary.rs`
+asserts exactly that, for both slots, by cancelling this process' module
+registration and then running the older build's statements.
 
 ## Incremental consistency
 
