@@ -67,6 +67,22 @@ fn indexes_and_searches_english_and_vietnamese() {
     assert_eq!(stats.files, 3);
 
     let connection = connect(&output).unwrap();
+
+    // Migration harness: a freshly-written corpus lands on the version this
+    // binary writes, not the SQLite default of 0.
+    assert_eq!(
+        llm_indexing::store::schema_version(&connection).unwrap(),
+        llm_indexing::store::CURRENT_SCHEMA_VERSION
+    );
+    // `GET /corpus/status`'s `pending_files` is derived from exactly this meta
+    // key — the pipeline's own last-discovery snapshot — rather than a
+    // filesystem walk; this is what proves the real pipeline actually writes
+    // it (the service-level tests only ever fabricate it via a fixture).
+    let discovered = llm_indexing::store::read_meta(&connection, "last_discovered_files")
+        .unwrap()
+        .and_then(|value| value.parse::<i64>().ok());
+    assert_eq!(discovered, Some(3), "all 3 discovered files, not just the 3 processed");
+
     let normalizer = Normalizer::load(&config);
     assert!(!search(&connection, &normalizer, "launder", 5, false)
         .unwrap()
