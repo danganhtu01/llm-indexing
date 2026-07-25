@@ -47,12 +47,14 @@ pub enum FailureClass {
     /// this class is presently unreachable, but classification is already
     /// wired to it the moment one gains a bounded wait.
     Timeout,
-    /// The document requires a password. Nothing in this build constructs
-    /// [`EncryptedDocument`] yet; see its doc comment. A zip-based Office
-    /// document that IS already password-protected surfaces this today
-    /// through `zip::result::ZipError::InvalidPassword`, which `classify`
-    /// also maps here — that is the existing `office_archive` path noticing a
-    /// password, not the PDF fast path B2 will add.
+    /// The document requires a password. Constructed as [`EncryptedDocument`]
+    /// by `extract.rs`'s PDF fast path (`pdf()`/`pdf_exhaustive()`) when
+    /// `pdfinfo` cannot open the file with poppler's default empty
+    /// password — see [`EncryptedDocument`]'s doc comment. A zip-based
+    /// Office document that IS already password-protected surfaces this
+    /// through a different route, `zip::result::ZipError::InvalidPassword`,
+    /// which `classify` also maps here — that is the existing
+    /// `office_archive` path noticing a password.
     Encrypted,
     /// A capability this build or its configuration lacks: no Tesseract
     /// binary for exhaustive PDF OCR, no local Whisper model file. See
@@ -109,12 +111,15 @@ impl std::error::Error for CapabilityUnavailable {}
 
 /// Marker for a PDF that requires a password to open.
 ///
-/// Reserved for B2 (the encrypted-PDF fast path) — NOT implemented here. Once
-/// `pdf()` inspects pdfinfo's already-captured stderr for "Incorrect
-/// password" and bails with this type instead of letting the file fall
-/// through to an empty `pdf-text-partial` row, [`classify`] starts returning
-/// [`FailureClass::Encrypted`] for it with no further change needed on this
-/// side. Not constructed anywhere in this build.
+/// Built by `extract.rs`'s `pdf_info()` (via `pdf()` and `pdf_exhaustive()`)
+/// when `pdfinfo` cannot open the document with poppler's default empty user
+/// password — bailing with this type instead of letting the file fall
+/// through to pdftotext/pdftoppm and an empty `pdf-text-partial` row.
+/// [`classify`] downcasts to this type and returns
+/// [`FailureClass::Encrypted`] for it; nothing further was needed on this
+/// side for B2 to land. An owner-password-only PDF (readable under the
+/// default empty user password) never constructs this — see `pdf_info()`'s
+/// doc comment for how the two are told apart.
 #[derive(Debug)]
 pub struct EncryptedDocument;
 
@@ -296,8 +301,9 @@ mod tests {
         assert_eq!(classify(&error), FailureClass::Unsupported);
     }
 
-    /// Not constructed anywhere in this build yet (B2 is out of scope), but
-    /// once something bails with it, classification is already correct.
+    /// `extract.rs`'s PDF fast path constructs this directly; this test
+    /// covers the classification side in isolation from the subprocess
+    /// plumbing.
     #[test]
     fn the_reserved_encrypted_marker_classifies_as_encrypted() {
         let error: anyhow::Error = anyhow::Error::new(EncryptedDocument);

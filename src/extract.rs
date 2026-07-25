@@ -14,7 +14,7 @@ use tempfile::tempdir;
 use zip::ZipArchive;
 
 use crate::config::Config;
-use crate::failure::CapabilityUnavailable;
+use crate::failure::{CapabilityUnavailable, EncryptedDocument};
 use crate::media::Transcriber;
 use crate::ocr::TesseractOcr;
 
@@ -639,7 +639,16 @@ fn pdf_exhaustive(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Ex
             CapabilityUnavailable("Tesseract is unavailable for exhaustive PDF OCR").into(),
         );
     }
-    let pages = pdf_pages(path);
+    let info = pdf_info(path);
+    if info.password_required {
+        // A typed error, not `anyhow::bail!`, so `crate::failure::classify`
+        // recognizes this as `Encrypted` by downcasting rather than parsing
+        // the message — see `failure.rs`. Bailing here saves every
+        // per-page pdftotext/pdftoppm spawn this loop would otherwise make,
+        // all doomed to the same empty result.
+        return Err(EncryptedDocument.into());
+    }
+    let pages = info.pages;
     if pages == 0 {
         anyhow::bail!("PDF page count is unavailable")
     }
@@ -707,7 +716,17 @@ fn pdf_exhaustive(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Ex
 }
 
 fn pdf(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
-    let pages = pdf_pages(path);
+    let info = pdf_info(path);
+    if info.password_required {
+        // Bail BEFORE spawning pdftotext/pdftoppm below — both would run
+        // and fail identically (12 live-corpus PDFs did exactly this,
+        // silently, every one becoming an empty `pdf-text-partial` row). A
+        // typed error, not `anyhow::bail!`, so `crate::failure::classify`
+        // recognizes this as `Encrypted` by downcasting rather than parsing
+        // the message — see `failure.rs`.
+        return Err(EncryptedDocument.into());
+    }
+    let pages = info.pages;
     let text = Command::new("pdftotext")
         .arg(path)
         .arg("-")
@@ -767,17 +786,82 @@ fn pdf(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
     }
 }
 
-fn pdf_pages(path: &Path) -> usize {
+/// What a single `pdfinfo` invocation tells us before any of pdftotext or
+/// pdftoppm gets spawned: the page count, and whether the document is one
+/// pdftotext/pdftoppm can actually read.
+struct PdfInfo {
+    pages: usize,
+    /// A user password is required and pdfinfo could not open the document
+    /// with poppler's default (empty) password — pdftotext/pdftoppm will
+    /// fail identically, so callers must bail rather than march through them
+    /// for an empty result. See [`pdf_info`] for how this is distinguished
+    /// from an owner-password-only PDF, which opens fine and must NOT set
+    /// this.
+    password_required: bool,
+}
+
+/// Run `pdfinfo` once and read both the page count and the encryption
+/// signal off its already-captured output — the same single subprocess this
+/// helper always spawned, just no longer throwing its stderr away.
+///
+/// poppler's `pdfinfo` opens every document with its default (empty) user
+/// password before printing anything. Two outcomes matter here:
+///
+/// - **Opens fine** (no user password, or an owner-password-only PDF whose
+///   user password is blank): pdfinfo prints its normal structured field
+///   block, including a `Pages:` line and — only when the document actually
+///   carries a permissions dictionary — an `Encrypted:` field such as
+///   `Encrypted: yes (print:no copy:no ...)`. Text extraction still works
+///   here (poppler's CLI tools don't enforce the permission bits), so this
+///   case must extract normally regardless of what `Encrypted:` says. We
+///   therefore don't need to parse the `Encrypted:` field at all: its mere
+///   presence is redundant with `Pages:` being present, which is the signal
+///   we already need for the page count.
+/// - **Cannot open** (a real user password is set): pdfinfo never reaches
+///   the point of printing any structured fields — no `Pages:`, no
+///   `Encrypted:` — and instead writes a password complaint to stderr
+///   (`Command Line Error: Incorrect password` on the poppler builds this
+///   repo has seen; other poppler versions/locales are known to word the
+///   lead-in differently, so we match the substring `incorrect password`
+///   case-insensitively rather than the whole line).
+///
+/// So the definitive, version-robust signal that extraction cannot proceed
+/// is the STRUCTURED one — no `Pages:` field, i.e. `pages == 0` — with the
+/// stderr text used only to confirm the reason is a password and not some
+/// other open failure (a corrupt file also yields `pages == 0` but no
+/// password wording, and must keep classifying as a decode/unknown failure,
+/// not `encrypted`).
+fn pdf_info(path: &Path) -> PdfInfo {
     let output = Command::new("pdfinfo").arg(path).output().ok();
-    output
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .and_then(|text| {
-            text.lines()
-                .find(|line| line.starts_with("Pages:"))
-                .and_then(|line| line.split_whitespace().nth(1))
-                .and_then(|n| n.parse().ok())
-        })
-        .unwrap_or(0)
+    let stdout = output
+        .as_ref()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    let stderr = output
+        .as_ref()
+        .map(|out| String::from_utf8_lossy(&out.stderr).into_owned())
+        .unwrap_or_default();
+    parse_pdf_info(&stdout, &stderr)
+}
+
+/// The pure half of [`pdf_info`]: turn `pdfinfo`'s captured stdout/stderr
+/// into a [`PdfInfo`]. Split out from the `Command` invocation so the
+/// classification rule itself — the part with version/wording risk — is
+/// testable against real captured `pdfinfo` output without needing poppler
+/// installed wherever the tests run.
+fn parse_pdf_info(stdout: &str, stderr: &str) -> PdfInfo {
+    let pages = stdout
+        .lines()
+        .find(|line| line.starts_with("Pages:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    let password_required =
+        pages == 0 && stderr.to_ascii_lowercase().contains("incorrect password");
+    PdfInfo {
+        pages,
+        password_required,
+    }
 }
 
 #[cfg(test)]
@@ -890,5 +974,112 @@ mod tests {
             extractor_revision(),
             format!("{:x}", with_heic.finalize())[..12].to_string()
         );
+    }
+
+    /// `parse_pdf_info` classification, pinned against REAL `pdfinfo`
+    /// (poppler 25.11.0) output captured by hand — not fabricated strings —
+    /// so these tests fail if the actual field/message wording this build
+    /// depends on ever drifts. Generated with a tiny hand-built one-page PDF
+    /// (plain, then re-saved through `pypdf` with `user_password=""` and
+    /// with a real user password) and Calibre's bundled poppler binaries;
+    /// see B2's task notes for how the fixtures were produced. No live
+    /// process spawn here — `pdf_info()` (the thin wrapper that actually
+    /// runs `pdfinfo`) is exercised separately by the end-to-end tests in
+    /// `tests/indexing.rs`, gated on poppler actually being on `PATH`.
+    mod pdf_info_classification {
+        use super::*;
+
+        /// A normal, unencrypted PDF: `Pages:` present, no stderr at all.
+        /// Must extract normally.
+        #[test]
+        fn an_unencrypted_pdf_is_not_password_required() {
+            let stdout = "Producer:        pypdf\n\
+                Pages:           1\n\
+                Encrypted:       no\n\
+                Page size:       200 x 200 pts\n\
+                PDF version:     1.4\n";
+            let info = parse_pdf_info(stdout, "");
+            assert_eq!(info.pages, 1);
+            assert!(!info.password_required);
+        }
+
+        /// Owner-password-only: blank user password opens it fine, so
+        /// pdfinfo prints the full field block INCLUDING `Pages:` — the
+        /// `Encrypted: yes (print:.. copy:..)` line is present but must not
+        /// by itself trigger a bail, because pdftotext/pdftoppm can still
+        /// read the document (poppler's CLI tools don't enforce the
+        /// permission bits). This is the case B2's task explicitly calls
+        /// out as must-not-block.
+        #[test]
+        fn an_owner_password_only_pdf_is_not_password_required_even_with_all_permissions_denied() {
+            let stdout = "Producer:        pypdf\n\
+                Pages:           1\n\
+                Encrypted:       yes (print:no copy:no change:no addNotes:no algorithm:RC4)\n\
+                Page size:       200 x 200 pts\n\
+                PDF version:     1.4\n";
+            let info = parse_pdf_info(stdout, "");
+            assert_eq!(info.pages, 1);
+            assert!(!info.password_required);
+        }
+
+        /// A real user password: pdfinfo never reaches the point of
+        /// printing ANY structured field — no `Pages:`, no `Encrypted:` —
+        /// stdout is empty and the password complaint lands on stderr. This
+        /// is the exact live-corpus shape (12 PDFs, evidence doc §pdfinfo).
+        #[test]
+        fn a_user_password_required_pdf_is_password_required() {
+            let info = parse_pdf_info("", "Command Line Error: Incorrect password\n");
+            assert_eq!(info.pages, 0);
+            assert!(info.password_required);
+        }
+
+        /// Poppler version/build wording varies (older builds, different
+        /// leading text) — match must be robust to that, so this checks a
+        /// handful of plausible variants rather than the one exact string
+        /// above, per the task's "keep it robust to poppler version
+        /// wording" requirement.
+        #[test]
+        fn password_detection_is_robust_to_poppler_wording_variants() {
+            for stderr in [
+                "Command Line Error: Incorrect password\n",
+                "Command Line Error: Incorrect password",
+                "Error: Incorrect password\n",
+                "incorrect password\n",
+                "INCORRECT PASSWORD\n",
+                "Syntax Warning: Incorrect password\n",
+            ] {
+                let info = parse_pdf_info("", stderr);
+                assert!(info.password_required, "{stderr:?} should be detected");
+            }
+        }
+
+        /// A corrupt/truncated file also yields no `Pages:` field, but for a
+        /// different reason — it must NOT classify as encrypted, or a
+        /// genuinely damaged (not password-protected) PDF would be
+        /// misreported and its resume behavior would follow the wrong path.
+        /// Real captured stderr from running pdfinfo against 27 bytes of
+        /// non-PDF garbage.
+        #[test]
+        fn a_corrupt_non_pdf_file_is_not_password_required() {
+            let stderr = "Syntax Warning: May not be a PDF file (continuing anyway)\n\
+                Syntax Error: Couldn't find trailer dictionary\n\
+                Syntax Error: Couldn't find trailer dictionary\n\
+                Syntax Error: Couldn't read xref table\n";
+            let info = parse_pdf_info("", stderr);
+            assert_eq!(info.pages, 0);
+            assert!(!info.password_required);
+        }
+
+        /// pdfinfo missing from `PATH` entirely: `pdf_info()`'s `.output()`
+        /// call fails and both strings are empty, same as this function
+        /// sees it. Must not be misread as an encrypted document — an
+        /// unrelated environment problem is `pages == 0`/`Unknown`, not
+        /// `Encrypted`, downstream in `pdf()`/`pdf_exhaustive()`.
+        #[test]
+        fn empty_output_from_a_missing_pdfinfo_binary_is_not_password_required() {
+            let info = parse_pdf_info("", "");
+            assert_eq!(info.pages, 0);
+            assert!(!info.password_required);
+        }
     }
 }

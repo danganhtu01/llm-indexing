@@ -384,6 +384,9 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
             stats.bytes += file.rec.size;
             stats.ocr_files += usize::from(file.ocr_used);
             stats.errors += usize::from(file.method.starts_with("error:"));
+            // A subset of `errors` above, not an alternative to it — every
+            // encrypted row is still an error, this just names which ones.
+            stats.encrypted += usize::from(file.method == "error:encrypted");
             stats.incomplete += usize::from(incomplete_method(&file.method));
             stats.embedded_chunks += file.chunks.len();
             stats.vision_files += usize::from(file.vision.is_some());
@@ -1184,8 +1187,8 @@ mod tests {
         use crate::failure::FailureClass;
 
         /// A stored `error:` row's suffix predates this workstream, a fixed
-        /// class it introduced, or (once B2 lands) the reserved encrypted
-        /// class — resume must not be able to tell them apart.
+        /// class it introduced, or the `encrypted` class B2 added on top —
+        /// resume must not be able to tell them apart.
         fn suffixes() -> Vec<String> {
             vec![
                 "Das".into(),     // German Windows: live corpus, 85 rows
