@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chardetng::EncodingDetector;
@@ -14,7 +15,7 @@ use tempfile::tempdir;
 use zip::ZipArchive;
 
 use crate::config::Config;
-use crate::failure::{CapabilityUnavailable, EncryptedDocument};
+use crate::failure::{CapabilityUnavailable, EncryptedDocument, HeicDecodeFailed};
 use crate::media::Transcriber;
 use crate::ocr::TesseractOcr;
 
@@ -44,6 +45,18 @@ const CODE_EXTS: &[&str] = &[
 const IMAGE_EXTS: &[&str] = &[
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".gif",
 ];
+/// `.heic` (Apple Photos/iCloud export): not in [`IMAGE_EXTS`] because the
+/// `image` crate has no HEIF feature and this build carries no libheif
+/// binding, so it cannot be handed to the OCR arm directly. Decoded to a JPEG
+/// frame first by [`heic`] via ffmpeg, then run through the same
+/// [`TesseractOcr::image_to_text`] the `IMAGE_EXTS` arm uses. 18,165 rows of
+/// the live corpus sat at `name-only-partial` for this before ffmpeg was
+/// confirmed (2026-07-25, this box) to decode them. `.heif` — the same
+/// container format under its generic extension — is deliberately NOT
+/// included: nothing in the live corpus needed it, and it was never verified
+/// against a real file the way `.heic` was; add it here (and to `heic()`'s
+/// doc comment) once it is.
+const HEIC_EXTS: &[&str] = &[".heic"];
 const EMAIL_EXTS: &[&str] = &[".eml", ".wdseml", ".emlx"];
 const AUDIO_EXTS: &[&str] = &[".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"];
 const VIDEO_EXTS: &[&str] = &[".mkv", ".mp4", ".mov", ".m4v", ".avi", ".webm"];
@@ -76,6 +89,7 @@ pub fn extractor_revision() -> String {
         TEXT_EXTS,
         CODE_EXTS,
         IMAGE_EXTS,
+        HEIC_EXTS,
         EMAIL_EXTS,
         AUDIO_EXTS,
         VIDEO_EXTS,
@@ -216,6 +230,12 @@ fn extract_inner(
                 pages: 1,
             })
         }
+        _ if HEIC_EXTS.contains(&ext)
+            && matches!(config.ocr.as_str(), "auto" | "on" | "exhaustive")
+            && ocr.available =>
+        {
+            heic(path, max_chars, ocr)
+        }
         _ if AUDIO_EXTS.contains(&ext) || VIDEO_EXTS.contains(&ext) => {
             media(path, ext, max_chars, ocr, transcriber)
         }
@@ -223,10 +243,11 @@ fn extract_inner(
             archive(path, config, ocr, transcriber, depth + 1, max_chars)
         }
         // A format this build DOES handle whose arm above declined on a runtime
-        // condition — OCR off or Tesseract absent for an image, an archive past
-        // the nesting limit. The capability exists, so the row must stay
-        // retryable rather than be written off as unsupported.
+        // condition — OCR off or Tesseract absent for an image or a HEIC, an
+        // archive past the nesting limit. The capability exists, so the row
+        // must stay retryable rather than be written off as unsupported.
         _ if IMAGE_EXTS.contains(&ext)
+            || HEIC_EXTS.contains(&ext)
             || AUDIO_EXTS.contains(&ext)
             || VIDEO_EXTS.contains(&ext)
             || ARCHIVE_EXTS.contains(&ext) =>
@@ -455,6 +476,110 @@ fn media(
         ocr_used: frame_count > 0,
         pages: frame_count,
     })
+}
+
+/// Bound on how long a single HEIC-to-JPEG ffmpeg decode may run before it is
+/// killed. This is the first extraction call site that bounds its subprocess
+/// wait at all — every other `Command::output()` call in this file blocks
+/// without a deadline (see `failure.rs`'s note that
+/// [`crate::failure::FailureClass::Timeout`] was previously unreachable) — so
+/// a pathological/corrupt HEIC frees the extract worker instead of hanging it
+/// for the life of the job. 60s mirrors `vision.timeout_secs`'s default
+/// (`config.rs::default_vision_timeout`), the closest existing per-file media
+/// budget in this build; a still-image decode should never approach it.
+const HEIC_DECODE_TIMEOUT_SECS: u64 = 60;
+
+/// Decode one still frame from a `.heic` file to a temp JPEG via ffmpeg, then
+/// run it through the same [`TesseractOcr::image_to_text`] the `IMAGE_EXTS`
+/// OCR arm uses.
+///
+/// ffmpeg has no dedicated HEIF demuxer in this build (`ffmpeg -formats`
+/// shows none) but reads HEIC/HEIF anyway: the format shares its ISOBMFF
+/// container with MP4, so ffmpeg's `mov,mp4,m4a,3gp,3g2,mj2` demuxer opens it
+/// and decodes the embedded HEVC still picture(s) via its ordinary HEVC
+/// decoder — including reassembling a tiled grid and applying the stored
+/// orientation, so a plain `-frames:v 1` extraction with no explicit `-map`
+/// is sufficient. Verified against a real iCloud-export `.heic` on this box
+/// (ffmpeg 8.1.2, 2026-07-25): a 48-tile 4032x3024 grid decoded correctly,
+/// rotated, in ~150ms. NOT verified on other ffmpeg builds — this depends on
+/// mov-demuxer HEIF stream-group support that is new enough that older
+/// ffmpeg builds may only see the first tile or refuse the file; a build
+/// that can't cope fails the same way a corrupt file does (see below), which
+/// is the safe direction to fail in.
+///
+/// Three distinct failure shapes reach three distinct [`FailureClass`]es via
+/// [`crate::failure::classify`]:
+/// - ffmpeg missing from `PATH`: `Command::spawn` returns an `io::Error` of
+///   kind `NotFound`, propagated as-is (no typed marker needed — `classify`
+///   already maps that kind to `IoNotFound`, same as a missing `antiword`).
+/// - ffmpeg wedged past [`HEIC_DECODE_TIMEOUT_SECS`]: [`wait_bounded`]
+///   returns an `io::Error` of kind `TimedOut`, which `classify` maps to
+///   `Timeout` — the class this call site is what makes reachable at all.
+/// - ffmpeg ran and exited but rejected the bytes (non-zero exit, or a zero
+///   exit with no output file — both observed from real ffmpeg builds on
+///   malformed input): [`HeicDecodeFailed`], which `classify` maps to
+///   `Decode`.
+///
+/// [`FailureClass`]: crate::failure::FailureClass
+fn heic(path: &Path, max_chars: usize, ocr: &TesseractOcr) -> Result<Extracted> {
+    let temp = tempdir()?;
+    let frame = temp.path().join("frame.jpg");
+    let mut command = Command::new("ffmpeg");
+    command.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"]);
+    command.arg(path);
+    command.args(["-frames:v", "1", "-q:v", "2"]);
+    command.arg(&frame);
+    // stdout/stderr dropped, matching `vision::video`'s bounded ffmpeg calls:
+    // the frame lands on disk, so there is no pipe to drain, and draining one
+    // is what the bounded wait below is not built to do.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawning ffmpeg for {}", path.display()))?;
+    let status = wait_bounded(&mut child, Duration::from_secs(HEIC_DECODE_TIMEOUT_SECS))
+        .with_context(|| format!("running ffmpeg for {}", path.display()))?;
+    if !status.success() || !frame.is_file() {
+        return Err(HeicDecodeFailed.into());
+    }
+    let text = truncate(ocr.image_to_text(&frame), max_chars);
+    Ok(Extracted {
+        ocr_used: !text.trim().is_empty(),
+        text,
+        method: "heic-ocr".into(),
+        pages: 1,
+    })
+}
+
+/// Wait for `child` up to `timeout`, killing and reaping it on expiry.
+/// Duplicated from `vision::video::wait_bounded` rather than shared — that
+/// helper is private to a module owned by the V4 worker (see its file-level
+/// doc comment) and returns `Option<ExitStatus>` for a caller that wants a
+/// distinguishable-by-string timeout, where this caller wants an `io::Error`
+/// of kind `TimedOut` so [`crate::failure::classify`] can recognize it by
+/// TYPE. Polls rather than blocking so a pathological ffmpeg cannot wedge the
+/// extract worker forever.
+fn wait_bounded(child: &mut Child, timeout: Duration) -> std::io::Result<ExitStatus> {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "ffmpeg exceeded {}s decoding a HEIC frame",
+                    timeout.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn read_limited(path: &Path, limit: usize) -> Result<Vec<u8>> {
@@ -915,6 +1040,112 @@ mod tests {
     }
 
     #[test]
+    fn heic_is_dispatched_by_name_not_written_off_as_unsupported() {
+        // Before this workstream `.heic` fell through every arm to the
+        // catch-all `_ => Ok(Extracted::unsupported())`, i.e. the SAME
+        // terminal `excluded:unsupported` `an_extension_no_extractor_handles_
+        // is_terminal_not_a_failure` pins for `.o`/`.xnb`/genuinely-unhandled
+        // extensions — permanently freezing every `.heic` row the moment the
+        // attempt cap (`pipeline::MAX_ATTEMPTS`) landed, on the verdict of a
+        // build with no HEIC path at all. With OCR off (as here) the new HEIC
+        // arm declines on the same runtime condition the PNG arm above does,
+        // landing on `name-only`, not `excluded:unsupported` — proof the
+        // extension is dispatched by name rather than fell through.
+        assert_eq!(extracted("photo.heic").method, "name-only");
+    }
+
+    /// Real ffmpeg + real tesseract, gated on both actually being on `PATH` —
+    /// same shape as `tests/indexing.rs`'s `pdfinfo_available`-gated B2 tests.
+    /// Garbage bytes named `.heic`: ffmpeg opens the file, cannot make sense
+    /// of it, and exits non-zero — the "ffmpeg ran but rejected the bytes"
+    /// shape `heic()`'s doc comment describes, which must classify as
+    /// [`crate::failure::FailureClass::Decode`], not `Unknown`. The
+    /// successful-decode counterpart is
+    /// `heic_dispatch_decodes_a_real_frame_and_ocrs_it` below, over
+    /// `tests/fixtures/heic-tiny.heic`.
+    #[test]
+    fn a_heic_ffmpeg_cannot_decode_classifies_as_decode_not_unknown() {
+        let mut config = Config::default();
+        config.ocr = "on".into();
+        config.finalize();
+        let ocr = TesseractOcr::new(&config);
+        if !ffmpeg_available() {
+            eprintln!("skipping HEIC decode-failure live test: ffmpeg not on PATH");
+            return;
+        }
+        if !ocr.available {
+            eprintln!("skipping HEIC decode-failure live test: tesseract not on PATH");
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("corrupt.heic");
+        fs::write(&path, b"not a real heic file").unwrap();
+        let error = extract(
+            &path,
+            ".heic",
+            21,
+            &config,
+            &ocr,
+            &Transcriber::new(&config),
+        )
+        .expect_err("garbage bytes are not a decodable HEIC frame");
+        assert_eq!(
+            crate::failure::classify(&error),
+            crate::failure::FailureClass::Decode
+        );
+    }
+
+    fn ffmpeg_available() -> bool {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The successful-decode counterpart to the decode-failure test above,
+    /// over a real (if synthetic) HEIC-shaped file — `tests/fixtures/
+    /// heic-tiny.heic`: a single 64x64 red HEVC still frame in an ISOBMFF
+    /// container, produced with
+    /// `ffmpeg -f lavfi -i color=c=red:s=64x64 -frames:v 1 -c:v hevc
+    /// -tag:v hvc1 -f mp4 heic-tiny.heic` (ffmpeg has no HEIC muxer to encode
+    /// a "real" `major_brand: heic` file with — see `heic()`'s doc comment —
+    /// so `-f mp4` is forced; the demuxer that reads it back, `mov,mp4,m4a,
+    /// 3gp,3g2,mj2`, is the SAME one that opens a real Apple `.heic`, whose
+    /// tile-grid HEVC decode was confirmed BY HAND against a real
+    /// iCloud-export file on this box on 2026-07-25 — this fixture pins the
+    /// end-to-end wiring (dispatch → ffmpeg → temp JPEG → tesseract →
+    /// `method`), not the mov demuxer's HEIF-brand handling itself, which a
+    /// synthetic single-tile file cannot exercise).
+    #[test]
+    fn heic_dispatch_decodes_a_real_frame_and_ocrs_it() {
+        let mut config = Config::default();
+        config.ocr = "on".into();
+        config.finalize();
+        let ocr = TesseractOcr::new(&config);
+        if !ffmpeg_available() {
+            eprintln!("skipping HEIC decode-success live test: ffmpeg not on PATH");
+            return;
+        }
+        if !ocr.available {
+            eprintln!("skipping HEIC decode-success live test: tesseract not on PATH");
+            return;
+        }
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/heic-tiny.heic");
+        let extracted = extract(
+            &fixture,
+            ".heic",
+            fs::metadata(&fixture).unwrap().len(),
+            &config,
+            &ocr,
+            &Transcriber::new(&config),
+        )
+        .expect("a decodable HEIC frame must extract, not error");
+        assert_eq!(extracted.method, "heic-ocr");
+        assert_eq!(extracted.pages, 1);
+    }
+
+    #[test]
     fn dispatched_extensions_are_not_reported_unsupported() {
         // DOCUMENT_EXTS is a copy of the dispatch's own arms, kept only so the
         // capability fingerprint moves when a format is added. This is what stops
@@ -952,13 +1183,19 @@ mod tests {
         assert_eq!(extractor_revision(), extractor_revision());
         assert_eq!(extractor_revision().len(), 12);
         // And it is derived from the tables rather than hand-maintained, so
-        // teaching this build a new format moves it without anyone remembering to.
-        let mut with_heic = Sha1::new();
-        with_heic.update(env!("CARGO_PKG_VERSION"));
+        // teaching this build a new format moves it without anyone remembering
+        // to. `.avif` stands in for "the next format this build learns" —
+        // `.heic` no longer works for that: it is one of the real tables
+        // (`HEIC_EXTS`) now, so hashing it a second time here would no longer
+        // differ from `extractor_revision()` and this assertion would start
+        // failing for the wrong reason.
+        let mut with_avif = Sha1::new();
+        with_avif.update(env!("CARGO_PKG_VERSION"));
         for table in [
             TEXT_EXTS,
             CODE_EXTS,
             IMAGE_EXTS,
+            HEIC_EXTS,
             EMAIL_EXTS,
             AUDIO_EXTS,
             VIDEO_EXTS,
@@ -966,13 +1203,13 @@ mod tests {
             DOCUMENT_EXTS,
         ] {
             for ext in table {
-                with_heic.update(ext);
+                with_avif.update(ext);
             }
         }
-        with_heic.update(".heic");
+        with_avif.update(".avif");
         assert_ne!(
             extractor_revision(),
-            format!("{:x}", with_heic.finalize())[..12].to_string()
+            format!("{:x}", with_avif.finalize())[..12].to_string()
         );
     }
 
