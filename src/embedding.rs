@@ -133,10 +133,19 @@ pub struct VectorScan {
     pub skipped: usize,
     /// The `model (Nd)` labels behind `skipped`, deduplicated and capped. What
     /// turns "everything was skipped" into an actionable message. Empty on the
-    /// [`RankPath::Vec0`] path, which never reads the rows it excludes.
+    /// index paths, which never read the rows they exclude.
     pub other_models: Vec<String>,
-    /// Which of the two ranking paths produced `hits`.
+    /// Which ranking path produced `hits`.
     pub path: RankPath,
+    /// How many candidates an index path nominated before the float re-score
+    /// picked `hits` out of them. `None` on the scan, which nominates nothing —
+    /// it scores every vector there is.
+    ///
+    /// Reported because it is the one knob behind an approximate answer: a
+    /// [`RankPath::Quantised`] result is only as good as the pool the
+    /// quantisation put the right rows into, and a caller comparing two
+    /// engines' answers is owed the number rather than left to infer it.
+    pub candidates: Option<usize>,
     /// Set only when a corpus HAS a shadow index that was not used, and says
     /// why. A search that quietly stops being fast is indistinguishable from
     /// one that was never made fast, and the two need completely different
@@ -146,19 +155,31 @@ pub struct VectorScan {
 
 /// How a [`VectorScan`] was ranked.
 ///
-/// Both paths return the same top-k with the same scores; they differ only in
-/// what they read to get there — the whole `chunks` table against just the
-/// vectors, 15.6 GB against 4.12 GB on the live corpus and roughly an order of
-/// magnitude in latency (`docs/ARCHITECTURE.md`). Reported to the caller because
-/// a 50 s answer and a 4 s one are otherwise the same JSON.
+/// [`Scan`] and [`Vec0`] return the same top-k with the same scores; they differ
+/// only in what they read to get there — the whole `chunks` table against just
+/// the vectors, 15.6 GB against 4.12 GB on the live corpus and roughly an order
+/// of magnitude in latency (`docs/ARCHITECTURE.md`). Reported to the caller
+/// because a 50 s answer and a 4 s one are otherwise the same JSON.
+///
+/// [`Quantised`] is the one that does NOT return the same list, and it is
+/// reachable only from [`rank_chunks_fast`] — see there.
+///
+/// [`Scan`]: RankPath::Scan
+/// [`Vec0`]: RankPath::Vec0
+/// [`Quantised`]: RankPath::Quantised
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RankPath {
     /// The exhaustive cosine scan. Always available; the only path a corpus
     /// without a shadow index has.
     Scan,
-    /// k-NN over the `vec0` shadow index, with the candidates re-scored against
-    /// the stored BLOBs.
+    /// k-NN over the exact `vec0` shadow index, with the candidates re-scored
+    /// against the stored BLOBs. Same answer as the scan.
     Vec0,
+    /// k-NN over the corpus' QUANTISED shadow index, with the candidates
+    /// re-scored against the stored BLOBs. The scores are exact; the SET of
+    /// rows they were computed over is what the quantisation nominated, so this
+    /// answer can differ from the scan's.
+    Quantised(crate::vec0::Tier),
 }
 
 impl RankPath {
@@ -166,32 +187,55 @@ impl RankPath {
         match self {
             Self::Scan => "scan",
             Self::Vec0 => "vec0",
+            Self::Quantised(crate::vec0::Tier::Int8) => "vec0_int8",
+            Self::Quantised(crate::vec0::Tier::Bit) => "vec0_bit",
+            // Unreachable: `vec0::usable` declines a float index in the
+            // quantised slot, which is the only way this pairing is built.
+            Self::Quantised(crate::vec0::Tier::Float) => "vec0",
         }
+    }
+
+    /// Whether this path's `hits` are the scan's own answer.
+    ///
+    /// The question every consumer of an approximate result has to be able to
+    /// ask, answered from the path rather than from a table of path names kept
+    /// somewhere else.
+    pub fn is_exact(self) -> bool {
+        !matches!(self, Self::Quantised(_))
     }
 }
 
-/// Rank a corpus' chunk embeddings against `query` by cosine similarity.
+/// Rank a corpus' chunk embeddings against `query` by cosine similarity —
+/// EXACTLY.
 ///
-/// The entry point for every ranking surface, and the one place that decides
-/// which path a corpus can be ranked by. A corpus carrying a usable `vec0`
-/// shadow index is ranked by [`rank_by_index`]; every other corpus — which is
-/// every corpus that has not been through `llm-index vector-index`, and every
-/// corpus whose index cannot be vouched for — is ranked by [`scan_chunks`],
-/// exactly as before the index existed.
+/// The entry point for every ranking surface that promises the corpus' true
+/// top-k, and the reason that promise survives the quantised tier: this looks in
+/// the exact slot ([`crate::vec0::Slot::Exact`]) and nowhere else. A corpus
+/// carrying a usable float `vec0` index is ranked by [`rank_by_index`] over its
+/// candidates; every other corpus — one that has not been through `llm-index
+/// vector-index`, one whose index cannot be vouched for, and one carrying only a
+/// QUANTISED index — is ranked by [`scan_chunks`], exactly as before any index
+/// existed. Building a fast index can therefore never change what this returns.
 ///
 /// The capability is discovered from the corpus itself rather than configured:
 /// there is no flag to get wrong, and a corpus that loses (or never gains) its
 /// index degrades in latency and in nothing else. Both paths return the same
 /// hits with the same scores in the same order; [`VectorScan::path`] reports
-/// which one ran.
+/// which one ran. [`rank_chunks_fast`] is the opted-into approximate sibling.
 pub fn rank_chunks(
     connection: &Connection,
     model: &str,
     query: &[f32],
     limit: usize,
 ) -> Result<VectorScan> {
-    match crate::vec0::usable(connection, model, query.len())? {
-        crate::vec0::Usable::Ready(state) => rank_by_index(connection, &state, query, limit),
+    let slot = crate::vec0::Slot::Exact;
+    match crate::vec0::usable(connection, slot, model, query.len())? {
+        crate::vec0::Usable::Ready(state) => {
+            let pool = limit.clamp(1, MAX_HITS) + KNN_TIE_MARGIN;
+            let candidates =
+                crate::vec0::knn(connection, state.tier, &vector_to_bytes(query), pool)?;
+            rank_by_index(connection, &state, candidates, query, limit, RankPath::Vec0)
+        }
         crate::vec0::Usable::Absent => scan_chunks(connection, model, query, limit, None),
         crate::vec0::Usable::Declined(reason) => {
             scan_chunks(connection, model, query, limit, Some(reason))
@@ -199,35 +243,152 @@ pub fn rank_chunks(
     }
 }
 
-/// Rank through the `vec0` shadow index.
+/// Rank against the corpus' QUANTISED shadow index, falling back to the exact
+/// path when it has none.
 ///
-/// Two steps, and the second is what keeps this path honest: the index picks
-/// the CANDIDATES, and their scores are then recomputed from
-/// `chunks.embedding` with [`cosine_bytes`] — the scan's own arithmetic, on the
-/// scan's own bytes — and ordered by the scan's own [`Ranked`] comparison. So a
-/// `score` in a response is the same number whichever path produced it, and the
-/// index can never introduce a ranking of its own.
+/// This is the only function that can reach a quantised index, and it exists
+/// because [`rank_chunks`] must not: a quantised k-NN returns a DIFFERENT set of
+/// rows from the scan, so serving it under the same request would silently
+/// change what search means. A caller opts in per request
+/// (`mode=semantic_fast`), gets [`RankPath::Quantised`] back when it was served
+/// that way, and gets the exact answer with a [`VectorScan::index_note`] when
+/// the corpus has no quantised index to serve it from.
 ///
-/// The candidate list is deliberately wider than `limit` ([`KNN_TIE_MARGIN`]).
-/// A k-NN returns SOME k nearest rows; where several vectors tie at the k-th
-/// distance, which of them it returns is its traversal order rather than the
-/// scan's "lower `chunks.id` wins". Over-fetching lets the re-score resolve
-/// those ties the scan's way, and costs nothing — a `vec0` k-NN's work is
-/// reading the vectors, not the size of its heap. Ties running deeper than the
-/// margin (more than 100 chunks at exactly the boundary distance, i.e. that
-/// many byte-identical vectors) can still pick a different member of the tie
-/// than the scan would; the hits are equally correct, and the alternative is
-/// giving up the index.
+/// What it buys, and what it costs, are measured on the live corpora in
+/// `docs/ARCHITECTURE.md`: the quantised tiers read a quarter (int8) or a
+/// thirty-second (bit) of the bytes the exact tier reads, and their answers are
+/// reported there as recall@10 against the scan's own top-10.
+///
+/// The candidates it nominates are re-scored from `chunks.embedding` exactly as
+/// on every other path, so every `score` in the response is a true cosine
+/// against the stored vector. What quantisation changes is which rows were
+/// scored at all — never what a score means.
+pub fn rank_chunks_fast(
+    connection: &Connection,
+    model: &str,
+    query: &[f32],
+    limit: usize,
+) -> Result<VectorScan> {
+    let slot = crate::vec0::Slot::Quantised;
+    let state = match crate::vec0::usable(connection, slot, model, query.len())? {
+        crate::vec0::Usable::Ready(state) => state,
+        // No quantised index, or one that cannot be vouched for. Either way the
+        // caller gets a real answer — the EXACT one, from whichever path
+        // `rank_chunks` can take — and a note saying the fast path is not what
+        // ran. Falling back rather than refusing is the same rule the exact
+        // path follows, and it is what lets a consumer ask for `semantic_fast`
+        // unconditionally against corpora that have not all been indexed.
+        other => {
+            let mut exact = rank_chunks(connection, model, query, limit)?;
+            let quantised = match other {
+                crate::vec0::Usable::Declined(reason) => reason,
+                _ => NO_QUANTISED_INDEX.to_string(),
+            };
+            // Both reasons, when there are two: the fast path did not run AND
+            // the exact index was not used either are different facts with
+            // different repairs, and a caller shown only one of them cannot act
+            // on the other.
+            exact.index_note = Some(match exact.index_note {
+                Some(existing) => {
+                    format!("{quantised}; the exact index was not used either: {existing}")
+                }
+                None => quantised,
+            });
+            return Ok(exact);
+        }
+    };
+    let limit = limit.clamp(1, MAX_HITS);
+    // The query goes through the SAME quantiser the corpus did, so the k-NN
+    // compares like with like. For int8 that is what makes it work at all:
+    // a per-vector scale is invisible to cosine only when both sides have one.
+    let query_bytes = vector_to_bytes(query);
+    let encoded = state
+        .encode(&query_bytes)
+        .context("encoding the query into the quantised index' tier")?;
+    let pool = candidate_pool(limit);
+    let candidates = crate::vec0::knn(connection, state.tier, encoded.as_ref(), pool)?;
+    rank_by_index(
+        connection,
+        &state,
+        candidates,
+        query,
+        limit,
+        RankPath::Quantised(state.tier),
+    )
+}
+
+/// Said when `mode=semantic_fast` reaches a corpus that has no quantised index.
+///
+/// `int8` and not `bit` in the suggestion: it is the tier the measurements
+/// picked, because it is the only one that answers with the corpus' real top-k
+/// (`docs/ARCHITECTURE.md`).
+const NO_QUANTISED_INDEX: &str = "this corpus has no quantised shadow index, so the exact path \
+                                  answered; build one with `llm-index vector-index --tier int8`";
+
+/// Candidates a quantised k-NN nominates for a `limit`-hit page.
+///
+/// Oversampling is what turns an approximate index into an accurate answer: the
+/// quantisation only has to put the right rows somewhere in the pool, and the
+/// float re-score then picks the same top-k out of it that the scan would.
+///
+/// The multiplier is MEASURED, not chosen. `docs/ARCHITECTURE.md` carries
+/// recall@10 against the exact answer at pools from 10 to 1,000 over the live
+/// 2.68 M-vector corpus, for both quantisations. On the `int8` tier recall is
+/// 0.9750 at pool 10 and **1.0000 from pool 20 upward**, so the bar is cleared
+/// by every pool this can produce; latency is flat to pool 100 (best 1,655 ->
+/// 1,750 ms) and then climbs with the re-score's keyed row reads (2,396 ms at
+/// pool 200, 3,257 ms at pool 1,000). Ten is the largest multiplier still on the
+/// flat part, i.e. all the margin that is free.
+///
+/// The pool is nearly free in the k-NN itself, whose work is reading 2.68 M
+/// vectors rather than the size of its heap; what it costs is one keyed `chunks`
+/// row read per candidate in the re-score, which is why it is bounded rather
+/// than simply large.
+const CANDIDATE_OVERSAMPLE: usize = 10;
+
+/// Ceiling on the candidate pool, at the point where the measured latency starts
+/// climbing. Reached at `limit` 20 — the `/corpus/search` default — and above.
+const MAX_CANDIDATES: usize = 200;
+
+fn candidate_pool(limit: usize) -> usize {
+    limit
+        .saturating_mul(CANDIDATE_OVERSAMPLE)
+        .clamp(limit, MAX_CANDIDATES)
+}
+
+/// Rank a k-NN's candidate list by re-scoring it against `chunks.embedding`.
+///
+/// The second step is what keeps every index path honest: the index picks the
+/// CANDIDATES, and their scores are then recomputed from `chunks.embedding`
+/// with [`cosine_bytes`] — the scan's own arithmetic, on the scan's own bytes —
+/// and ordered by the scan's own [`Ranked`] comparison. So a `score` in a
+/// response is the same number whichever path produced it, and no index can
+/// introduce a ranking of its own. On the exact tier that makes the answer
+/// identical to the scan's; on a quantised tier it makes every score exact even
+/// where the SET differs.
+///
+/// The exact tier's candidate list is deliberately wider than `limit`
+/// ([`KNN_TIE_MARGIN`]). A k-NN returns SOME k nearest rows; where several
+/// vectors tie at the k-th distance, which of them it returns is its traversal
+/// order rather than the scan's "lower `chunks.id` wins". Over-fetching lets the
+/// re-score resolve those ties the scan's way, and costs nothing — a `vec0`
+/// k-NN's work is reading the vectors, not the size of its heap. Ties running
+/// deeper than the margin (more than 100 chunks at exactly the boundary
+/// distance, i.e. that many byte-identical vectors) can still pick a different
+/// member of the tie than the scan would; the hits are equally correct, and the
+/// alternative is giving up the index.
 fn rank_by_index(
     connection: &Connection,
     state: &crate::vec0::IndexState,
+    candidates: Vec<i64>,
     query: &[f32],
     limit: usize,
+    path: RankPath,
 ) -> Result<VectorScan> {
     let limit = limit.clamp(1, MAX_HITS);
     let width = query.len() * 4;
     let query_norm = norm(query);
-    let candidates = crate::vec0::knn(connection, &vector_to_bytes(query), limit + KNN_TIE_MARGIN)?;
+    let nominated = candidates.len();
     let mut best = TopK::new(limit);
     let mut statement = connection.prepare("SELECT embedding FROM chunks WHERE id=?1")?;
     for id in candidates {
@@ -250,13 +411,14 @@ fn rank_by_index(
         hits,
         // The index holds exactly the rows the scan would have compared, and
         // excludes exactly the rows it would have skipped — that is what
-        // `vec0::build` filters on. Reporting the recorded counts keeps the two
+        // `vec0::build` filters on. Reporting the recorded counts keeps the
         // paths' responses the same shape without reading 2.7 M rows to
         // recount what the corpus already knows.
         compared: state.vectors,
         skipped: state.chunks.saturating_sub(state.vectors),
         other_models: Vec::new(),
-        path: RankPath::Vec0,
+        path,
+        candidates: Some(nominated),
         index_note: None,
     })
 }
@@ -331,6 +493,7 @@ fn scan_chunks(
         skipped,
         other_models: other_models.into_iter().collect(),
         path: RankPath::Scan,
+        candidates: None,
         index_note,
     })
 }
@@ -805,7 +968,14 @@ mod tests {
         // index (`llm-index vector-index`): the k-NN path over the SAME corpus
         // and the SAME query, so the two numbers are comparable and the hits can
         // be checked against each other rather than merely timed.
-        match crate::vec0::usable(&connection, EMBEDDING_MODEL, query.len()).unwrap() {
+        match crate::vec0::usable(
+            &connection,
+            crate::vec0::Slot::Exact,
+            EMBEDDING_MODEL,
+            query.len(),
+        )
+        .unwrap()
+        {
             crate::vec0::Usable::Absent => {
                 eprintln!("no vec0 shadow index in this corpus; scan numbers only")
             }
@@ -881,7 +1051,14 @@ mod tests {
         // the scores are recomputed from the same BLOBs by the same cosine.
         let mut connection = indexable_corpus(500);
         let scanned = scan_chunks(&connection, MODEL, &PROBE, 20, None).unwrap();
-        crate::vec0::build(&mut connection, MODEL, 3, |_, _| {}).unwrap();
+        crate::vec0::build(
+            &mut connection,
+            crate::vec0::Tier::Float,
+            MODEL,
+            3,
+            |_, _| {},
+        )
+        .unwrap();
         let indexed = rank_chunks(&connection, MODEL, &PROBE, 20).unwrap();
 
         assert_eq!(scanned.path, RankPath::Scan);
@@ -912,8 +1089,16 @@ mod tests {
         // over the vectors already stored. Rebuilt twice, because a rebuild
         // over an existing index is the repair path an operator actually runs.
         let mut connection = indexable_corpus(300);
-        crate::vec0::build(&mut connection, MODEL, 3, |_, _| {}).unwrap();
-        crate::vec0::build(&mut connection, MODEL, 3, |_, _| {}).unwrap();
+        for _ in 0..2 {
+            crate::vec0::build(
+                &mut connection,
+                crate::vec0::Tier::Float,
+                MODEL,
+                3,
+                |_, _| {},
+            )
+            .unwrap();
+        }
         for limit in [1, 5, 20, MAX_HITS] {
             let indexed = rank_chunks(&connection, MODEL, &PROBE, limit).unwrap();
             let scanned = scan_chunks(&connection, MODEL, &PROBE, limit, None).unwrap();
@@ -951,7 +1136,14 @@ mod tests {
         // fallback is not a formality: the row it wrote is a genuine top hit,
         // and a k-NN over the index could not have found it.
         let mut connection = indexable_corpus(100);
-        crate::vec0::build(&mut connection, MODEL, 3, |_, _| {}).unwrap();
+        crate::vec0::build(
+            &mut connection,
+            crate::vec0::Tier::Float,
+            MODEL,
+            3,
+            |_, _| {},
+        )
+        .unwrap();
         connection
             .execute(
                 "INSERT INTO files(id,path,name) VALUES(9001,'/corpus/late.txt','late.txt')",
@@ -985,7 +1177,14 @@ mod tests {
         // still knows about is dropped by the re-score rather than returned
         // pathless or scored from the stale vector.
         let mut connection = indexable_corpus(20);
-        crate::vec0::build(&mut connection, MODEL, 3, |_, _| {}).unwrap();
+        crate::vec0::build(
+            &mut connection,
+            crate::vec0::Tier::Float,
+            MODEL,
+            3,
+            |_, _| {},
+        )
+        .unwrap();
         let top = rank_chunks(&connection, MODEL, &PROBE, 1).unwrap().hits[0]
             .content
             .clone();
@@ -994,9 +1193,11 @@ mod tests {
         connection
             .execute("DELETE FROM chunks WHERE content=?1", [&top])
             .unwrap();
-        let mut state = crate::vec0::state(&connection).unwrap().unwrap();
+        let mut state = crate::vec0::state(&connection, crate::vec0::Slot::Exact)
+            .unwrap()
+            .unwrap();
         state.chunks -= 1;
-        crate::vec0::write_state(&connection, &state).unwrap();
+        crate::vec0::write_state(&connection, crate::vec0::Slot::Exact, &state).unwrap();
 
         let scan = rank_chunks(&connection, MODEL, &PROBE, 5).unwrap();
         assert_eq!(scan.path, RankPath::Vec0);
@@ -1017,5 +1218,597 @@ mod tests {
         assert_eq!(scan.hits.len(), MAX_HITS);
         let scan = rank_chunks(&connection, MODEL, &[1.0, 0.0, 0.0], 0).unwrap();
         assert_eq!(scan.hits.len(), 1);
+    }
+
+    // ---- the quantised tier ------------------------------------------------
+    //
+    // Everything below is about ONE question: a quantised index returns a
+    // different set of rows from the scan, so how different, and does the
+    // caller ever get it without asking? The live-corpus numbers are in
+    // `docs/ARCHITECTURE.md` and come from `quantised_recall_over_a_real_corpus`
+    // at the bottom; the fixtures here pin the behaviour that has to hold
+    // whatever those numbers are.
+
+    /// A deterministic 32-bit LCG. No `rand` dependency, and a failure here is
+    /// always the same failure.
+    struct Lcg(u32);
+
+    impl Lcg {
+        fn next(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (self.0 >> 8) as f32 / (1u32 << 23) as f32 - 0.5
+        }
+
+        fn unit(&mut self, width: usize) -> Vec<f32> {
+            let vector = (0..width).map(|_| self.next()).collect::<Vec<_>>();
+            let length = norm(&vector);
+            vector.into_iter().map(|value| value / length).collect()
+        }
+    }
+
+    /// The width the shipped model embeds at, and the one bit quantisation has
+    /// to be able to pack.
+    const WIDTH: usize = 384;
+
+    /// Documents per topic, and topics, in the fixture corpora below.
+    const PER_TOPIC: usize = 25;
+
+    /// How far a document sits from its topic's centre, and a query from the
+    /// topic it is asking about. Chosen so intra-topic cosine lands near 0.75 —
+    /// close enough that the ten nearest are genuinely the same subject, far
+    /// enough apart that ranking them is a real task rather than a tie.
+    const JITTER: f32 = 0.15;
+
+    /// How much of every vector is the corpus' shared "hub" direction.
+    ///
+    /// The single most important number in this fixture. Text-embedding models
+    /// do not produce vectors spread evenly over the sphere: they produce
+    /// vectors clustered around one dominant mean direction, so any two
+    /// documents already agree strongly before their topics are considered.
+    /// A fixture without that is not a text corpus, and it cannot exercise the
+    /// thing that makes `Tier::Bit` work — a sign bit taken about the ORIGIN
+    /// carries information only if the corpus straddles the origin, and a
+    /// hubbed corpus does not.
+    const HUB: f32 = 2.0;
+
+    /// A corpus shaped like a real one: one shared hub direction, `clusters`
+    /// topics around it, [`PER_TOPIC`] documents around each topic, every vector
+    /// normalised. The topic centres come back so a test can ask a question that
+    /// HAS an answer.
+    ///
+    /// Every part of that shape is load-bearing, and none is decoration:
+    ///
+    /// * uniformly random 384-d vectors would be a dishonest CORPUS — they are
+    ///   all nearly orthogonal, so a top-10 is ten members of one
+    ///   undifferentiated cloud, and they straddle the origin in every dimension
+    ///   so binary quantisation looks better here than it is;
+    /// * a uniformly random QUERY would be a dishonest question — it sits near
+    ///   nothing, so its top-10 is separated by cosine noise smaller than any
+    ///   8-bit (let alone 1-bit) quantiser's rounding, and every quantisation
+    ///   scores badly on it for a reason that has nothing to do with search.
+    ///   Measured here, that fixture put `Tier::Bit` at recall@10 0.79 — a fact
+    ///   about asking a corpus of documents about nothing, not about the tier.
+    ///
+    /// So the tests below query NEAR a topic centre, exactly as a real query
+    /// lands near a subject, and the ranking task is discriminating between that
+    /// subject's own documents — which is the task quantisation has to survive.
+    fn clustered_corpus(clusters: usize) -> (Connection, Vec<Vec<f32>>) {
+        let mut rng = Lcg(20_260_726);
+        let hub = rng.unit(WIDTH);
+        let mut rows = Vec::with_capacity(clusters * PER_TOPIC);
+        let mut centres = Vec::with_capacity(clusters);
+        let mut id = 1i64;
+        for _ in 0..clusters {
+            let topic = rng.unit(WIDTH);
+            let centre = normalise(
+                &hub.iter()
+                    .zip(&topic)
+                    .map(|(shared, own)| HUB * shared + own)
+                    .collect::<Vec<_>>(),
+            );
+            for _ in 0..PER_TOPIC {
+                rows.push((id, id, MODEL, jitter_around(&centre, &mut rng)));
+                id += 1;
+            }
+            centres.push(centre);
+        }
+        (corpus(&rows), centres)
+    }
+
+    /// `centre` displaced by [`JITTER`] of noise, renormalised.
+    fn jitter_around(centre: &[f32], rng: &mut Lcg) -> Vec<f32> {
+        normalise(
+            &centre
+                .iter()
+                .map(|value| value + JITTER * rng.next())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn normalise(vector: &[f32]) -> Vec<f32> {
+        let length = norm(vector);
+        vector.iter().map(|value| value / length).collect()
+    }
+
+    /// Share of the exact top-`k` that `candidate` also returned.
+    ///
+    /// Keyed on `(path, chunk_index)`, which identifies a chunk, and NOT on its
+    /// text: a real corpus is full of chunks whose content is byte-identical
+    /// (boilerplate headers, empty-ish OCR pages, the same document filed
+    /// twice). Keying on text silently collapses those into one truth entry and
+    /// counts every hit that matches any of them, which reports recall above
+    /// 1.0 — as this measurement did until it keyed on identity.
+    fn recall(exact: &VectorScan, candidate: &VectorScan) -> f64 {
+        let key = |hit: &VectorHit| (hit.path.clone(), hit.chunk_index);
+        let truth = exact.hits.iter().map(key).collect::<BTreeSet<_>>();
+        if truth.is_empty() {
+            return 1.0;
+        }
+        let found = candidate
+            .hits
+            .iter()
+            .filter(|hit| truth.contains(&key(hit)))
+            .count();
+        found as f64 / truth.len() as f64
+    }
+
+    /// The recall bar this feature ships against — see plan §6 Q1.
+    const RECALL_BAR: f64 = 0.95;
+
+    /// The floor `Tier::Bit` has to stay above on this fixture.
+    ///
+    /// Not a bar it ships against — it does not clear [`RECALL_BAR`] here or on
+    /// the live corpus, and `docs/ARCHITECTURE.md` says so with the numbers.
+    /// This is the line between "coarse" and "broken": an uncentred bit index,
+    /// or one whose packing disagreed with `sqlite-vec`'s Hamming distance,
+    /// lands far below it, so it catches the failures that would otherwise look
+    /// like the tier merely being lossy.
+    const BIT_FLOOR: f64 = 0.5;
+
+    #[test]
+    fn a_quantised_index_clears_the_recall_bar_and_rebuilds_to_the_same_answer() {
+        // Rebuild equivalence, stated the only way it can be stated for a lossy
+        // index: not "the same list" — it is not the same list — but "the same
+        // list to within the bar each tier is held to", reproduced by a rebuild
+        // from the same BLOBs. Both quantisations, over 20 queries drawn from
+        // the corpus' own geometry.
+        //
+        // The two bars differ because the measurements differ. `Int8` returns
+        // the exact top-10 on the live 2.68 M-vector corpus (recall@10 1.0000
+        // from pool 20 up) and is what `semantic_fast` is built on; `Bit` is
+        // three times faster and does not come close (0.125 to 0.615), so what
+        // is pinned here is that it still works as designed rather than that it
+        // is good enough to prefer.
+        let (mut connection, centres) = clustered_corpus(40);
+        crate::vec0::build(
+            &mut connection,
+            crate::vec0::Tier::Float,
+            MODEL,
+            WIDTH,
+            |_, _| {},
+        )
+        .unwrap();
+        let mut rng = Lcg(7);
+        let queries = centres
+            .iter()
+            .take(20)
+            .map(|centre| jitter_around(centre, &mut rng))
+            .collect::<Vec<_>>();
+
+        for (tier, bar) in [
+            (crate::vec0::Tier::Int8, RECALL_BAR),
+            (crate::vec0::Tier::Bit, BIT_FLOOR),
+        ] {
+            // Built twice: a rebuild over an existing index is the repair path
+            // an operator actually runs, and it has to land in the same place.
+            let mut rounds = Vec::new();
+            for _ in 0..2 {
+                crate::vec0::build(&mut connection, tier, MODEL, WIDTH, |_, _| {}).unwrap();
+                let mut total = 0.0;
+                for query in &queries {
+                    let exact = rank_chunks(&connection, MODEL, query, 10).unwrap();
+                    let fast = rank_chunks_fast(&connection, MODEL, query, 10).unwrap();
+                    assert_eq!(fast.path, RankPath::Quantised(tier));
+                    assert!(!fast.path.is_exact());
+                    assert_eq!(fast.hits.len(), exact.hits.len());
+                    assert_eq!(fast.candidates, Some(candidate_pool(10)));
+                    total += recall(&exact, &fast);
+                }
+                rounds.push(total / queries.len() as f64);
+            }
+            assert!(rounds[0] >= bar, "{tier:?} recall@10 {:.4}", rounds[0]);
+            assert_eq!(
+                rounds[0], rounds[1],
+                "{tier:?}: a rebuild from the same BLOBs must reproduce the same answer"
+            );
+        }
+    }
+
+    #[test]
+    fn the_quantised_path_scores_every_hit_from_the_stored_float_vector() {
+        // The invariant that survives quantisation: what changes is which rows
+        // were scored, never what a score means. Every hit the fast path
+        // returns carries the cosine the scan would have computed for it, to
+        // the bit.
+        let (mut connection, centres) = clustered_corpus(10);
+        crate::vec0::build(
+            &mut connection,
+            crate::vec0::Tier::Bit,
+            MODEL,
+            WIDTH,
+            |_, _| {},
+        )
+        .unwrap();
+        let mut rng = Lcg(11);
+        let query = jitter_around(&centres[3], &mut rng);
+
+        let fast = rank_chunks_fast(&connection, MODEL, &query, 10).unwrap();
+        let exact = scan_chunks(&connection, MODEL, &query, MAX_HITS, None).unwrap();
+        assert!(!fast.hits.is_empty());
+        for hit in &fast.hits {
+            let scanned = exact
+                .hits
+                .iter()
+                .find(|candidate| candidate.content == hit.content)
+                .unwrap_or_else(|| panic!("{} is not in the scan's top-100", hit.content));
+            assert_eq!(
+                hit.score.to_bits(),
+                scanned.score.to_bits(),
+                "{}",
+                hit.content
+            );
+        }
+        // And the page is ordered by that score, descending, like every other
+        // path in this module.
+        assert!(fast
+            .hits
+            .windows(2)
+            .all(|pair| pair[0].score >= pair[1].score));
+    }
+
+    #[test]
+    fn the_exact_path_never_reads_the_quantised_index() {
+        // The separation the whole design rests on. A corpus carrying ONLY a
+        // quantised index answers `mode=semantic` by the scan — it does not
+        // quietly become approximate because an operator built a fast index.
+        let mut connection = indexable_corpus(200);
+        crate::vec0::build(
+            &mut connection,
+            crate::vec0::Tier::Int8,
+            MODEL,
+            3,
+            |_, _| {},
+        )
+        .unwrap();
+
+        let exact = rank_chunks(&connection, MODEL, &PROBE, 10).unwrap();
+        let scanned = scan_chunks(&connection, MODEL, &PROBE, 10, None).unwrap();
+        assert_eq!(exact.path, RankPath::Scan);
+        assert!(exact.path.is_exact());
+        assert_eq!(exact.index_note, None, "there is no EXACT index to explain");
+        assert_eq!(
+            exact
+                .hits
+                .iter()
+                .map(|hit| (hit.content.clone(), hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            scanned
+                .hits
+                .iter()
+                .map(|hit| (hit.content.clone(), hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn the_fast_path_over_a_corpus_without_a_quantised_index_answers_exactly() {
+        // The absent-index fallback. A request for the fast path over a corpus
+        // that has none is answered EXACTLY rather than refused, and the note
+        // says both that it was and how to make it fast.
+        let connection = indexable_corpus(120);
+        let fast = rank_chunks_fast(&connection, MODEL, &PROBE, 10).unwrap();
+        let scanned = scan_chunks(&connection, MODEL, &PROBE, 10, None).unwrap();
+
+        assert_eq!(fast.path, RankPath::Scan);
+        assert!(fast.path.is_exact());
+        assert!(
+            fast.index_note
+                .as_deref()
+                .is_some_and(|note| note.contains("no quantised shadow index")),
+            "{:?}",
+            fast.index_note
+        );
+        assert_eq!(fast.hits.len(), scanned.hits.len());
+        assert_eq!(fast.hits[0].content, scanned.hits[0].content);
+    }
+
+    #[test]
+    fn the_fast_path_uses_the_exact_index_when_that_is_all_the_corpus_has() {
+        // Same fallback, one rung up: a corpus with a float index and no
+        // quantised one serves `semantic_fast` from the float index — still
+        // exact, still faster than the scan, and still labelled honestly.
+        let mut connection = indexable_corpus(120);
+        crate::vec0::build(
+            &mut connection,
+            crate::vec0::Tier::Float,
+            MODEL,
+            3,
+            |_, _| {},
+        )
+        .unwrap();
+
+        let fast = rank_chunks_fast(&connection, MODEL, &PROBE, 10).unwrap();
+        assert_eq!(fast.path, RankPath::Vec0);
+        assert!(fast.path.is_exact());
+        assert!(fast
+            .index_note
+            .as_deref()
+            .is_some_and(|note| note.contains("no quantised shadow index")));
+    }
+
+    #[test]
+    fn a_stale_quantised_index_is_bypassed_and_the_answer_is_still_right() {
+        // The staleness witness, on the quantised slot. A build without index
+        // maintenance writes a genuine top hit behind the index; the fast path
+        // must fall back rather than serve a page that cannot contain it.
+        let mut connection = indexable_corpus(100);
+        crate::vec0::build(
+            &mut connection,
+            crate::vec0::Tier::Int8,
+            MODEL,
+            3,
+            |_, _| {},
+        )
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO files(id,path,name) VALUES(9001,'/corpus/late.txt','late.txt')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO chunks(id,file_id,chunk_index,content,embedding,dimensions,model) \
+                 VALUES(9001,9001,0,'written behind the index',?1,3,?2)",
+                rusqlite::params![vector_to_bytes(&PROBE), MODEL],
+            )
+            .unwrap();
+
+        let fast = rank_chunks_fast(&connection, MODEL, &PROBE, 5).unwrap();
+        assert_eq!(fast.path, RankPath::Scan);
+        assert!(
+            fast.index_note
+                .as_deref()
+                .is_some_and(|note| note.contains("stale") && note.contains("chunks_vec_q")),
+            "{:?}",
+            fast.index_note
+        );
+        assert_eq!(fast.hits[0].content, "written behind the index");
+    }
+
+    #[test]
+    fn the_candidate_pool_is_bounded_and_never_below_the_page() {
+        assert_eq!(candidate_pool(10), 10 * CANDIDATE_OVERSAMPLE);
+        assert_eq!(candidate_pool(1), CANDIDATE_OVERSAMPLE);
+        assert_eq!(candidate_pool(MAX_HITS), MAX_CANDIDATES);
+        assert!(
+            candidate_pool(MAX_HITS) >= MAX_HITS,
+            "a full page must never ask for fewer candidates than hits"
+        );
+    }
+
+    /// Recall and latency of the quantised tiers over a real corpus — runs only
+    /// when `LLM_INDEX_BENCH_CORPUS` names one, otherwise it skips, so CI needs
+    /// no multi-GB fixture. Build with `--release`.
+    ///
+    /// This is the measurement the shipped [`CANDIDATE_OVERSAMPLE`] comes from,
+    /// and the numbers it printed are in `docs/ARCHITECTURE.md`. It wants a
+    /// corpus carrying BOTH indexes: the float one is the ground truth (proven
+    /// equal to the scan by `scan_latency_over_a_real_corpus`) and answering
+    /// 20 queries from it costs seconds instead of the ~20 minutes the same
+    /// queries would cost by scanning.
+    ///
+    /// `FASTEMBED_CACHE_DIR` pointing at a staged `multilingual-e5-small` makes
+    /// the queries REAL query embeddings, which is the only honest way to
+    /// measure recall — a random unit vector is nowhere near the manifold a
+    /// query lands on, and quantisation error is a property of where you are on
+    /// it. Without the model the test says so and falls back to stored corpus
+    /// vectors, which is the next best thing and clearly labelled.
+    #[test]
+    fn quantised_recall_over_a_real_corpus() {
+        let Ok(path) = std::env::var("LLM_INDEX_BENCH_CORPUS") else {
+            eprintln!("skipping quantised recall measurement: LLM_INDEX_BENCH_CORPUS unset");
+            return;
+        };
+        crate::vec0::register();
+        let connection = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open corpus read-only");
+        let quantised = match crate::vec0::usable(
+            &connection,
+            crate::vec0::Slot::Quantised,
+            EMBEDDING_MODEL,
+            WIDTH,
+        )
+        .unwrap()
+        {
+            crate::vec0::Usable::Ready(state) => state,
+            crate::vec0::Usable::Absent => {
+                eprintln!("no quantised shadow index in this corpus; nothing to measure");
+                return;
+            }
+            crate::vec0::Usable::Declined(reason) => {
+                eprintln!("quantised index not usable: {reason}");
+                return;
+            }
+        };
+        let exact_path = crate::vec0::usable(
+            &connection,
+            crate::vec0::Slot::Exact,
+            EMBEDDING_MODEL,
+            WIDTH,
+        )
+        .unwrap();
+        eprintln!(
+            "corpus {path}: {} vectors over {} chunks, quantised tier {}, exact index {}",
+            quantised.vectors,
+            quantised.chunks,
+            quantised.tier.as_str(),
+            match &exact_path {
+                crate::vec0::Usable::Ready(_) => "present (ground truth is the k-NN)".to_string(),
+                crate::vec0::Usable::Absent => "absent (ground truth is the full scan)".to_string(),
+                crate::vec0::Usable::Declined(reason) => format!("declined: {reason}"),
+            }
+        );
+
+        let queries = bench_queries(&connection);
+        // The exact answer, once per query, reused by every pool size.
+        let mut truth = Vec::new();
+        let mut exact_ms = Vec::new();
+        for query in &queries {
+            let started = std::time::Instant::now();
+            let scan = rank_chunks(&connection, EMBEDDING_MODEL, query, 10).unwrap();
+            exact_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            truth.push(scan);
+        }
+        eprintln!(
+            "exact path ({}) over {} queries: {}",
+            truth[0].path.as_str(),
+            queries.len(),
+            summarise(&exact_ms)
+        );
+
+        // The SHIPPED path, exactly as `mode=semantic_fast` calls it, before the
+        // sweep below explores the pools around it. Reported first so the table
+        // can be read as "and here is why that is the pool it uses".
+        let mut shipped_ms = Vec::new();
+        let mut shipped_recall = Vec::new();
+        for (query, exact) in queries.iter().zip(&truth) {
+            let started = std::time::Instant::now();
+            let fast = rank_chunks_fast(&connection, EMBEDDING_MODEL, query, 10).unwrap();
+            shipped_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(fast.path, RankPath::Quantised(quantised.tier));
+            assert_eq!(fast.candidates, Some(candidate_pool(10)));
+            shipped_recall.push(recall(exact, &fast));
+        }
+        eprintln!(
+            "SHIPPED rank_chunks_fast (limit 10, pool {}): recall@10 mean {:.4} worst {:.4}; {}",
+            candidate_pool(10),
+            shipped_recall.iter().sum::<f64>() / shipped_recall.len() as f64,
+            shipped_recall.iter().cloned().fold(f64::INFINITY, f64::min),
+            summarise(&shipped_ms)
+        );
+
+        // Pool 10 is the "no rerank headroom" pattern — the quantised k-NN's own
+        // top-10, re-scored but never given anything to choose between. Every
+        // larger pool is the rerank pattern at a different oversample.
+        for pool in [10usize, 20, 50, 100, 200, 500, 1_000] {
+            let mut recalls = Vec::new();
+            let mut millis = Vec::new();
+            for (query, exact) in queries.iter().zip(&truth) {
+                let bytes = vector_to_bytes(query);
+                let encoded = quantised.encode(&bytes).unwrap();
+                let started = std::time::Instant::now();
+                let candidates =
+                    crate::vec0::knn(&connection, quantised.tier, encoded.as_ref(), pool).unwrap();
+                let fast = rank_by_index(
+                    &connection,
+                    &quantised,
+                    candidates,
+                    query,
+                    10,
+                    RankPath::Quantised(quantised.tier),
+                )
+                .unwrap();
+                millis.push(started.elapsed().as_secs_f64() * 1000.0);
+                recalls.push(recall(exact, &fast));
+            }
+            let mean = recalls.iter().sum::<f64>() / recalls.len() as f64;
+            let floor = recalls.iter().cloned().fold(f64::INFINITY, f64::min);
+            eprintln!(
+                "{} pool {pool:>5}: recall@10 mean {mean:.4} worst {floor:.4}; {}",
+                quantised.tier.as_str(),
+                summarise(&millis)
+            );
+        }
+    }
+
+    /// `n` query vectors for the bench, embedded by the real model when one is
+    /// staged and drawn from the corpus otherwise.
+    fn bench_queries(connection: &Connection) -> Vec<Vec<f32>> {
+        let prompts = [
+            "hoa don thanh toan",
+            "invoice total amount due",
+            "passport scan copy",
+            "bang diem dai hoc",
+            "insurance policy renewal",
+            "hop dong lao dong",
+            "photo of a beach at sunset",
+            "meeting notes action items",
+            "giay khai sinh",
+            "bank statement transactions",
+            "curriculum vitae experience",
+            "so do nha dat",
+            "medical test results",
+            "software licence agreement",
+            "thu moi hop",
+            "tax return filing",
+            "receipt for equipment purchase",
+            "danh sach nhan vien",
+            "travel itinerary booking",
+            "warranty certificate",
+        ];
+        let config = crate::config::Config::default();
+        match Embedder::new(&config) {
+            Ok(mut embedder) => {
+                eprintln!("queries: {} real embeddings of real prompts", prompts.len());
+                prompts
+                    .iter()
+                    .map(|prompt| embedder.embed_query(prompt).unwrap())
+                    .collect()
+            }
+            Err(error) => {
+                eprintln!(
+                    "queries: NO embedding model ({error:#}) — falling back to {} stored corpus \
+                     vectors, which sit on the passage manifold rather than the query one",
+                    prompts.len()
+                );
+                let mut statement = connection
+                    .prepare(
+                        "SELECT embedding FROM chunks WHERE model=?1 AND id % 9973 = 0 LIMIT ?2",
+                    )
+                    .unwrap();
+                statement
+                    .query_map(
+                        rusqlite::params![EMBEDDING_MODEL, prompts.len() as i64],
+                        |row| {
+                            let blob = row.get_ref(0)?.as_blob()?;
+                            Ok(blob
+                                .chunks_exact(4)
+                                .map(|bytes| {
+                                    f32::from_le_bytes(bytes.try_into().expect("four bytes"))
+                                })
+                                .collect::<Vec<f32>>())
+                        },
+                    )
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            }
+        }
+    }
+
+    /// `best / median / worst` of a set of millisecond timings.
+    fn summarise(millis: &[f64]) -> String {
+        let mut sorted = millis.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        format!(
+            "best {:.0} ms, median {:.0} ms, worst {:.0} ms",
+            sorted[0],
+            sorted[sorted.len() / 2],
+            sorted[sorted.len() - 1]
+        )
     }
 }
