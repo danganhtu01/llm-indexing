@@ -378,7 +378,7 @@ with the same model the corpus rows were embedded with
 | param | default | meaning |
 |---|---|---|
 | `q` | — | required; blank or missing is `400` |
-| `mode` | `semantic` | only `semantic` today; anything else is `400` listing the accepted modes |
+| `mode` | `semantic` | `semantic` (exact) or `semantic_fast` (quantised, approximate); anything else is `400` listing the accepted modes |
 | `limit` | `20` | clamped to `1..=100` |
 | `output` | `corpus.sqlite` | same plain-filename rule as every other route here |
 
@@ -401,7 +401,8 @@ with the same model the corpus rows were embedded with
   "compared_chunks": 100000,
   "skipped_chunks": 0,
   "elapsed_ms": 1204,
-  "path": "scan"
+  "path": "scan",
+  "exact": true
 }
 ```
 
@@ -410,20 +411,38 @@ are one shape. `score` is cosine similarity in `-1.0..=1.0`; ordering is
 descending score, ties broken by ascending `chunks.id`, so the same query over
 the same corpus always returns the same list in the same order.
 
-**`path` says how the answer was produced**, because the two ways differ by more
-than an order of magnitude in latency and by nothing else:
+**`mode` chooses the promise.** `semantic` (the default) is exact: the answer is
+the corpus' true top-k, however long that takes. `semantic_fast` ranks through
+the corpus' QUANTISED shadow index instead — sub-second where `semantic` is
+seconds, at the cost of returning an approximation of the same list. It is a
+separate mode rather than a tolerance knob because approximate and exact are
+different promises, and a caller has to choose one deliberately.
 
-| `path` | meaning |
-|---|---|
-| `scan` | the exhaustive cosine scan over every stored vector |
-| `vec0` | a k-NN lookup against the corpus' `vec0` shadow index, with the candidates re-scored from the same BLOBs — same hits, same scores, same order |
+**`path` says how the answer was produced**, and **`exact` says whether it is
+the scan's own answer.** Never infer the second from the first: a
+`semantic_fast` request over a corpus with no quantised index is answered
+exactly, and only `exact` tells you so.
+
+| `path` | `exact` | meaning |
+|---|---|---|
+| `scan` | `true` | the exhaustive cosine scan over every stored vector |
+| `vec0` | `true` | a k-NN lookup against the corpus' exact `vec0` shadow index, with the candidates re-scored from the same BLOBs — same hits, same scores, same order as the scan |
+| `vec0_int8` | `false` | a k-NN over the int8-quantised index, oversampled and re-scored from the float BLOBs |
+| `vec0_bit` | `false` | the same over the 1-bit-quantised index |
+
+On the two quantised paths `candidates` reports how many rows the k-NN nominated
+before the float re-score picked the page out of them — the one number behind how
+good the approximation is. Every `score` is a true cosine against the stored
+vector on every path; what quantisation changes is which rows were scored at all.
 
 A corpus has a shadow index only after `llm-index vector-index` has been run
 against it; without one, `path` is always `scan` and nothing else changes. When a
 corpus HAS one that was not used, `index_note` says why — an interrupted build,
 another model's vectors, or an index that a build without index maintenance has
-written behind (`--rebuild` is the repair). A missing `index_note` on
-`path: scan` means there is no index to talk about.
+written behind (`--rebuild` is the repair). Asking for `semantic_fast` on a
+corpus with no quantised index also fills `index_note`, with the command that
+would build one. A missing `index_note` on `path: scan` means there is no index
+to talk about.
 
 **`status` is the field to branch on.** An empty `hits` is never ambiguous:
 
@@ -450,10 +469,24 @@ throwaway search at startup.
 
 **Per-query cost.** The scan is exhaustive, so latency scales with the corpus:
 measured 0.24 s per 100 k vectors and 13.7 s over the live 2.68 M-vector /
-15.6 GB corpus. A corpus with a `vec0` shadow index reads the vectors only and
-answers roughly an order of magnitude faster — best warm passes 1.32 s at 869 k
-vectors and 3.9 s at 2.68 M, against 13.9 s and 45.6 s for the scan measured back
-to back on the same loaded workstation. That is a large improvement and still not
-interactive at 2.68 M vectors; see `docs/ARCHITECTURE.md` for the full table, the
-build cost and why `vec0` 0.1.9 is a faster brute force rather than an ANN.
-Either way this is not a search-as-you-type endpoint.
+15.6 GB corpus. A corpus with an exact `vec0` shadow index reads the vectors only
+and answers roughly an order of magnitude faster — best warm passes 1.32 s at
+869 k vectors and 3.9 s at 2.68 M, against 13.9 s and 45.6 s for the scan measured
+back to back on the same loaded workstation.
+
+`mode=semantic_fast` over an `int8` index is faster again, and it is the only
+configuration that is ever interactive — measured over 20 real query embeddings,
+`limit=10`, **recall@10 1.0000 against the exact answer at both sizes**:
+
+| vectors | `semantic` (exact index) | `semantic_fast` (`int8`) |
+|---|---|---|
+| 869,267 | 916 ms best | **571 ms best, 586 ms median** |
+| 2,684,125 | 3,787 ms best | 1,860 ms best, 1,945 ms median |
+
+So sub-second arrives below about a million vectors and not at 2.68 M, where the
+`int8` k-NN is bound by `sqlite-vec` 0.1.9's scalar int8 kernel rather than by
+I/O. The `bit` tier IS sub-second there (143 - 399 ms) at recall@10 0.125 - 0.445,
+which is why it is not what `semantic_fast` suggests building. `docs/ARCHITECTURE.md`
+carries every pool, both tiers, both corpora, the build costs, and why `vec0`
+0.1.9 is a faster brute force rather than an ANN. None of this is a
+search-as-you-type endpoint at 2.68 M vectors.

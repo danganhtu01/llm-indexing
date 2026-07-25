@@ -23,8 +23,9 @@ this component.
   diacritic-insensitive FTS5 search
 - 384-dimensional `multilingual-e5-small` embeddings and cosine vector search,
   over the `vector-search` CLI subcommand and `GET /corpus/search?mode=semantic`
-  alike, with an optional `vec0` k-NN shadow index (`vector-index`) that an
-  existing corpus can gain without re-embedding anything
+  alike, with optional `vec0` k-NN shadow indexes (`vector-index`) — an exact one
+  and a quantised one for `mode=semantic_fast` — that an existing corpus can gain
+  without re-embedding anything
 - Crash-safe batched writes, resume/change detection, removal pruning, authentic
   incomplete/error counts, folder aggregation, manifests, reports and optional
   sidecars
@@ -79,17 +80,31 @@ cargo build --release --locked
 ./target/release/llm-index vector-search "customer due diligence" \
   --index index_out/index.sqlite
 ./target/release/llm-index vector-index --index index_out/index.sqlite
+./target/release/llm-index vector-index --index index_out/index.sqlite --tier int8
 ./target/release/llm-index top-folder "hoa don" --index index_out --limit 10
 ```
 
-`vector-index` builds the optional `vec0` shadow index from the vectors a corpus
-already holds — nothing is re-embedded — and turns semantic search from an
+`vector-index` builds the optional `vec0` shadow indexes from the vectors a
+corpus already holds — nothing is re-embedded — and turns semantic search from an
 exhaustive scan into a k-NN lookup. It is opt-in per corpus: without it,
 `vector-search` and `/corpus/search` scan exactly as before, and the response
 says which path served it. `--status` reports what a corpus has, `--rebuild`
 replaces it after a build that does not maintain it has written to the corpus,
-and `--drop` removes it. See
-[Cost of the vector scan](docs/ARCHITECTURE.md#cost-of-the-vector-scan).
+and `--drop` removes it.
+
+`--tier` picks which of the two indexes to touch. The default `float` tier is
+exact — `mode=semantic` uses it and returns what the scan returns, only sooner.
+The `int8` and `bit` tiers are QUANTISED: much smaller, much faster, and they
+change which rows come back, so only `mode=semantic_fast` reads them and the
+response labels itself `exact: false`. A corpus can carry one of each.
+
+Build `int8` unless you have measured otherwise: on both live corpora it returned
+the exact top-10 (recall@10 1.0000) in 571 ms at 869 k vectors and 1,860 ms at
+2.68 M. `bit` is three to twelve times faster again and much less accurate
+(recall@10 0.16 - 0.80), which is why sub-second and exact-enough are not the same
+answer at 2.68 M vectors. See
+[Cost of the vector scan](docs/ARCHITECTURE.md#cost-of-the-vector-scan) for every
+number, both tiers, both corpora.
 
 Copy `config.example.yaml` to override OCR, extraction, Whisper, embedding,
 worker, sidecar and skip settings.

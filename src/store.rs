@@ -267,17 +267,18 @@ pub struct IndexStore {
     /// Set when a per-file rollback itself failed, leaving the open transaction
     /// in an unknown state. `finish` then discards it instead of committing.
     poisoned: bool,
-    /// The corpus' `vec0` shadow index, when it has one — `None` for every
+    /// The corpus' `vec0` shadow indexes, when it has any — EMPTY for every
     /// corpus that has never been through `llm-index vector-index`, which is
     /// every corpus by default and the reason nothing here costs anything
-    /// unless an operator asked for it.
+    /// unless an operator asked for it. At most two: the exact slot and the
+    /// quantised one (`crate::vec0::Slot`).
     ///
-    /// Held in memory because it is a pair of counts that has to move with the
+    /// Held in memory because each is a pair of counts that has to move with the
     /// rows: [`crate::vec0::IndexState::vectors`] and
-    /// [`crate::vec0::IndexState::chunks`] are what let a reader prove the
-    /// index still covers the corpus, so they are re-stamped inside the same
-    /// per-file savepoint that writes the chunks themselves.
-    vec0: Option<crate::vec0::IndexState>,
+    /// [`crate::vec0::IndexState::chunks`] are what let a reader prove an index
+    /// still covers the corpus, so they are re-stamped inside the same per-file
+    /// savepoint that writes the chunks themselves.
+    vec0: Vec<crate::vec0::Maintained>,
 }
 
 impl IndexStore {
@@ -370,11 +371,7 @@ impl IndexStore {
         // finished has no state to load, and is left exactly as it is: this job
         // will not maintain a table it cannot vouch for, and the build the
         // operator re-runs replaces it wholesale.
-        let vec0 = if crate::vec0::present(&connection)? {
-            crate::vec0::state(&connection)?
-        } else {
-            None
-        };
+        let vec0 = crate::vec0::maintained(&connection)?;
         connection.execute_batch("BEGIN IMMEDIATE")?;
         Ok(Self {
             out: root,
@@ -548,46 +545,49 @@ impl IndexStore {
         Ok(())
     }
 
-    /// Mirror one just-written `chunks` row into the shadow index.
+    /// Mirror one just-written `chunks` row into every shadow index the corpus
+    /// carries.
     ///
     /// A no-op — not a branch taken cheaply, but no work at all — for a corpus
-    /// without an index, which is every corpus that has not been through
-    /// `llm-index vector-index`. That is what makes the index optional at index
-    /// time as well as at query time: a job on an unindexed corpus writes
+    /// without one, which is every corpus that has not been through
+    /// `llm-index vector-index`. That is what makes the indexes optional at
+    /// index time as well as at query time: a job on an unindexed corpus writes
     /// exactly the rows it wrote before this existed.
     ///
-    /// A chunk the index does not cover (another embedding model, another
-    /// width) is counted and not inserted, which is the same rule
+    /// A chunk an index does not cover (another embedding model, another width)
+    /// is counted and not inserted, which is the same rule
     /// [`crate::vec0::build`] applies. Both counters move here so the state a
     /// reader validates against is written by the code that writes the rows.
+    /// Each index is encoded into its OWN tier from the same `f32` bytes, so a
+    /// corpus carrying both an exact and a quantised index stays consistent
+    /// across both without the caller knowing either exists.
     fn index_chunk(&mut self, id: i64, embedding: &[u8]) -> Result<()> {
-        let Some(state) = self.vec0.as_mut() else {
-            return Ok(());
-        };
-        state.chunks += 1;
-        if state.model != crate::embedding::EMBEDDING_MODEL
-            || embedding.len() != state.dimensions * 4
-        {
-            return Ok(());
+        for index in &mut self.vec0 {
+            index.state.chunks += 1;
+            if index.state.model != crate::embedding::EMBEDDING_MODEL {
+                continue;
+            }
+            let Some(encoded) = index.state.encode(embedding) else {
+                continue;
+            };
+            index.state.vectors += 1;
+            crate::vec0::insert(&self.connection, index.state.tier, id, encoded.as_ref())?;
         }
-        state.vectors += 1;
-        crate::vec0::insert(&self.connection, id, embedding)
+        Ok(())
     }
 
-    /// Drop a file's chunks out of the shadow index, ahead of the `DELETE` that
-    /// removes the rows themselves.
+    /// Drop a file's chunks out of every shadow index, ahead of the `DELETE`
+    /// that removes the rows themselves.
     ///
     /// Ahead, not after: the ids and the widths this needs live in the rows
     /// being deleted, so reading them afterwards would read nothing and leave
-    /// the index holding vectors for chunks that no longer exist — which a
-    /// later k-NN would return as candidates and the re-score would silently
-    /// drop, quietly shrinking every result page near a re-indexed file.
+    /// an index holding vectors for chunks that no longer exist — which a later
+    /// k-NN would return as candidates and the re-score would silently drop,
+    /// quietly shrinking every result page near a re-indexed file.
     fn unindex_chunks_of(&mut self, file_id: i64) -> Result<()> {
-        let Some(state) = self.vec0.as_ref() else {
+        if self.vec0.is_empty() {
             return Ok(());
-        };
-        let width = state.dimensions * 4;
-        let model = state.model.clone();
+        }
         let mut statement = self
             .connection
             .prepare("SELECT id,model,LENGTH(embedding) FROM chunks WHERE file_id=?1")?;
@@ -602,20 +602,20 @@ impl IndexStore {
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         for (id, row_model, length) in doomed {
-            let indexed = row_model == model && length as usize == width;
-            if indexed {
-                crate::vec0::delete(&self.connection, id)?;
-            }
-            let state = self.vec0.as_mut().expect("checked above");
-            state.chunks = state.chunks.saturating_sub(1);
-            if indexed {
-                state.vectors = state.vectors.saturating_sub(1);
+            for index in &mut self.vec0 {
+                let indexed =
+                    row_model == index.state.model && length as usize == index.state.dimensions * 4;
+                if indexed {
+                    crate::vec0::delete(&self.connection, index.slot, id)?;
+                    index.state.vectors = index.state.vectors.saturating_sub(1);
+                }
+                index.state.chunks = index.state.chunks.saturating_sub(1);
             }
         }
         Ok(())
     }
 
-    /// Re-stamp the shadow index' `meta` record from the in-memory counters.
+    /// Re-stamp every shadow index' `meta` record from the in-memory counters.
     ///
     /// Called at the end of every unit of work that moved them, INSIDE that
     /// unit's savepoint/transaction, so the counts a reader validates against
@@ -630,13 +630,15 @@ impl IndexStore {
     fn stamp_vec0(&mut self) -> Result<()> {
         // Checked before the lookup, not after: a corpus with no index must not
         // pay a `meta` query per file for a stamp it will never write.
-        if self.vec0.is_none() {
+        if self.vec0.is_empty() {
             return Ok(());
         }
         let job = crate::vec0::job_stamp(&self.connection);
-        let state = self.vec0.as_mut().expect("checked above");
-        state.job = job;
-        crate::vec0::write_state(&self.connection, state)
+        for index in &mut self.vec0 {
+            index.state.job = job.clone();
+            crate::vec0::write_state(&self.connection, index.slot, &index.state)?;
+        }
+        Ok(())
     }
 
     /// Every database row one file contributes, run inside the caller's
@@ -1679,30 +1681,41 @@ CREATE TABLE chunks(
         );
     }
 
-    /// A corpus with a shadow index over `dimensions`-wide vectors, built from
-    /// whatever `chunks` already holds. Returns the destination.
+    /// A corpus with BOTH shadow indexes over `dimensions`-wide vectors, built
+    /// from whatever `chunks` already holds.
+    ///
+    /// Both, because the writer has to keep whatever it finds in step and the
+    /// interesting failure is maintaining one slot and forgetting the other.
+    /// The tiers differ only in their encoder, which has its own tests; what
+    /// these exercise is that every maintenance site walks the whole set.
     fn indexed_corpus(destination: &Path, dimensions: usize) {
         let mut connection = connect(destination).unwrap();
-        crate::vec0::build(
-            &mut connection,
-            crate::embedding::EMBEDDING_MODEL,
-            dimensions,
-            |_, _| {},
-        )
-        .unwrap();
+        for tier in [crate::vec0::Tier::Float, crate::vec0::Tier::Int8] {
+            crate::vec0::build(
+                &mut connection,
+                tier,
+                crate::embedding::EMBEDDING_MODEL,
+                dimensions,
+                |_, _| {},
+            )
+            .unwrap();
+        }
     }
 
-    /// `(rows in the shadow index, recorded state)` for a corpus on disk.
-    fn shadow(destination: &Path) -> (i64, crate::vec0::IndexState) {
+    /// `(rows in the index, recorded state)` for one slot of a corpus on disk.
+    fn shadow(destination: &Path, slot: crate::vec0::Slot) -> (i64, crate::vec0::IndexState) {
         let connection = connect(destination).unwrap();
         let rows = connection
             .query_row(
-                &format!("SELECT COUNT(*) FROM {}", crate::vec0::SHADOW_TABLE),
+                &format!("SELECT COUNT(*) FROM {}", slot.table()),
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        (rows, crate::vec0::state(&connection).unwrap().unwrap())
+        (
+            rows,
+            crate::vec0::state(&connection, slot).unwrap().unwrap(),
+        )
     }
 
     /// A file carrying `count` chunks whose vectors are 2 floats wide, matching
@@ -1711,6 +1724,116 @@ CREATE TABLE chunks(
         let mut file = sample_file(path);
         file.chunks = (0..count).map(chunk).collect();
         file
+    }
+
+    /// The same, 8 floats wide — the narrowest a `bit` index can pack, and the
+    /// only reason this exists.
+    fn wide_file(path: &str, count: usize) -> ProcessedFile {
+        let mut file = sample_file(path);
+        file.chunks = (0..count)
+            .map(|index| crate::embedding::EmbeddedChunk {
+                index,
+                content: format!("chunk {index}"),
+                vector: (0..8)
+                    .map(|dimension| (index as f32 + 1.0) * 0.1 - dimension as f32 * 0.05)
+                    .collect(),
+            })
+            .collect();
+        file
+    }
+
+    #[test]
+    fn an_index_job_maintains_a_centring_index_through_its_own_quantiser() {
+        // The `bit` tier's writer path. It differs from every other index only
+        // in needing the corpus centre to encode at all, so the failure this
+        // catches is a writer that mirrors rows into it without one — which
+        // would leave the counts moving and the vectors not.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&wide_file("/a/one.txt", 2), 0.0).unwrap();
+        store.finish().unwrap();
+        let mut connection = connect(&destination).unwrap();
+        crate::vec0::build(
+            &mut connection,
+            crate::vec0::Tier::Bit,
+            crate::embedding::EMBEDDING_MODEL,
+            8,
+            |_, _| {},
+        )
+        .unwrap();
+        drop(connection);
+
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store.add(&wide_file("/a/two.txt", 3), 1.0).unwrap();
+        store.finish().unwrap();
+
+        let (rows, state) = shadow(&destination, crate::vec0::Slot::Quantised);
+        assert_eq!(rows, 5, "the job's own chunks were quantised and stored");
+        assert_eq!(state.vectors, 5);
+        assert_eq!(state.chunks, 5);
+        // One byte per vector, which is the tier actually doing its job rather
+        // than the writer having fallen back to something wider.
+        let bytes: i64 = connect(&destination)
+            .unwrap()
+            .query_row(
+                &format!(
+                    "SELECT LENGTH(embedding) FROM {} LIMIT 1",
+                    crate::vec0::Slot::Quantised.table()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, 1);
+        let connection = connect(&destination).unwrap();
+        assert!(matches!(
+            crate::vec0::usable(
+                &connection,
+                crate::vec0::Slot::Quantised,
+                crate::embedding::EMBEDDING_MODEL,
+                8
+            )
+            .unwrap(),
+            crate::vec0::Usable::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn a_job_leaves_a_centring_index_alone_when_its_centre_has_gone() {
+        // Half-maintaining is worse than not maintaining: the chunk count would
+        // climb while the vector count stood still, so an index a reader already
+        // declines would also start lying about itself. The writer skips it.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&wide_file("/a/one.txt", 2), 0.0).unwrap();
+        store.finish().unwrap();
+        let mut connection = connect(&destination).unwrap();
+        crate::vec0::build(
+            &mut connection,
+            crate::vec0::Tier::Bit,
+            crate::embedding::EMBEDDING_MODEL,
+            8,
+            |_, _| {},
+        )
+        .unwrap();
+        connection
+            .execute(
+                "DELETE FROM meta WHERE key=?1",
+                [crate::vec0::Slot::Quantised.centre_key()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store.add(&wide_file("/a/two.txt", 3), 1.0).unwrap();
+        store.finish().unwrap();
+
+        let (rows, state) = shadow(&destination, crate::vec0::Slot::Quantised);
+        assert_eq!(rows, 2, "untouched");
+        assert_eq!(state.vectors, 2, "and its own numbers are untouched too");
+        assert_eq!(state.chunks, 2);
     }
 
     #[test]
@@ -1725,7 +1848,9 @@ CREATE TABLE chunks(
         store.add(&embedded_file("/a/one.txt", 2), 0.0).unwrap();
         store.finish().unwrap();
         indexed_corpus(&destination, 2);
-        assert_eq!(shadow(&destination).0, 2);
+        for slot in crate::vec0::Slot::ALL {
+            assert_eq!(shadow(&destination, slot).0, 2, "{slot:?}");
+        }
 
         // A later job adds a file and re-indexes the first with fewer chunks.
         let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
@@ -1735,16 +1860,20 @@ CREATE TABLE chunks(
         store.add(&shrunk, 1.0).unwrap();
         store.finish().unwrap();
 
-        let (rows, state) = shadow(&destination);
-        assert_eq!(rows, 4, "3 new + 1 replacement, the old 2 removed");
-        assert_eq!(state.vectors, 4);
-        assert_eq!(state.chunks, 4);
-        // The witness a reader checks: recorded chunk count == live chunk count.
         let live: i64 = connect(&destination)
             .unwrap()
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(live as usize, state.chunks);
+        for slot in crate::vec0::Slot::ALL {
+            let (rows, state) = shadow(&destination, slot);
+            assert_eq!(
+                rows, 4,
+                "3 new + 1 replacement, the old 2 removed; {slot:?}"
+            );
+            assert_eq!(state.vectors, 4, "{slot:?}");
+            // The witness a reader checks: recorded == live chunk count.
+            assert_eq!(live as usize, state.chunks, "{slot:?}");
+        }
     }
 
     #[test]
@@ -1773,10 +1902,12 @@ CREATE TABLE chunks(
         store.finish().unwrap();
 
         assert_eq!(pruned, 1);
-        let (rows, state) = shadow(&destination);
-        assert_eq!(rows, 1);
-        assert_eq!(state.vectors, 1);
-        assert_eq!(state.chunks, 1);
+        for slot in crate::vec0::Slot::ALL {
+            let (rows, state) = shadow(&destination, slot);
+            assert_eq!(rows, 1, "{slot:?}");
+            assert_eq!(state.vectors, 1, "{slot:?}");
+            assert_eq!(state.chunks, 1, "{slot:?}");
+        }
     }
 
     #[test]
@@ -1810,15 +1941,21 @@ CREATE TABLE chunks(
         store.add(&embedded_file("/a/later.txt", 1), 1.0).unwrap();
         store.finish().unwrap();
 
-        let (rows, state) = shadow(&destination);
-        assert_eq!(rows, 2, "the failed file left nothing behind");
-        assert_eq!(state.vectors, 2);
-        assert_eq!(state.chunks, 2);
         let connection = connect(&destination).unwrap();
-        assert!(matches!(
-            crate::vec0::usable(&connection, crate::embedding::EMBEDDING_MODEL, 2).unwrap(),
-            crate::vec0::Usable::Ready(_)
-        ));
+        for slot in crate::vec0::Slot::ALL {
+            let (rows, state) = shadow(&destination, slot);
+            assert_eq!(rows, 2, "the failed file left nothing behind; {slot:?}");
+            assert_eq!(state.vectors, 2, "{slot:?}");
+            assert_eq!(state.chunks, 2, "{slot:?}");
+            assert!(
+                matches!(
+                    crate::vec0::usable(&connection, slot, crate::embedding::EMBEDDING_MODEL, 2)
+                        .unwrap(),
+                    crate::vec0::Usable::Ready(_)
+                ),
+                "{slot:?}"
+            );
+        }
     }
 
     #[test]
@@ -1839,12 +1976,24 @@ CREATE TABLE chunks(
         store.finish().unwrap();
 
         let connection = connect(&destination).unwrap();
-        assert!(!crate::vec0::present(&connection).unwrap());
-        assert!(crate::vec0::state(&connection).unwrap().is_none());
-        assert!(matches!(
-            crate::vec0::usable(&connection, crate::embedding::EMBEDDING_MODEL, 2).unwrap(),
-            crate::vec0::Usable::Absent
-        ));
+        for slot in crate::vec0::Slot::ALL {
+            assert!(
+                !crate::vec0::present(&connection, slot).unwrap(),
+                "{slot:?}"
+            );
+            assert!(
+                crate::vec0::state(&connection, slot).unwrap().is_none(),
+                "{slot:?}"
+            );
+            assert!(
+                matches!(
+                    crate::vec0::usable(&connection, slot, crate::embedding::EMBEDDING_MODEL, 2)
+                        .unwrap(),
+                    crate::vec0::Usable::Absent
+                ),
+                "{slot:?}"
+            );
+        }
     }
 
     #[test]
