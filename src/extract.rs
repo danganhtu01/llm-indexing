@@ -624,6 +624,13 @@ fn pdf_exhaustive(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Ex
     })
 }
 
+/// Bound on how much pdftoppm stderr a single OCR-fallback failure logs.
+/// A malformed PDF can make poppler emit stderr without limit (repeated
+/// "Syntax Error" / "Bad block header" lines); capping this is what keeps
+/// that failure mode from flooding engine.log the way the old inherited-stdio
+/// path did.
+const STDERR_LOG_CHARS: usize = 2000;
+
 fn pdf(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
     let pages = pdf_pages(path);
     let text = Command::new("pdftotext")
@@ -648,13 +655,29 @@ fn pdf(path: &Path, config: &Config, ocr: &TesseractOcr) -> Result<Extracted> {
     let prefix = temp.path().join("page");
     let max_page = pages.max(1).min(config.ocr_max_pages);
     let dpi = config.ocr_dpi.to_string();
-    let status = Command::new("pdftoppm")
+    let rendered = Command::new("pdftoppm")
         .args(["-f", "1", "-l", &max_page.to_string(), "-png", "-r", &dpi])
         .arg(path)
         .arg(&prefix)
-        .status();
+        .output();
+    let succeeded = match &rendered {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            tracing::warn!(
+                path = %path.display(),
+                status = %output.status,
+                stderr = %truncate(String::from_utf8_lossy(&output.stderr).trim().to_string(), STDERR_LOG_CHARS),
+                "pdftoppm failed for OCR fallback"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "pdftoppm could not be spawned");
+            false
+        }
+    };
     let mut ocr_parts = Vec::new();
-    if status.map(|s| s.success()).unwrap_or(false) {
+    if succeeded {
         let mut images = fs::read_dir(temp.path())?
             .flatten()
             .map(|e| e.path())
@@ -696,4 +719,27 @@ fn pdf_pages(path: &Path) -> usize {
                 .and_then(|n| n.parse().ok())
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The pdftoppm OCR-fallback path itself needs poppler + tesseract binaries
+    // and can't be exercised as a plain unit test; what's testable in-process
+    // is the bound that keeps a pathological PDF's stderr from flooding
+    // engine.log the way the old inherited-stdio call did.
+    #[test]
+    fn stderr_log_bound_caps_pathological_output() {
+        let flood = "Syntax Error: Couldn't find trailer dictionary\n".repeat(500);
+        assert!(flood.chars().count() > STDERR_LOG_CHARS);
+        let capped = truncate(flood, STDERR_LOG_CHARS);
+        assert_eq!(capped.chars().count(), STDERR_LOG_CHARS);
+    }
+
+    #[test]
+    fn stderr_log_bound_leaves_short_output_untouched() {
+        let short = "Command Line Error: Incorrect password".to_string();
+        assert_eq!(truncate(short.clone(), STDERR_LOG_CHARS), short);
+    }
 }
