@@ -20,7 +20,9 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::config::{clamp_workers, Config, MAX_WORKERS};
-use crate::embedding::{rank_chunks, Embedder, VectorScan, EMBEDDING_MODEL, MAX_HITS};
+use crate::embedding::{
+    rank_chunks, rank_chunks_fast, Embedder, VectorScan, EMBEDDING_MODEL, MAX_HITS,
+};
 use crate::jobs_store::{JobsStore, MAX_PERSISTED_HISTORY, RESERVED_OUTPUT_NAME};
 use crate::pipeline::{run_index, IndexRequest};
 use crate::runtime::RuntimeKnobs;
@@ -1690,10 +1692,21 @@ fn empty_status() -> Value {
 // choice is read off the corpus rather than configured here: this route stays
 // read-only, and nothing it does can create, repair or invalidate an index.
 
-/// Modes `/corpus/search` accepts. Only `semantic` today; the list is what a
-/// rejected request is told, so adding a keyword mode later stays a one-line
-/// change with no new failure shape.
-const SEARCH_MODES: &[&str] = &["semantic"];
+/// Modes `/corpus/search` accepts. The list is what a rejected request is told,
+/// so adding a keyword mode later stays a one-line change with no new failure
+/// shape.
+///
+/// `semantic` is exact and is the default. `semantic_fast` is the opt-in that
+/// exists because exactness has a price: it ranks through the corpus' QUANTISED
+/// shadow index, which reads a fraction of the bytes and returns an
+/// approximation of the same list. Two modes rather than one mode with a
+/// tolerance knob, because approximate and exact are different promises and a
+/// caller has to make that choice deliberately — see
+/// [`crate::embedding::rank_chunks_fast`].
+const SEARCH_MODES: &[&str] = &["semantic", "semantic_fast"];
+
+/// The mode that ranks through the quantised index.
+const FAST_MODE: &str = "semantic_fast";
 
 /// Hits returned when the caller does not ask. Matches the `search` CLI
 /// subcommand rather than `vector-search`'s 10: a search API's default page is
@@ -1752,6 +1765,7 @@ async fn corpus_search(
         )
             .into_response();
     }
+    let fast = mode == FAST_MODE;
     let limit = query
         .limit
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
@@ -1765,6 +1779,7 @@ async fn corpus_search(
         Acquired::Warming { warming_ms } => {
             return Json(search_response(
                 &text,
+                mode,
                 limit,
                 SearchOutcome::Warming { warming_ms },
             ))
@@ -1773,6 +1788,7 @@ async fn corpus_search(
         Acquired::Unavailable { reason } => {
             return Json(search_response(
                 &text,
+                mode,
                 limit,
                 // `acquire` armed a fresh load on the way out; say so, or a
                 // caller has no way to know retrying is worth anything.
@@ -1819,12 +1835,12 @@ async fn corpus_search(
                     });
                 }
             };
-            semantic_scan(&output, &query_vector, limit, started)
+            semantic_scan(&output, &query_vector, limit, fast, started)
         })
         .await
     };
     match scan {
-        Ok(Ok(outcome)) => Json(search_response(&text, limit, outcome)).into_response(),
+        Ok(Ok(outcome)) => Json(search_response(&text, mode, limit, outcome)).into_response(),
         Ok(Err(error)) => read_error(&error),
         Err(error) => unreadable(&format!("search task failed: {error}")),
     }
@@ -1839,6 +1855,7 @@ fn semantic_scan(
     output: &Path,
     query_vector: &[f32],
     limit: usize,
+    fast: bool,
     started: Instant,
 ) -> Result<SearchOutcome, ReadError> {
     let connection = match open_ro(output) {
@@ -1870,7 +1887,11 @@ fn semantic_scan(
             other_models: Vec::new(),
         });
     }
-    let scan = rank_chunks(&connection, EMBEDDING_MODEL, query_vector, limit)?;
+    let scan = if fast {
+        rank_chunks_fast(&connection, EMBEDDING_MODEL, query_vector, limit)?
+    } else {
+        rank_chunks(&connection, EMBEDDING_MODEL, query_vector, limit)?
+    };
     let elapsed_ms = started.elapsed().as_millis() as u64;
     if scan.compared > 0 {
         return Ok(SearchOutcome::Ranked { scan, elapsed_ms });
@@ -1919,9 +1940,9 @@ enum SearchOutcome {
 /// consumer branches on `status` and never has to interpret an empty `hits`.
 /// `hits` mirrors `llm-search`'s `/search/vector` rows (`path`, `name`,
 /// `chunk_index`, `score`, `content`) so the two search surfaces stay one shape.
-fn search_response(query: &str, limit: usize, outcome: SearchOutcome) -> Value {
+fn search_response(query: &str, mode: &str, limit: usize, outcome: SearchOutcome) -> Value {
     let mut body = json!({
-        "mode": "semantic",
+        "mode": mode,
         "query": query,
         "limit": limit,
         "model": EMBEDDING_MODEL,
@@ -1934,12 +1955,20 @@ fn search_response(query: &str, limit: usize, outcome: SearchOutcome) -> Value {
             body["compared_chunks"] = json!(scan.compared);
             body["skipped_chunks"] = json!(scan.skipped);
             body["elapsed_ms"] = json!(elapsed_ms);
-            // Which of the two ranking paths served this. The hits and their
-            // scores are the same either way; the latency is not, by more than
-            // an order of magnitude on a large corpus, so a consumer that sees
-            // a slow answer can tell "this corpus has no shadow index" from
-            // "this corpus has one and it was not used" without guessing.
+            // Which ranking path served this. The exact paths' hits and scores
+            // are the same either way; their latency is not, by more than an
+            // order of magnitude on a large corpus, so a consumer that sees a
+            // slow answer can tell "this corpus has no shadow index" from "this
+            // corpus has one and it was not used" without guessing.
             body["path"] = json!(scan.path.as_str());
+            // And whether that path is the scan's own answer, stated rather
+            // than left to be looked up: `semantic_fast` over a corpus with no
+            // quantised index is answered EXACTLY, and a consumer that has to
+            // label its results has no other way to know which it got.
+            body["exact"] = json!(scan.path.is_exact());
+            if let Some(candidates) = scan.candidates {
+                body["candidates"] = json!(candidates);
+            }
             if let Some(note) = scan.index_note {
                 body["index_note"] = json!(note);
             }
@@ -2460,7 +2489,7 @@ mod tests {
     /// results" has to become a stated reason, and it is reachable without the
     /// embedding model because the query vector is already an argument.
     mod semantic {
-        use super::super::{search_response, semantic_scan, ReadError, SearchOutcome};
+        use super::super::{search_response, semantic_scan, ReadError, SearchOutcome, FAST_MODE};
         use crate::embedding::{vector_to_bytes, EMBEDDING_MODEL};
         use rusqlite::Connection;
         use serde_json::Value;
@@ -2507,7 +2536,17 @@ mod tests {
         }
 
         fn scan(path: &Path) -> SearchOutcome {
-            match semantic_scan(path, &[1.0, 0.0, 0.0], 5, Instant::now()) {
+            rank(path, false)
+        }
+
+        /// `mode=semantic_fast`: the same request, routed at the quantised
+        /// index instead of the exact one.
+        fn fast(path: &Path) -> SearchOutcome {
+            rank(path, true)
+        }
+
+        fn rank(path: &Path, fast: bool) -> SearchOutcome {
+            match semantic_scan(path, &[1.0, 0.0, 0.0], 5, fast, Instant::now()) {
                 Ok(outcome) => outcome,
                 Err(ReadError::Busy) => panic!("a fixture corpus cannot be busy"),
                 Err(ReadError::Unreadable(detail)) => panic!("fixture unreadable: {detail}"),
@@ -2515,7 +2554,11 @@ mod tests {
         }
 
         fn body(outcome: SearchOutcome) -> Value {
-            search_response("beach at sunset", 5, outcome)
+            search_response("beach at sunset", "semantic", 5, outcome)
+        }
+
+        fn fast_body(outcome: SearchOutcome) -> Value {
+            search_response("beach at sunset", FAST_MODE, 5, outcome)
         }
 
         #[test]
@@ -2615,10 +2658,17 @@ mod tests {
             assert!(body.get("index_note").is_none(), "{body}");
         }
 
-        /// The same corpus after `llm-index vector-index`.
-        fn with_shadow_index(path: &Path, dimensions: usize) {
+        /// The same corpus after `llm-index vector-index --tier TIER`.
+        fn with_shadow_index(path: &Path, tier: crate::vec0::Tier, dimensions: usize) {
             let mut connection = Connection::open(path).unwrap();
-            crate::vec0::build(&mut connection, EMBEDDING_MODEL, dimensions, |_, _| {}).unwrap();
+            crate::vec0::build(
+                &mut connection,
+                tier,
+                EMBEDDING_MODEL,
+                dimensions,
+                |_, _| {},
+            )
+            .unwrap();
         }
 
         #[test]
@@ -2635,10 +2685,11 @@ mod tests {
                     ("clip-vit-b32", vec![1.0, 0.0, 0.0]),
                 ]),
             );
-            with_shadow_index(&path, 3);
+            with_shadow_index(&path, crate::vec0::Tier::Float, 3);
             let body = body(scan(&path));
             assert_eq!(body["status"], "ready");
             assert_eq!(body["path"], "vec0");
+            assert_eq!(body["exact"], true);
             assert_eq!(body["compared_chunks"], 2);
             assert_eq!(body["skipped_chunks"], 1);
             let hits = body["hits"].as_array().unwrap();
@@ -2649,6 +2700,63 @@ mod tests {
         }
 
         #[test]
+        fn semantic_fast_ranks_through_the_quantised_index_and_labels_itself() {
+            // The opt-in path as a consumer sees it: same envelope, same score
+            // arithmetic, a `path` naming the quantisation and `exact: false`
+            // so nothing has to infer the promise from the path name.
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(
+                &path,
+                Some(&[
+                    (EMBEDDING_MODEL, vec![0.0, 1.0, 0.0]),
+                    (EMBEDDING_MODEL, vec![1.0, 0.0, 0.0]),
+                    ("clip-vit-b32", vec![1.0, 0.0, 0.0]),
+                ]),
+            );
+            with_shadow_index(&path, crate::vec0::Tier::Int8, 3);
+            let body = fast_body(fast(&path));
+            assert_eq!(body["mode"], FAST_MODE);
+            assert_eq!(body["status"], "ready");
+            assert_eq!(body["path"], "vec0_int8");
+            assert_eq!(body["exact"], false);
+            // The pool is `limit x` the measured oversample, bounded by what
+            // the corpus actually holds: three chunks, two of them this model's.
+            assert_eq!(body["candidates"], 2);
+            let hits = body["hits"].as_array().unwrap();
+            assert_eq!(hits[0]["content"], "chunk 1");
+            // The score is the float cosine, not a quantised distance: the
+            // quantisation chooses the candidates and never the numbers.
+            assert!((hits[0]["score"].as_f64().unwrap() - 1.0).abs() < 0.0001);
+            assert!(body.get("index_note").is_none(), "{body}");
+        }
+
+        #[test]
+        fn semantic_fast_over_a_corpus_without_one_answers_exactly_and_says_so() {
+            // The fallback that matters most: asking for the fast path on a
+            // corpus that has no quantised index returns the EXACT answer, and
+            // labels it exact rather than pretending the request was served.
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(
+                &path,
+                Some(&[
+                    (EMBEDDING_MODEL, vec![0.0, 1.0, 0.0]),
+                    (EMBEDDING_MODEL, vec![1.0, 0.0, 0.0]),
+                ]),
+            );
+            let body = fast_body(fast(&path));
+            assert_eq!(body["status"], "ready");
+            assert_eq!(body["path"], "scan");
+            assert_eq!(body["exact"], true);
+            assert!(
+                body["index_note"].as_str().unwrap().contains("--tier int8"),
+                "{body}"
+            );
+            assert_eq!(body["hits"][0]["content"], "chunk 1");
+        }
+
+        #[test]
         fn a_corpus_whose_index_cannot_be_trusted_says_which_path_served_it() {
             // The capability fallback as a consumer sees it: still `ready`, still
             // the right hits, but `path: scan` with the reason attached — the
@@ -2656,7 +2764,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("corpus.sqlite");
             corpus(&path, Some(&[(EMBEDDING_MODEL, vec![1.0, 0.0, 0.0])]));
-            with_shadow_index(&path, 3);
+            with_shadow_index(&path, crate::vec0::Tier::Float, 3);
             Connection::open(&path)
                 .unwrap()
                 .execute(

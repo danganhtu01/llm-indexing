@@ -1443,7 +1443,9 @@ async fn corpus_search_rejects_an_unknown_mode_and_lists_the_ones_it_takes() {
 
     let (status, body) = get_json_status(&app, "/corpus/search?q=beach&mode=telepathy").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["modes"], json!(["semantic"]));
+    // The list is the contract: a consumer discovers `semantic_fast` from a
+    // rejection rather than from a version number.
+    assert_eq!(body["modes"], json!(["semantic", "semantic_fast"]));
     assert!(
         body["error"].as_str().unwrap().contains("telepathy"),
         "{body}"
