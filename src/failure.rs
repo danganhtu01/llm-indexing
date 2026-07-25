@@ -38,8 +38,12 @@ pub enum FailureClass {
     IoDenied,
     /// The bytes were reachable but not well-formed for their claimed format:
     /// a corrupt/truncated Zip-based container (`.docx`/`.xlsx`/`.pptx`/an
-    /// archive extension), a malformed `.eml`, or WAV data `hound` rejects
-    /// after the ffmpeg extraction step.
+    /// archive extension), a malformed `.eml`, WAV data `hound` rejects after
+    /// the ffmpeg extraction step, or a `.heic`/`.heif` ffmpeg cannot decode
+    /// (see [`HeicDecodeFailed`]) — a genuinely bad-bytes failure, distinct
+    /// from ffmpeg being absent ([`FailureClass::IoNotFound`]) or wedged
+    /// ([`FailureClass::Timeout`]), both of which the same call site reaches
+    /// through ordinary `io::Error` propagation instead of this marker.
     Decode,
     /// `std::io::Error` with kind [`std::io::ErrorKind::TimedOut`]. Nothing in
     /// this build's extraction path currently produces this — every
@@ -131,6 +135,27 @@ impl fmt::Display for EncryptedDocument {
 
 impl std::error::Error for EncryptedDocument {}
 
+/// Marker for a `.heic`/`.heif` file ffmpeg ran on but could not turn into a
+/// still frame — a non-zero exit, or a zero-byte/missing output file despite a
+/// zero exit (both seen from real ffmpeg builds on malformed input).
+///
+/// Built by `extract.rs`'s `heic()` only for THIS shape: ffmpeg was found and
+/// ran to completion but rejected the bytes. A missing ffmpeg binary and a
+/// wedged decode both reach [`classify`] as a plain `std::io::Error` (spawn
+/// `NotFound`, bounded-wait `TimedOut`) and never construct this — see
+/// `heic()`'s doc comment for why those two are left to the ordinary chain
+/// walk instead of a typed marker of their own.
+#[derive(Debug)]
+pub struct HeicDecodeFailed;
+
+impl fmt::Display for HeicDecodeFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ffmpeg could not decode the HEIC/HEIF image")
+    }
+}
+
+impl std::error::Error for HeicDecodeFailed {}
+
 /// Map an `std::io::Error`'s kind to a [`FailureClass`]. Shared by the
 /// top-of-chain check in [`classify`] and by the library error types below
 /// that carry their own `io::Error` (`zip::result::ZipError::Io`,
@@ -167,6 +192,9 @@ pub fn classify(error: &anyhow::Error) -> FailureClass {
         }
         if cause.downcast_ref::<CapabilityUnavailable>().is_some() {
             return FailureClass::Unsupported;
+        }
+        if cause.downcast_ref::<HeicDecodeFailed>().is_some() {
+            return FailureClass::Decode;
         }
         match cause.downcast_ref::<zip::result::ZipError>() {
             Some(zip::result::ZipError::Io(io_error)) => return classify_io(io_error.kind()),
@@ -308,6 +336,16 @@ mod tests {
     fn the_reserved_encrypted_marker_classifies_as_encrypted() {
         let error: anyhow::Error = anyhow::Error::new(EncryptedDocument);
         assert_eq!(classify(&error), FailureClass::Encrypted);
+    }
+
+    /// `extract.rs`'s `heic()` constructs this directly when ffmpeg ran but
+    /// rejected the bytes; this test covers the classification side in
+    /// isolation from the subprocess plumbing, same as the encrypted-document
+    /// test above.
+    #[test]
+    fn a_heic_ffmpeg_could_not_decode_is_decode() {
+        let error: anyhow::Error = anyhow::Error::new(HeicDecodeFailed);
+        assert_eq!(classify(&error), FailureClass::Decode);
     }
 
     #[test]
