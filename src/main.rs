@@ -270,6 +270,15 @@ struct ServeArgs {
     /// `INDEX_VISION_MAX`); requests above it are rejected. Default `off`.
     #[arg(long = "vision-max", value_enum)]
     vision_max: Option<VisionMode>,
+    /// Require this token in an `X-Submit-Token` header on every job-mutating
+    /// route (`POST /index`, `POST /jobs/{id}/cancel`, the `/runtime` POSTs);
+    /// env fallback `LLM_SUBMIT_TOKEN`, the flag winning. Set by the app that
+    /// manages this engine so it alone can create, cancel or retune jobs —
+    /// read-only routes stay open for its monitors and search proxy. Unset
+    /// (the default) leaves every route open, exactly as before the flag
+    /// existed.
+    #[arg(long = "submit-token")]
+    submit_token: Option<String>,
 }
 
 #[derive(Args)]
@@ -624,6 +633,16 @@ fn serve(args: ServeArgs) -> Result<()> {
                 .and_then(|value| value.parse().ok())
         })
         .unwrap_or(VisionMode::Off);
+    // Flag over env, mirroring --vision-max / INDEX_VISION_MAX. An empty env
+    // value reads as unset (a `LLM_SUBMIT_TOKEN=` line in a unit file must not
+    // arm the gate with an empty secret), while an EXPLICITLY empty flag is
+    // rejected by `router` — loudly, because the operator asked for a gate and
+    // an empty one would admit any caller that sends an empty header.
+    let submit_token = args.submit_token.or_else(|| {
+        std::env::var("LLM_SUBMIT_TOKEN")
+            .ok()
+            .filter(|token| !token.is_empty())
+    });
     let config = ServiceConfig {
         output_root: args.output_root,
         allowed_roots,
@@ -634,6 +653,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         max_pending: args.max_pending,
         max_body: args.max_body,
         vision_max,
+        submit_token,
     };
     let address: SocketAddr = args.listen.parse().context("--listen must be HOST:PORT")?;
     let runtime = tokio::runtime::Runtime::new()?;
