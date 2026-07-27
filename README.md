@@ -70,6 +70,19 @@ the service writes only a plain `.sqlite` filename under `/output`. Port 9801 is
 bound to localhost by the standalone Compose file and is internal-only in the
 `ff-lc-app` deployment.
 
+A localhost binding still leaves the job surface open to every process on the
+box. When the engine is managed by an app that must hold absolute control over
+its jobs, start it with `serve --submit-token <secret>` (env fallback
+`LLM_SUBMIT_TOKEN`; the flag wins): every job-mutating route (`POST /index`,
+`POST /jobs/{id}/cancel`, the `/runtime` POSTs) then requires that secret in an
+`X-Submit-Token` header, while the read-only surface (health, settings, job
+GETs, `/corpus/*` including search) stays open for monitors and search proxies.
+The managing app generates the secret, passes it at launch and keeps it to
+itself, making it the only caller that can create, cancel or retune jobs — so
+it never again has to report a directly-submitted job it cannot pause or
+cancel. Without the flag, nothing changes. See
+[`docs/HTTP_API.md`](docs/HTTP_API.md#submit-token--gating-the-job-mutating-routes).
+
 ## Native CLI
 
 ```bash
