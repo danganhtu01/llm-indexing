@@ -7,8 +7,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
+use axum::http::{header, Method, StatusCode};
+use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -56,6 +57,16 @@ pub struct ServiceConfig {
     /// Highest vision tier this server will accept (`serve --vision-max`,
     /// default `off`); requests above it are rejected at submit.
     pub vision_max: VisionMode,
+    /// Shared secret gating the job-mutating routes (`serve --submit-token`,
+    /// env fallback `LLM_SUBMIT_TOKEN`). `None` — the default — leaves every
+    /// route open, exactly as before the flag existed. Set, it makes the app
+    /// that launched this engine the only caller whose job mutations are
+    /// accepted: the owner's directive is that every job routes through the
+    /// web app so the app holds absolute control over the jobs, and an open
+    /// loopback port let anything on the box submit "engine-native" jobs the
+    /// app could neither pause nor cancel. Read-only routes are deliberately
+    /// not gated — see [`require_submit_token`].
+    pub submit_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +157,13 @@ struct AppState {
 pub fn router(config: ServiceConfig) -> Result<Router> {
     fs::create_dir_all(&config.output_root)?;
     let mut normalized = config;
+    // An empty submit token would be a gate any caller passes by sending an
+    // empty header — worse than no gate, because it LOOKS locked while the
+    // job surface stays wide open. The operator asked for owner control, so
+    // refuse to start rather than run with fake protection.
+    if normalized.submit_token.as_deref() == Some("") {
+        anyhow::bail!("--submit-token must not be empty (unset it to serve ungated)")
+    }
     normalized.output_root = normalized.output_root.canonicalize()?;
     normalized.allowed_roots = normalized
         .allowed_roots
@@ -237,7 +255,7 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         embedder: Arc::new(QueryEmbedder::new(normalized.config_path.clone())),
         jobs_store,
     };
-    Ok(Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/settings", get(settings))
         .route("/index", post(submit))
@@ -254,7 +272,21 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         .route("/corpus/search", get(corpus_search))
         .layer(DefaultBodyLimit::max(max_body))
         .layer(TraceLayer::new_for_http())
-        .with_state(state))
+        .with_state(state);
+    // The submit-token gate wraps OUTSIDE every other layer, and only when a
+    // token was configured: an ungated serve carries not just no check but no
+    // extra layer at all, which is what keeps the no-flag path byte-for-byte
+    // today's service.
+    Ok(match normalized.submit_token {
+        None => router,
+        Some(token) => {
+            let token: Arc<str> = token.into();
+            router.layer(from_fn(move |request: Request, next: Next| {
+                let token = token.clone();
+                async move { require_submit_token(&token, request, next).await }
+            }))
+        }
+    })
 }
 
 /// The `root` query-param name for an allowed input root: its directory name
@@ -264,6 +296,80 @@ fn root_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
+
+// ── Submit-token gate (serve --submit-token / LLM_SUBMIT_TOKEN) ─────────────
+
+/// The header a gated job mutation must present. One name, shared verbatim
+/// with the vlm-indexing engine's identical gate, so an app managing both
+/// engines sends the same header to each instead of learning two dialects.
+pub const SUBMIT_TOKEN_HEADER: &str = "X-Submit-Token";
+
+/// Gate every job-mutating route behind the configured submit token.
+///
+/// The owner's directive is that every job routes through the web app, so the
+/// app holds absolute control over the jobs. Without this gate anything on the
+/// box could POST straight to the engine's loopback port, and the app would
+/// then honestly report an "engine-native job" it can neither pause nor
+/// cancel — the hole the token closes. The app sets the token when it launches
+/// the engine and keeps it to itself, becoming the only caller whose
+/// mutations the engine accepts.
+///
+/// The gate keys on the METHOD, not on a route list: in this service every
+/// mutation is a POST (`/index`, `/jobs/{id}/cancel`, `/runtime`,
+/// `/jobs/{id}/runtime`) and every GET is read-only by construction, so a
+/// job-mutating route added later is covered by default (fail closed) instead
+/// of depending on someone remembering to enrol it. Read-only routes stay
+/// open on purpose — the app's search proxy, monitor panels and read tools
+/// keep working tokenless, which is what makes the token an app-held WRITE
+/// credential rather than a service password.
+///
+/// A rejection happens before any handler runs, so it has no side effects: no
+/// job row, no cancellation flag, no persisted envelope. The body names the
+/// header so a refused integrator learns what to send, not just that they
+/// were refused.
+async fn require_submit_token(token: &str, request: Request, next: Next) -> Response {
+    if request.method() != Method::POST {
+        return next.run(request).await;
+    }
+    let authorized = request
+        .headers()
+        .get(SUBMIT_TOKEN_HEADER)
+        .is_some_and(|value| constant_time_eq(value.as_bytes(), token.as_bytes()));
+    if authorized {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "status": "error",
+            "error": format!(
+                "missing or invalid {SUBMIT_TOKEN_HEADER} header; \
+                 job-mutating routes on this server require the submit token"
+            ),
+            "header": SUBMIT_TOKEN_HEADER,
+        })),
+    )
+        .into_response()
+}
+
+/// Constant-time byte comparison for the submit token.
+///
+/// A plain `==` over byte slices bails at the first mismatching byte, and on a
+/// quiet loopback that timing difference is measurable enough to recover a
+/// secret one byte at a time. The `subtle` crate is the stock answer but is
+/// not already in the dependency tree, and one fold does not justify a new
+/// supply-chain edge: OR the XOR of every byte pair and test the accumulator
+/// once, so the work done depends on the lengths alone. The length check
+/// itself may short-circuit — it reveals only the token's length, which an
+/// attacker cannot iterate on the way per-byte timing can be iterated on.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |acc, (l, r)| acc | (l ^ r))
+            == 0
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
@@ -2145,7 +2251,10 @@ fn now() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_settings, read_only, requested_paths, root_name, valid_output_name, Corpus};
+    use super::{
+        build_settings, constant_time_eq, read_only, requested_paths, root_name, valid_output_name,
+        Corpus,
+    };
     use crate::config::{Config, MAX_WORKERS};
     use crate::settings::{
         OcrSettings, VisionSettings, OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE,
@@ -2431,6 +2540,20 @@ mod tests {
         assert_eq!(defaults["tag_top_k"], vision.tag_top_k.unwrap());
         assert_eq!(defaults["max_frames"], vision.max_frames.unwrap());
         assert_eq!(defaults["timeout_secs"], vision.timeout_secs.unwrap());
+    }
+
+    /// The submit-token fold must agree with `==` on every outcome — its whole
+    /// point is to change the TIMING of the answer, never the answer.
+    #[test]
+    fn submit_token_comparison_matches_equality() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        // Same length, one byte off — the case the fold (rather than an
+        // early-exit compare) exists for.
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"Xecret", b"secret"));
+        // Different lengths differ by length alone, which is not secret.
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+        assert!(!constant_time_eq(b"", b"secret"));
     }
 
     #[test]

@@ -1,6 +1,47 @@
 # HTTP API
 The container listens on TCP 9801. All API requests and responses are JSON.
 
+## Submit token — gating the job-mutating routes
+
+By default every route below is open to anything that can reach the port. That
+is the right default for a standalone container, and the wrong one for an
+app-managed engine: the managing app is supposed to hold absolute control over
+the job surface, and an engine whose loopback port accepts direct
+`POST /index` calls leaves that app honestly reporting an "engine-native job"
+it can neither pause nor cancel.
+
+`serve --submit-token <secret>` (env fallback `LLM_SUBMIT_TOKEN`; the flag
+wins, and an explicitly empty value is refused at startup) closes that hole.
+When set, every **job-mutating** route requires the same secret in an
+`X-Submit-Token` header:
+
+- `POST /index`
+- `POST /jobs/{id}/cancel`
+- `POST /runtime` and `POST /jobs/{id}/runtime`
+
+A missing or wrong token answers `401` before the handler runs, so a refusal
+has no side effects — no job row, no cancellation flag, no persisted envelope:
+
+```json
+{"status": "error", "error": "missing or invalid X-Submit-Token header; job-mutating routes on this server require the submit token", "header": "X-Submit-Token"}
+```
+
+Every read-only route — `GET /health`, `GET /settings`, the job and runtime
+GETs, and the whole `/corpus/*` read surface including `/corpus/search` —
+stays open, so an app's search proxy, monitor panels and read tools work
+without the token. That split is what makes the token an app-held **write
+credential** rather than a service password. The gate keys on the request
+method: every mutation this service exposes is a POST and every GET is
+read-only by construction, so a job-mutating route added later is gated by
+default instead of depending on someone remembering to enrol it.
+
+The comparison is constant-time, and without the flag the gate is not even
+installed — an ungated `serve` behaves exactly as it always has.
+
+The flag and header names are shared verbatim with the vlm-indexing engine's
+identical gate (whose env fallback is `VLM_SUBMIT_TOKEN`), so an app managing
+both engines configures and calls them uniformly.
+
 ## `GET /health`
 
 Returns service version/readiness and whether a job is queued or running.
@@ -91,7 +132,9 @@ apart.
 
 ## `POST /index`
 
-Queues one job and returns `202 Accepted` with an `id`.
+Queues one job and returns `202 Accepted` with an `id`. On a server started
+with `--submit-token` this route requires the `X-Submit-Token` header — see
+[Submit token](#submit-token--gating-the-job-mutating-routes).
 
 ```json
 {
@@ -252,13 +295,17 @@ before the next extraction/embedding boundary and commits the files it had
 already finished, which stay in the published corpus. Poll the job until its
 state becomes `cancelled`; that result carries the `output` name and reports the
 partial corpus as retained. Resubmit with `"resume": true` to continue from it.
-A job cancelled before it started leaves the output untouched.
+A job cancelled before it started leaves the output untouched. Gated by the
+[submit token](#submit-token--gating-the-job-mutating-routes) when one is
+configured, like every job-mutating route.
 
 ## Runtime stage tuning
 
 Concurrency knobs that can be changed **while a job is running**. Values are
 integers; out-of-range values are **clamped, not rejected**, and the response
-always reports what actually landed.
+always reports what actually landed. Both POSTs here mutate how jobs run, so
+they sit behind the [submit token](#submit-token--gating-the-job-mutating-routes)
+when one is configured; the GETs stay open.
 
 ### `GET /runtime`
 
