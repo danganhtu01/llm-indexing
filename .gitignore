@@ -28,3 +28,9 @@ logs/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Agent worktrees / scratch (never commit; symlinks are machine-specific)
+.claude/
+# `target/` above does not match a SYMLINK named `target` (see the 2026-07-26
+# snapshot commit that force-added one pointing at the old Hetzner volume).
+target
