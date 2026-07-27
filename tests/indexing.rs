@@ -58,6 +58,7 @@ fn indexes_and_searches_english_and_vietnamese() {
         resume: false,
         overwrite: false,
         artifacts: true,
+        retry_errors: false,
         include_paths: None,
         cancellation: None,
         runtime: None,
@@ -155,6 +156,7 @@ fn index(
         resume,
         overwrite: false,
         artifacts: false,
+        retry_errors: false,
         include_paths,
         cancellation,
         runtime: None,
@@ -437,6 +439,7 @@ fn pooled_embedding_is_invariant_to_the_embed_pool_size() {
             resume: false,
             overwrite: false,
             artifacts: false,
+            retry_errors: false,
             include_paths: None,
             cancellation: None,
             runtime: Some(runtime),
@@ -826,6 +829,234 @@ fn a_model_change_that_keeps_an_old_row_leaves_the_upgrade_gate_open() {
         current,
         "once every file is migrated the marker finally advances to the current model"
     );
+}
+
+/// The corpus's own record of how a path has fared: `(method, attempts)`.
+fn only_file_attempts(destination: &Path) -> (String, i64) {
+    connect(destination)
+        .unwrap()
+        .query_row("SELECT method, attempts FROM files", [], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap()
+}
+
+/// The whole workstream, end to end: a file that cannot be read is attempted
+/// three times across three resumes and then stops costing anything, and the
+/// escape hatches still work. A corrupt `.docx` is used because it fails
+/// deterministically with no external tool involved.
+#[test]
+fn an_unreadable_file_is_attempted_three_times_and_then_left_alone() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let destination = temp.path().join("corpus.sqlite");
+    let doc = input.join("broken.docx");
+    fs::write(&doc, b"this was never a zip").unwrap();
+
+    // The first run plus two resumes: each one pays the file's full cost and
+    // records the failure.
+    for expected in 1..=3 {
+        let stats = index(&input, &destination, expected > 1, None, None, None).unwrap();
+        assert_eq!(stats.errors, 1, "attempt {expected} must run and fail");
+        assert_eq!(
+            stats.capped, 0,
+            "nothing is capped before the budget is out"
+        );
+        let (method, attempts) = only_file_attempts(&destination);
+        assert!(method.starts_with("error:"), "{method}");
+        assert_eq!(attempts, i64::from(expected), "attempt {expected} recorded");
+    }
+
+    // The fourth resume is the point of the workstream: the file is not read,
+    // not OCR'd, not embedded. Before the cap this repeated forever, once per
+    // resume, for ~181k of the live corpus's 263k rows.
+    let converged = index(&input, &destination, true, None, None, None).unwrap();
+    assert_eq!(converged.files, 0, "a capped file is not processed at all");
+    assert_eq!(converged.errors, 0);
+    assert_eq!(
+        converged.capped, 1,
+        "and it is reported as capped, not done"
+    );
+    assert_eq!(only_file_attempts(&destination).1, 3, "no further attempts");
+
+    // Escape hatch one: the file changes. New bytes get a full budget, so the
+    // repaired document is read even though the path had burned every attempt.
+    write_docx(&doc, "Suspicious activity report for the compliance team.");
+    let repaired = index(&input, &destination, true, None, None, None).unwrap();
+    assert_eq!(repaired.files, 1, "changed bytes are always reprocessed");
+    assert_eq!(repaired.errors, 0);
+    let (method, attempts) = only_file_attempts(&destination);
+    assert_eq!(method, "docx");
+    assert_eq!(attempts, 0, "a finished row carries no failed attempts");
+}
+
+/// Escape hatch two: `retry_errors`. The operator has fixed the reason the rows
+/// failed — a drive that was not mounted, a dependency that was not installed —
+/// and asks for the capped rows back. OFF by default, which is what the test
+/// above depends on.
+#[test]
+fn retry_errors_reopens_a_capped_row() {
+    let _serialized = model_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let destination = temp.path().join("corpus.sqlite");
+    fs::write(input.join("broken.docx"), b"this was never a zip").unwrap();
+
+    for resume in [false, true, true, true] {
+        run_index(IndexRequest {
+            paths: std::slice::from_ref(&input),
+            out: &destination,
+            config: durability_config(),
+            resume,
+            overwrite: false,
+            artifacts: false,
+            retry_errors: false,
+            include_paths: None,
+            cancellation: None,
+            runtime: None,
+            progress: None,
+        })
+        .unwrap();
+    }
+    assert_eq!(only_file_attempts(&destination).1, 3, "budget spent");
+
+    let retried = run_index(IndexRequest {
+        paths: std::slice::from_ref(&input),
+        out: &destination,
+        config: durability_config(),
+        resume: true,
+        overwrite: false,
+        artifacts: false,
+        retry_errors: true,
+        include_paths: None,
+        cancellation: None,
+        runtime: None,
+        progress: None,
+    })
+    .unwrap();
+    assert_eq!(retried.files, 1, "retry_errors reopens the capped row");
+    assert_eq!(retried.capped, 0);
+    assert_eq!(
+        only_file_attempts(&destination).1,
+        4,
+        "the extra attempt is counted like any other"
+    );
+}
+
+/// B2: the encrypted-PDF fast path. `pdfinfo` must actually be on `PATH` for
+/// any of this to exercise real detection instead of the harmless "binary
+/// missing" fallback `parse_pdf_info` also has to handle — see
+/// `pdf_info_classification::empty_output_from_a_missing_pdfinfo_binary_is_not_password_required`
+/// in `extract.rs` for that case covered in isolation. Skips cleanly (like
+/// the vision live tests) rather than failing on a box without poppler
+/// installed.
+mod encrypted_pdf_fast_path {
+    use super::*;
+
+    fn pdfinfo_available() -> bool {
+        std::process::Command::new("pdfinfo")
+            .arg("-v")
+            .output()
+            .is_ok()
+    }
+
+    /// Three fixtures, all built from the SAME one-page PDF with the text
+    /// "Owner password only test": `pdf-plain.pdf` unencrypted,
+    /// `pdf-owner-password-only.pdf` re-saved with `user_password=""` (opens
+    /// under poppler's default password, permissions fully denied),
+    /// `pdf-user-password-required.pdf` re-saved with a real user password.
+    /// Verified against Calibre's bundled poppler 25.11.0 while writing this
+    /// test: `pdftotext` reads the first two and fails identically to
+    /// `pdfinfo` on the third with "Command Line Error: Incorrect password".
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn an_encrypted_pdf_becomes_an_honest_error_row_and_counts_separately() {
+        if !pdfinfo_available() {
+            eprintln!("skipping encrypted-PDF live test: pdfinfo not on PATH");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        fs::copy(
+            fixture("pdf-user-password-required.pdf"),
+            input.join("locked.pdf"),
+        )
+        .unwrap();
+
+        let stats = index(&input, &destination, false, None, None, None).unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(stats.errors, 1, "a password-required PDF is an error row");
+        assert_eq!(
+            stats.encrypted, 1,
+            "the operator-visible encrypted counter, separate from stats.errors"
+        );
+        let (method, _) = only_file_row(&destination);
+        assert_eq!(
+            method, "error:encrypted",
+            "honest error:encrypted, not a silent empty pdf-text-partial"
+        );
+    }
+
+    /// The must-not-block case: an owner-password-only PDF, with EVERY
+    /// permission bit denied in the fixture, still has its text pulled by
+    /// `pdftotext` under poppler's default empty user password. B2 must not
+    /// mistake `Encrypted: yes` for a reason to bail.
+    #[test]
+    fn an_owner_password_only_pdf_still_extracts() {
+        if !pdfinfo_available() {
+            eprintln!("skipping encrypted-PDF live test: pdfinfo not on PATH");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        fs::copy(
+            fixture("pdf-owner-password-only.pdf"),
+            input.join("restricted.pdf"),
+        )
+        .unwrap();
+
+        let stats = index(&input, &destination, false, None, None, None).unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(
+            stats.errors, 0,
+            "owner-password-only must not be treated as blocking"
+        );
+        assert_eq!(stats.encrypted, 0);
+        let (method, _) = only_file_row(&destination);
+        assert!(!method.starts_with("error:"), "must extract, got {method}");
+    }
+
+    /// Control: an ordinary unencrypted PDF is unaffected by the fast path.
+    #[test]
+    fn a_normal_pdf_is_unaffected() {
+        if !pdfinfo_available() {
+            eprintln!("skipping encrypted-PDF live test: pdfinfo not on PATH");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        fs::copy(fixture("pdf-plain.pdf"), input.join("plain.pdf")).unwrap();
+
+        let stats = index(&input, &destination, false, None, None, None).unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(stats.errors, 0);
+        assert_eq!(stats.encrypted, 0);
+        let (method, _) = only_file_row(&destination);
+        assert_eq!(method, "pdf-text");
+    }
 }
 
 /// The other half of P0-8, and the one a live deployment actually depends on:

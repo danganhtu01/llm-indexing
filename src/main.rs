@@ -25,11 +25,20 @@ struct Cli {
     command: Command,
 }
 
+// `IndexArgs` is the widest variant by a long way — it carries every `index`
+// flag, and the three faces knobs pushed the spread past clippy's threshold.
+// Boxing it, the lint's own suggestion, is not available: `clap`'s `Subcommand`
+// derive requires the variant to hold a type implementing `Args`, which
+// `Box<IndexArgs>` does not. The enum is built exactly once, on the stack, from
+// `Cli::parse()` in `main`, so the size it warns about is a few hundred bytes
+// that exist for the length of one move.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     Index(IndexArgs),
     Search(SearchArgs),
     VectorSearch(VectorSearchArgs),
+    VectorIndex(VectorIndexArgs),
     TopFolder(TopFolderArgs),
     Analyze(AnalyzeArgs),
     Serve(ServeArgs),
@@ -79,6 +88,10 @@ struct IndexArgs {
     vision: Option<VisionMode>,
     #[arg(long)]
     resume: bool,
+    /// With `--resume`, also re-attempt rows that have already failed the maximum
+    /// number of times. OFF by default; see `IndexRequest::retry_errors`.
+    #[arg(long, requires = "resume")]
+    retry_errors: bool,
     // Per-job OCR quality overrides (feed the SAME settings merge as the HTTP
     // `ocr_opts`); language selection stays on the legacy `--ocr-langs` above.
     #[arg(long)]
@@ -102,6 +115,15 @@ struct IndexArgs {
     vision_tag_top_k: Option<usize>,
     #[arg(long)]
     vision_captioner: Option<String>,
+    /// Face detection + embedding: `off` (default) or `yunet-sface`. Opt-in and
+    /// privacy-sensitive; the pair also has to be staged by
+    /// `fetch-data --faces`, and is simply absent (not an error) if it is not.
+    #[arg(long)]
+    vision_faces: Option<String>,
+    #[arg(long)]
+    vision_face_score: Option<f32>,
+    #[arg(long)]
+    vision_max_faces: Option<usize>,
     #[arg(long)]
     vision_max_frames: Option<usize>,
     #[arg(long)]
@@ -130,6 +152,77 @@ struct VectorSearchArgs {
     limit: usize,
     #[arg(long)]
     config: Option<PathBuf>,
+}
+
+/// `vector-index` — build, rebuild, inspect or drop a corpus' OPTIONAL `vec0`
+/// shadow indexes.
+///
+/// An index is a derived copy of `chunks.embedding` that makes
+/// `/corpus/search` a k-NN lookup instead of a full scan. It is built from the
+/// BLOBs a corpus already holds: an existing corpus gains one without
+/// re-embedding a single document, and dropping it loses nothing.
+///
+/// A corpus can carry two at once, and `--tier` picks which one this invocation
+/// touches. The `float` tier serves the default `mode=semantic` and returns
+/// exactly what the scan returns; the `int8` and `bit` tiers serve
+/// `mode=semantic_fast` only, and return an approximation whose measured
+/// recall is in `docs/ARCHITECTURE.md`.
+///
+/// Nothing here is implicit. A corpus has no index until this is run against it,
+/// and an index that exists is maintained by later index jobs. Rebuilding is the
+/// repair for one that a build without that maintenance has written behind.
+#[derive(Args)]
+struct VectorIndexArgs {
+    #[arg(long, default_value = "index_out/index.sqlite")]
+    index: PathBuf,
+    /// Which representation to store the copy in.
+    ///
+    /// `float` is exact: its candidates re-score into the same top-k the scan
+    /// produces, which is why it is the only tier the default query path will
+    /// read. `int8` and `bit` are QUANTISED — smaller and faster, and they
+    /// change which rows come back, so they are reachable only from
+    /// `mode=semantic_fast`. A corpus holds at most one quantised index:
+    /// building `bit` over an `int8` corpus replaces it.
+    #[arg(long, value_enum, default_value_t = TierArg::Float)]
+    tier: TierArg,
+    /// Replace an existing index of this tier's slot. Without it, an
+    /// already-indexed corpus is reported and left alone — a rebuild reads
+    /// every vector in the corpus and is not something to trigger by re-running
+    /// a command.
+    #[arg(long)]
+    rebuild: bool,
+    /// Remove this tier's index and its `meta` record, leaving the corpus
+    /// exactly as it was before it had one. Semantic search falls back to the
+    /// remaining path.
+    #[arg(long, conflicts_with = "rebuild")]
+    drop: bool,
+    /// Report what the corpus holds, in both slots, and change nothing.
+    #[arg(long, conflicts_with_all = ["rebuild", "drop"])]
+    status: bool,
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+/// `--tier` as clap sees it.
+///
+/// A separate enum from [`llm_indexing::vec0::Tier`] so the library stays free
+/// of the CLI parser, which is the same separation `--ocr` and the other mode
+/// flags already keep.
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum TierArg {
+    Float,
+    Int8,
+    Bit,
+}
+
+impl From<TierArg> for llm_indexing::vec0::Tier {
+    fn from(tier: TierArg) -> Self {
+        match tier {
+            TierArg::Float => Self::Float,
+            TierArg::Int8 => Self::Int8,
+            TierArg::Bit => Self::Bit,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -177,6 +270,15 @@ struct ServeArgs {
     /// `INDEX_VISION_MAX`); requests above it are rejected. Default `off`.
     #[arg(long = "vision-max", value_enum)]
     vision_max: Option<VisionMode>,
+    /// Require this token in an `X-Submit-Token` header on every job-mutating
+    /// route (`POST /index`, `POST /jobs/{id}/cancel`, the `/runtime` POSTs);
+    /// env fallback `LLM_SUBMIT_TOKEN`, the flag winning. Set by the app that
+    /// manages this engine so it alone can create, cancel or retune jobs —
+    /// read-only routes stay open for its monitors and search proxy. Unset
+    /// (the default) leaves every route open, exactly as before the flag
+    /// existed.
+    #[arg(long = "submit-token")]
+    submit_token: Option<String>,
 }
 
 #[derive(Args)]
@@ -204,6 +306,10 @@ struct RequestArgs {
     resume: bool,
     #[arg(long)]
     overwrite: bool,
+    /// Re-attempt rows that have already failed the maximum number of times.
+    /// OFF by default; see `IndexRequest::retry_errors`.
+    #[arg(long)]
+    retry_errors: bool,
 }
 
 #[derive(Args)]
@@ -220,6 +326,17 @@ struct FetchDataArgs {
     /// SHA-256 verification instead of dictionaries/OCR data.
     #[arg(long, conflicts_with_all = ["dictionaries_only", "ocr_only"])]
     vision: bool,
+    /// Also fetch the OPT-IN face pair (YuNet detector + SFace embedder), with
+    /// the same pinned SHA-256 verification.
+    ///
+    /// Separate from `--vision` on purpose. Face embeddings are biometric
+    /// identifiers for people who never opted in, so putting the models on a box
+    /// is its own deliberate act rather than a side effect of staging the vision
+    /// stack — and a box that never runs this command reports the faces
+    /// capability as absent, which is the honest answer. Usable with or without
+    /// `--vision`.
+    #[arg(long, conflicts_with_all = ["dictionaries_only", "ocr_only"])]
+    faces: bool,
 }
 
 #[derive(Args)]
@@ -233,6 +350,7 @@ fn main() -> Result<()> {
         Command::Index(args) => index(args),
         Command::Search(args) => search_command(args),
         Command::VectorSearch(args) => vector_search_command(args),
+        Command::VectorIndex(args) => vector_index_command(args),
         Command::TopFolder(args) => top_folder_command(args),
         Command::Analyze(args) => analyze_command(args),
         Command::Serve(args) => serve(args),
@@ -246,6 +364,93 @@ fn vector_search_command(args: VectorSearchArgs) -> Result<()> {
     let config = Config::load(args.config.as_deref())?;
     let hits = vector_search(&args.index, &config, &args.query, args.limit)?;
     println!("{}", serde_json::to_string_pretty(&hits)?);
+    Ok(())
+}
+
+/// Build / rebuild / drop / report one tier of a corpus' `vec0` shadow indexes.
+///
+/// Opens the corpus read-WRITE and is the only surface in this crate that
+/// does so outside an index job — which is why it is a CLI subcommand rather
+/// than a route: everything under `/corpus/*` is a read-only surface by
+/// construction, and a rebuild over 2.68 M vectors runs for minutes, so
+/// bolting it on there would mean either a write on the read surface or a
+/// second job machinery for one command.
+///
+/// The build never writes `chunks`, so it is safe against the corpus in the
+/// sense that matters: an interrupted one leaves the corpus exactly as it was
+/// plus a table no query will use.
+///
+/// Every report describes BOTH slots, whichever one the invocation touched: the
+/// question an operator is actually asking is what this corpus can serve, and
+/// that is the pair.
+fn vector_index_command(args: VectorIndexArgs) -> Result<()> {
+    let config = Config::load(args.config.as_deref())?;
+    let tier: llm_indexing::vec0::Tier = args.tier.into();
+    let slot = tier.slot();
+    let mut connection = connect(&args.index)?;
+    let describe = |connection: &_| -> Result<()> {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "exact": llm_indexing::vec0::describe(connection, llm_indexing::vec0::Slot::Exact)?,
+                "quantised":
+                    llm_indexing::vec0::describe(connection, llm_indexing::vec0::Slot::Quantised)?,
+            }))?
+        );
+        Ok(())
+    };
+    if args.status {
+        return describe(&connection);
+    }
+    if args.drop {
+        llm_indexing::vec0::drop_index(&connection, slot)?;
+        return describe(&connection);
+    }
+    if llm_indexing::vec0::present(&connection, slot)? && !args.rebuild {
+        eprintln!(
+            "this corpus already has a {} shadow index; pass --rebuild to replace it",
+            slot.table()
+        );
+        return describe(&connection);
+    }
+    // 384 for `multilingual-e5-small` — read out of the corpus, not out of a
+    // model: the index mirrors what is stored, and learning the number this way
+    // keeps a rebuild from loading 448 MB of ONNX weights it has no use for.
+    let Some(dimensions) =
+        llm_indexing::vec0::corpus_dimensions(&connection, &config.embedding_model)?
+    else {
+        anyhow::bail!(
+            "this corpus holds no {} vectors; there is nothing to index",
+            config.embedding_model
+        )
+    };
+    let started = std::time::Instant::now();
+    let report = llm_indexing::vec0::build(
+        &mut connection,
+        tier,
+        &config.embedding_model,
+        dimensions,
+        |written, total| {
+            eprintln!(
+                "  {written}/{total} vectors indexed ({:.0}s)",
+                started.elapsed().as_secs_f64()
+            );
+        },
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "tier": tier.as_str(),
+            "vectors": report.vectors,
+            "skipped": report.skipped,
+            // What this index cost the corpus, which is the question an
+            // operator is really asking and which the file size cannot answer
+            // for a REBUILD (it reuses the pages the dropped index freed).
+            "vector_bytes": report.vectors * tier.bytes_per_vector(dimensions),
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "state": report.state,
+        }))?
+    );
     Ok(())
 }
 
@@ -300,6 +505,9 @@ fn index(args: IndexArgs) -> Result<()> {
         tag_threshold: args.vision_tag_threshold,
         tag_top_k: args.vision_tag_top_k,
         captioner: args.vision_captioner.clone(),
+        faces: args.vision_faces.clone(),
+        face_score: args.vision_face_score,
+        max_faces: args.vision_max_faces,
         max_frames: args.vision_max_frames,
         timeout_secs: args.vision_timeout_secs,
     };
@@ -325,6 +533,7 @@ fn index(args: IndexArgs) -> Result<()> {
         resume: args.resume,
         overwrite: false,
         artifacts: true,
+        retry_errors: args.retry_errors,
         include_paths: None,
         cancellation: None,
         runtime: None,
@@ -424,6 +633,16 @@ fn serve(args: ServeArgs) -> Result<()> {
                 .and_then(|value| value.parse().ok())
         })
         .unwrap_or(VisionMode::Off);
+    // Flag over env, mirroring --vision-max / INDEX_VISION_MAX. An empty env
+    // value reads as unset (a `LLM_SUBMIT_TOKEN=` line in a unit file must not
+    // arm the gate with an empty secret), while an EXPLICITLY empty flag is
+    // rejected by `router` — loudly, because the operator asked for a gate and
+    // an empty one would admit any caller that sends an empty header.
+    let submit_token = args.submit_token.or_else(|| {
+        std::env::var("LLM_SUBMIT_TOKEN")
+            .ok()
+            .filter(|token| !token.is_empty())
+    });
     let config = ServiceConfig {
         output_root: args.output_root,
         allowed_roots,
@@ -434,6 +653,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         max_pending: args.max_pending,
         max_body: args.max_body,
         vision_max,
+        submit_token,
     };
     let address: SocketAddr = args.listen.parse().context("--listen must be HOST:PORT")?;
     let runtime = tokio::runtime::Runtime::new()?;
@@ -471,6 +691,7 @@ fn request(args: RequestArgs) -> Result<()> {
         workers: args.workers,
         resume: args.resume,
         overwrite: args.overwrite,
+        retry_errors: args.retry_errors,
         include_paths: None,
         vision: Some(args.vision.as_str().to_string()),
         ocr_opts: None,
@@ -509,7 +730,7 @@ fn request(args: RequestArgs) -> Result<()> {
 }
 
 fn fetch_data(args: FetchDataArgs) -> Result<()> {
-    if args.vision {
+    if args.vision || args.faces {
         return fetch_vision_models(&args);
     }
     const RAW: &str = "https://raw.githubusercontent.com";
@@ -590,6 +811,18 @@ fn fetch_vision_models(args: &FetchDataArgs) -> Result<()> {
     let directory = args.data_dir.join("vision");
     let client = reqwest::blocking::Client::new();
     for model in VISION_MODELS {
+        // Two independent opt-ins over ONE registry: `--vision` stages the
+        // artifacts the tiers require, `--faces` stages the optional face pair.
+        // Neither implies the other, so a deployment that wants tags never
+        // acquires biometric models it did not ask for.
+        let wanted = if model.optional {
+            args.faces
+        } else {
+            args.vision
+        };
+        if !wanted {
+            continue;
+        }
         let destination = directory.join(model.relative);
         // Re-verify an already-present pinned file rather than trusting mere
         // existence. The atomic write below means an interrupted download never
@@ -647,10 +880,14 @@ fn fetch_vision_models(args: &FetchDataArgs) -> Result<()> {
     // CLIP is served from fastembed's own cache (there is no single pinned file),
     // so stage it here — the ONLY sanctioned network fetch of CLIP (VISION-SPEC
     // §1) — so index-time tags jobs load it locally and the submit pre-flight can
-    // require it instead of fastembed silently downloading it mid-job.
-    println!("staging CLIP encoders under {} …", directory.display());
-    llm_indexing::vision::prefetch_clip(&directory)?;
-    println!("CLIP encoders staged under {}", directory.display());
+    // require it instead of fastembed silently downloading it mid-job. Skipped
+    // for a faces-only fetch: ~350 MB of tag encoders is not what
+    // `fetch-data --faces` was asked for.
+    if args.vision {
+        println!("staging CLIP encoders under {} …", directory.display());
+        llm_indexing::vision::prefetch_clip(&directory)?;
+        println!("CLIP encoders staged under {}", directory.display());
+    }
     Ok(())
 }
 

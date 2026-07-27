@@ -27,6 +27,25 @@ ocr_langs: "vie+eng"
 # Dictionaries are fetched with: llm-index fetch-data --data-dir data
 data_dir: data
 
+# Vision. Off everywhere by default; the full knob table is in docs/VISION.md.
+# Only the keys a faces deployment needs are shown here — every other vision
+# key keeps its documented default when omitted, like the rest of this file.
+#
+# faces is the one sub-model that defaults to OFF rather than to its model id.
+# It writes 128-d face embeddings — biometric identifiers for people who never
+# opted in — into the corpus's own `faces` table, so it is opt-in twice: this
+# key AND staging the models with `llm-index fetch-data --faces` (a plain
+# `fetch-data --vision` does not download them). Everything stays on this
+# machine: no network at index time, and face data never reaches the searchable
+# text, sidecars, manifests or job summaries. If the models are not staged the
+# capability is simply absent and jobs run without it — never an error.
+# vision:
+#   max: off                 # off | meta | tags | captions (faces needs tags+)
+#   models_dir: vision       # resolved under data_dir when relative
+#   faces: "off"             # off | yunet-sface
+#   face_score: 0.9          # 0.05..=0.99 — minimum detection score kept
+#   max_faces: 20            # 1..=200 — faces kept per file
+
 # Local media transcription and semantic embeddings. The container image bakes
 # these artifacts in; native installs must fetch/place them before indexing.
 whisper_model: models/ggml-small.bin

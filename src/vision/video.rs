@@ -57,6 +57,7 @@ pub(super) fn analyze(
     models_dir: &Path,
     cfg: &VisionConfig,
     mode: VisionMode,
+    faces_ready: bool,
 ) -> VisionResult {
     let started = Instant::now();
     let mut result = VisionResult::default();
@@ -103,6 +104,7 @@ pub(super) fn analyze(
     let analyzer = super::VisionAnalyzer {
         cfg: cfg.clone(),
         models_dir: models_dir.to_path_buf(),
+        faces_ready,
     };
     let frame_target = mode.min(VisionMode::Tags);
     let per_frame: Vec<VisionResult> = frames
@@ -110,7 +112,7 @@ pub(super) fn analyze(
         .map(|frame| analyzer.analyze_image(frame, frame_target))
         .collect();
 
-    aggregate_into(&mut result, &per_frame, cfg.tag_top_k);
+    aggregate_into(&mut result, &per_frame, cfg.tag_top_k, cfg.max_faces);
     result.frames = Some(per_frame.len());
     // Record the full requested `mode` only when every frame reached the
     // per-frame target tier; if a frame fell short (e.g. tag models missing, so
@@ -137,8 +139,13 @@ pub(super) fn analyze(
 
 /// Fold per-frame image results into the aggregate video result: representative
 /// dimensions, union of objects (summed counts), union of tags (best score),
-/// and a mean-pooled CLIP embedding.
-fn aggregate_into(result: &mut VisionResult, frames: &[VisionResult], tag_top_k: usize) {
+/// a mean-pooled CLIP embedding, and the concatenated per-keyframe faces.
+fn aggregate_into(
+    result: &mut VisionResult,
+    frames: &[VisionResult],
+    tag_top_k: usize,
+    max_faces: usize,
+) {
     if let Some(first) = frames.iter().find(|frame| frame.width.is_some()) {
         result.width = first.width;
         result.height = first.height;
@@ -150,6 +157,40 @@ fn aggregate_into(result: &mut VisionResult, frames: &[VisionResult], tag_top_k:
         result.embedding_model = Some(model);
         result.dimensions = Some(dimensions);
     }
+    aggregate_faces(result, frames, max_faces);
+}
+
+/// Concatenate the faces found in each keyframe, stamping the keyframe ordinal
+/// so a box means something: it is in THAT frame's pixel space, not the video's.
+///
+/// Deliberately a concatenation, not a de-duplication — one person walking
+/// through five keyframes yields five faces here. Deciding that those five are
+/// one person is cross-file/cross-frame identity work, which is the app's job
+/// (plan §6 F2); the engine's job is per-file facts. `max_faces` bounds the
+/// whole file rather than each frame, so a crowd scene cannot multiply by
+/// `max_frames`.
+///
+/// `faces_model` is carried up from the frames so the video row records that it
+/// WAS scanned even when no keyframe held a face — the same
+/// scanned-versus-never-scanned distinction stills rely on.
+fn aggregate_faces(result: &mut VisionResult, frames: &[VisionResult], max_faces: usize) {
+    result.faces_model = frames.iter().find_map(|frame| frame.faces_model.clone());
+    if result.faces_model.is_none() {
+        return;
+    }
+    let mut faces = Vec::new();
+    for (ordinal, frame) in frames.iter().enumerate() {
+        for face in &frame.faces {
+            if faces.len() >= max_faces {
+                result.faces = faces;
+                return;
+            }
+            let mut face = face.clone();
+            face.frame = Some(ordinal as u32);
+            faces.push(face);
+        }
+    }
+    result.faces = faces;
 }
 
 /// Union object detections across frames: sum counts per label, keep the peak
@@ -647,6 +688,74 @@ mod tests {
         assert!(mean_pool(&[VisionResult::default()]).is_none());
     }
 
+    fn face(x: i32) -> crate::vision::types::FaceDetection {
+        crate::vision::types::FaceDetection {
+            x,
+            y: 0,
+            width: 40,
+            height: 40,
+            quality: 0.95,
+            embedding: Some(vec![0.5; 4]),
+            frame: None,
+        }
+    }
+
+    fn scanned(faces: Vec<crate::vision::types::FaceDetection>) -> VisionResult {
+        VisionResult {
+            faces,
+            faces_model: Some("yunet-sface".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn aggregate_faces_stamps_the_keyframe_each_face_came_from() {
+        let frames = vec![
+            scanned(vec![face(10)]),
+            scanned(vec![]),
+            scanned(vec![face(20), face(30)]),
+        ];
+        let mut result = VisionResult::default();
+        aggregate_faces(&mut result, &frames, 20);
+        assert_eq!(result.faces_model.as_deref(), Some("yunet-sface"));
+        assert_eq!(
+            result
+                .faces
+                .iter()
+                .map(|face| (face.x, face.frame))
+                .collect::<Vec<_>>(),
+            vec![(10, Some(0)), (20, Some(2)), (30, Some(2))]
+        );
+    }
+
+    #[test]
+    fn aggregate_faces_caps_the_whole_file_not_each_frame() {
+        let frames = vec![
+            scanned(vec![face(1), face(2)]),
+            scanned(vec![face(3), face(4)]),
+        ];
+        let mut result = VisionResult::default();
+        aggregate_faces(&mut result, &frames, 3);
+        assert_eq!(result.faces.len(), 3);
+        assert_eq!(result.faces[2].frame, Some(1));
+    }
+
+    #[test]
+    fn aggregate_faces_records_a_scan_that_found_nothing_but_not_an_unscanned_video() {
+        // Every keyframe scanned, none held a face: the video is marked scanned
+        // so a resume leaves it alone.
+        let mut scanned_result = VisionResult::default();
+        aggregate_faces(&mut scanned_result, &[scanned(vec![]), scanned(vec![])], 20);
+        assert_eq!(scanned_result.faces_model.as_deref(), Some("yunet-sface"));
+        assert!(scanned_result.faces.is_empty());
+
+        // Faces off (or unstaged): no stamp, so the video stays eligible.
+        let mut unscanned = VisionResult::default();
+        aggregate_faces(&mut unscanned, &[VisionResult::default()], 20);
+        assert_eq!(unscanned.faces_model, None);
+        assert!(unscanned.faces.is_empty());
+    }
+
     // --- end-to-end (gated: needs ffmpeg to synthesize + extract) ---------
 
     fn ffmpeg_available() -> bool {
@@ -694,7 +803,7 @@ mod tests {
 
         let cfg = VisionConfig::default();
         let models = dir.path(); // unused at the meta tier
-        let result = analyze(&clip, models, &cfg, VisionMode::Meta);
+        let result = analyze(&clip, models, &cfg, VisionMode::Meta, false);
 
         assert_eq!(result.error, None, "meta-tier video should not error");
         assert_eq!(result.mode, VisionMode::Meta);

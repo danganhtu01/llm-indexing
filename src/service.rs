@@ -2,13 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
+use axum::http::{header, Method, StatusCode};
+use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -20,17 +21,20 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::config::{clamp_workers, Config, MAX_WORKERS};
+use crate::embedding::{
+    rank_chunks, rank_chunks_fast, Embedder, VectorScan, EMBEDDING_MODEL, MAX_HITS,
+};
 use crate::jobs_store::{JobsStore, MAX_PERSISTED_HISTORY, RESERVED_OUTPUT_NAME};
 use crate::pipeline::{run_index, IndexRequest};
 use crate::runtime::RuntimeKnobs;
 use crate::settings::{
     installed_tessdata_langs, tessdata_sources, OcrSettings, VisionSettings, CAPTIONERS, DETECTORS,
-    OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE, TAGGERS,
+    FACE_MODELS, OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE, TAGGERS,
 };
 use crate::store::{grouped, journal_path, BUSY_TIMEOUT, READ_BUSY_TIMEOUT};
 use crate::vision::{
-    available_tiers, captioner_present, corrupt_models, detector_present, missing_vision_prereqs,
-    tagger_present, VisionMode,
+    available_tiers, captioner_present, corrupt_face_models, corrupt_models, detector_present,
+    faces_present, missing_vision_prereqs, tagger_present, VisionMode,
 };
 use crate::VERSION;
 
@@ -53,6 +57,16 @@ pub struct ServiceConfig {
     /// Highest vision tier this server will accept (`serve --vision-max`,
     /// default `off`); requests above it are rejected at submit.
     pub vision_max: VisionMode,
+    /// Shared secret gating the job-mutating routes (`serve --submit-token`,
+    /// env fallback `LLM_SUBMIT_TOKEN`). `None` — the default — leaves every
+    /// route open, exactly as before the flag existed. Set, it makes the app
+    /// that launched this engine the only caller whose job mutations are
+    /// accepted: the owner's directive is that every job routes through the
+    /// web app so the app holds absolute control over the jobs, and an open
+    /// loopback port let anything on the box submit "engine-native" jobs the
+    /// app could neither pause nor cancel. Read-only routes are deliberately
+    /// not gated — see [`require_submit_token`].
+    pub submit_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +87,14 @@ pub struct JobRequest {
     pub resume: bool,
     #[serde(default)]
     pub overwrite: bool,
+    /// Re-attempt rows that have already burned `MAX_ATTEMPTS` without
+    /// finishing. Default FALSE, and left that way except when the reason those
+    /// rows failed has been fixed outside the engine: a resume with this set
+    /// re-runs extraction, OCR and embedding over every file that has failed
+    /// everything so far — ~69% of the rows on the live corpus. It changes which
+    /// rows are attempted, never how one is processed.
+    #[serde(default)]
+    pub retry_errors: bool,
     #[serde(default)]
     pub include_paths: Option<Vec<String>>,
     /// Requested vision tier (`off`|`meta`|`tags`|`captions`); `None` means
@@ -122,6 +144,9 @@ struct AppState {
     /// Default worker count this serve process runs jobs with; advertised by
     /// `GET /settings` as `workers.default`.
     workers: usize,
+    /// Lazily loaded query-side embedding model, shared by every
+    /// `/corpus/search?mode=semantic` request.
+    embedder: Arc<QueryEmbedder>,
     /// Persisted job envelopes (P0-11) — `jobs.sqlite` under `output_root`.
     /// Written to on every status transition worth reconciling on; read by
     /// `GET /jobs/{id}` once a job has aged out of (or never existed in, after
@@ -132,6 +157,13 @@ struct AppState {
 pub fn router(config: ServiceConfig) -> Result<Router> {
     fs::create_dir_all(&config.output_root)?;
     let mut normalized = config;
+    // An empty submit token would be a gate any caller passes by sending an
+    // empty header — worse than no gate, because it LOOKS locked while the
+    // job surface stays wide open. The operator asked for owner control, so
+    // refuse to start rather than run with fake protection.
+    if normalized.submit_token.as_deref() == Some("") {
+        anyhow::bail!("--submit-token must not be empty (unset it to serve ungated)")
+    }
     normalized.output_root = normalized.output_root.canonicalize()?;
     normalized.allowed_roots = normalized
         .allowed_roots
@@ -220,9 +252,10 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         vision_max: normalized.vision_max,
         config_path: normalized.config_path.clone(),
         workers: normalized.workers,
+        embedder: Arc::new(QueryEmbedder::new(normalized.config_path.clone())),
         jobs_store,
     };
-    Ok(Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/settings", get(settings))
         .route("/index", post(submit))
@@ -236,9 +269,24 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         .route("/corpus/tree", get(corpus_tree))
         .route("/corpus/documents/{id}/text", get(corpus_document_text))
         .route("/corpus/status", get(corpus_status_handler))
+        .route("/corpus/search", get(corpus_search))
         .layer(DefaultBodyLimit::max(max_body))
         .layer(TraceLayer::new_for_http())
-        .with_state(state))
+        .with_state(state);
+    // The submit-token gate wraps OUTSIDE every other layer, and only when a
+    // token was configured: an ungated serve carries not just no check but no
+    // extra layer at all, which is what keeps the no-flag path byte-for-byte
+    // today's service.
+    Ok(match normalized.submit_token {
+        None => router,
+        Some(token) => {
+            let token: Arc<str> = token.into();
+            router.layer(from_fn(move |request: Request, next: Next| {
+                let token = token.clone();
+                async move { require_submit_token(&token, request, next).await }
+            }))
+        }
+    })
 }
 
 /// The `root` query-param name for an allowed input root: its directory name
@@ -248,6 +296,80 @@ fn root_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
+
+// ── Submit-token gate (serve --submit-token / LLM_SUBMIT_TOKEN) ─────────────
+
+/// The header a gated job mutation must present. One name, shared verbatim
+/// with the vlm-indexing engine's identical gate, so an app managing both
+/// engines sends the same header to each instead of learning two dialects.
+pub const SUBMIT_TOKEN_HEADER: &str = "X-Submit-Token";
+
+/// Gate every job-mutating route behind the configured submit token.
+///
+/// The owner's directive is that every job routes through the web app, so the
+/// app holds absolute control over the jobs. Without this gate anything on the
+/// box could POST straight to the engine's loopback port, and the app would
+/// then honestly report an "engine-native job" it can neither pause nor
+/// cancel — the hole the token closes. The app sets the token when it launches
+/// the engine and keeps it to itself, becoming the only caller whose
+/// mutations the engine accepts.
+///
+/// The gate keys on the METHOD, not on a route list: in this service every
+/// mutation is a POST (`/index`, `/jobs/{id}/cancel`, `/runtime`,
+/// `/jobs/{id}/runtime`) and every GET is read-only by construction, so a
+/// job-mutating route added later is covered by default (fail closed) instead
+/// of depending on someone remembering to enrol it. Read-only routes stay
+/// open on purpose — the app's search proxy, monitor panels and read tools
+/// keep working tokenless, which is what makes the token an app-held WRITE
+/// credential rather than a service password.
+///
+/// A rejection happens before any handler runs, so it has no side effects: no
+/// job row, no cancellation flag, no persisted envelope. The body names the
+/// header so a refused integrator learns what to send, not just that they
+/// were refused.
+async fn require_submit_token(token: &str, request: Request, next: Next) -> Response {
+    if request.method() != Method::POST {
+        return next.run(request).await;
+    }
+    let authorized = request
+        .headers()
+        .get(SUBMIT_TOKEN_HEADER)
+        .is_some_and(|value| constant_time_eq(value.as_bytes(), token.as_bytes()));
+    if authorized {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "status": "error",
+            "error": format!(
+                "missing or invalid {SUBMIT_TOKEN_HEADER} header; \
+                 job-mutating routes on this server require the submit token"
+            ),
+            "header": SUBMIT_TOKEN_HEADER,
+        })),
+    )
+        .into_response()
+}
+
+/// Constant-time byte comparison for the submit token.
+///
+/// A plain `==` over byte slices bails at the first mismatching byte, and on a
+/// quiet loopback that timing difference is measurable enough to recover a
+/// secret one byte at a time. The `subtle` crate is the stock answer but is
+/// not already in the dependency tree, and one fold does not justify a new
+/// supply-chain edge: OR the XOR of every byte pair and test the accumulator
+/// once, so the work done depends on the lengths alone. The length check
+/// itself may short-circuit — it reveals only the token's length, which an
+/// attacker cannot iterate on the way per-byte timing can be iterated on.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |acc, (l, r)| acc | (l ^ r))
+            == 0
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
@@ -339,10 +461,19 @@ fn build_settings(
             "detectors": sub_models(DETECTORS, detector_present(&models_dir)),
             "taggers": sub_models(TAGGERS, tagger_present(&models_dir)),
             "captioners": sub_models(CAPTIONERS, captioner_present(&models_dir)),
+            // Faces is enumerated exactly like the other sub-models, and for the
+            // same reason: an app must be able to tell "this box cannot do
+            // faces" from "this box will not", without guessing. `present` is
+            // false on every box that has not deliberately staged the pair, and
+            // the default below is `off` on every box.
+            "faces": sub_models(FACE_MODELS, faces_present(&models_dir)),
             "defaults": {
                 "detector_conf": config.vision.detector_conf,
                 "tag_threshold": config.vision.tag_score,
                 "tag_top_k": config.vision.tag_top_k,
+                "faces": config.vision.faces,
+                "face_score": config.vision.face_score,
+                "max_faces": config.vision.max_faces,
                 "max_frames": config.vision.max_frames,
                 "timeout_secs": config.vision.timeout_secs,
             },
@@ -1054,6 +1185,19 @@ fn run_job(
             )
         }
     }
+    // Faces gets the integrity half of that gate but NOT the presence half. An
+    // absent pair means the capability is absent and the job runs without it;
+    // a pair that is present but does not match its pinned hash is bytes nobody
+    // vouched for computing claims about people's identities, so the job stops.
+    if config.vision.max != VisionMode::Off && config.vision.faces_enabled() {
+        let corrupt = corrupt_face_models(&config.vision_models_dir());
+        if !corrupt.is_empty() {
+            anyhow::bail!(
+                "face model integrity check failed (corrupt/truncated/tampered); \
+                 re-run llm-index fetch-data --faces --force: {corrupt:?}"
+            )
+        }
+    }
     let progress_id = id.to_owned();
     let stats = run_index(IndexRequest {
         paths: &paths,
@@ -1062,6 +1206,7 @@ fn run_job(
         resume: request.resume,
         overwrite,
         artifacts: false,
+        retry_errors: request.retry_errors,
         include_paths,
         cancellation: Some(cancellation),
         runtime: Some(runtime),
@@ -1075,8 +1220,8 @@ fn run_job(
     })?;
     Ok(json!({
         "id":id,"status":"complete","output":request.output,"database":destination,"files":stats.files,
-        "ocr_files":stats.ocr_files,"errors":stats.errors,"skipped":stats.skipped,
-        "incomplete":stats.incomplete,"embedded_chunks":stats.embedded_chunks,"removed":stats.removed,
+        "ocr_files":stats.ocr_files,"errors":stats.errors,"encrypted":stats.encrypted,"skipped":stats.skipped,
+        "capped":stats.capped,"incomplete":stats.incomplete,"embedded_chunks":stats.embedded_chunks,"removed":stats.removed,
         "vision_files":stats.vision_files,"vision":config.vision.max.as_str(),
         "elapsed_seconds":stats.elapsed_seconds,"ocr_langs":config.ocr_langs,"completed_at":now()
     }))
@@ -1233,6 +1378,11 @@ fn is_busy(error: &rusqlite::Error) -> bool {
 /// `/corpus/status` during a long index wants a prompt "busy, retry" far more
 /// than it wants to block for the writer's whole commit window.
 fn read_only(path: &Path) -> Result<Connection, rusqlite::Error> {
+    // Before the open, or a corpus carrying a `vec0` shadow index would be
+    // served by the scan forever: the module reaches a connection through
+    // SQLite's auto-extension list, consulted once as the connection is
+    // created. See [`crate::vec0::register`].
+    crate::vec0::register();
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.busy_timeout(READ_BUSY_TIMEOUT)?;
     connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
@@ -1627,6 +1777,446 @@ fn empty_status() -> Value {
     })
 }
 
+// ── Semantic search (GET /corpus/search) ────────────────────────────────────
+//
+// The `chunks` embeddings every index job has been writing since the corpus
+// format's first release had exactly one reader — the `vector-search` CLI
+// subcommand — so on the live corpora 4.1 GB of paid-for vectors were reachable
+// only by shelling into the container. This route is that reader, over the same
+// read-only corpus surface as `/corpus/tree` and friends.
+//
+// `POST /search/fts` and `POST /search/vector` were deliberately moved out of
+// this service to `llm-search` (see docs/HTTP_API.md); this is not a walk-back
+// of that. `llm-search` holds every chunk vector RESIDENT to serve a
+// search-as-you-type socket — 2.68 M x 384 floats plus their text is a
+// multi-gigabyte process, which is why the hub app does not run one. What is
+// added back here is the streaming, nothing-resident half: one ranking pass per
+// request, `O(limit)` memory, and no second service to deploy.
+//
+// That pass is a k-NN lookup when the corpus carries a `vec0` shadow index and
+// an exhaustive scan when it does not (`crate::vec0`, `crate::embedding`). The
+// choice is read off the corpus rather than configured here: this route stays
+// read-only, and nothing it does can create, repair or invalidate an index.
+
+/// Modes `/corpus/search` accepts. The list is what a rejected request is told,
+/// so adding a keyword mode later stays a one-line change with no new failure
+/// shape.
+///
+/// `semantic` is exact and is the default. `semantic_fast` is the opt-in that
+/// exists because exactness has a price: it ranks through the corpus' QUANTISED
+/// shadow index, which reads a fraction of the bytes and returns an
+/// approximation of the same list. Two modes rather than one mode with a
+/// tolerance knob, because approximate and exact are different promises and a
+/// caller has to make that choice deliberately — see
+/// [`crate::embedding::rank_chunks_fast`].
+const SEARCH_MODES: &[&str] = &["semantic", "semantic_fast"];
+
+/// The mode that ranks through the quantised index.
+const FAST_MODE: &str = "semantic_fast";
+
+/// Hits returned when the caller does not ask. Matches the `search` CLI
+/// subcommand rather than `vector-search`'s 10: a search API's default page is
+/// what a UI renders, and 20 is that.
+const DEFAULT_SEARCH_LIMIT: usize = 20;
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    /// Optional in the type ONLY so a missing query answers the service's own
+    /// JSON `400` instead of axum's plain-text rejection.
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    output: Option<String>,
+}
+
+/// GET /corpus/search?q=TEXT[&mode=semantic][&limit=20][&output=corpus.sqlite]
+///
+/// Embeds `q` with the same model the corpus rows were embedded with and ranks
+/// `chunks` by cosine similarity. Everything expensive — loading the model,
+/// embedding the query, scanning the corpus — happens on a blocking worker.
+///
+/// The response always carries `status`, and an empty `hits` is never left
+/// ambiguous: a corpus indexed without embeddings, a corpus embedded by another
+/// model, and a model that has not finished loading are three different
+/// `status`/`reason` pairs, not three empty lists. Only a corpus that exists and
+/// cannot be read is an error (`503`, shared with the rest of this surface).
+///
+/// It also carries `path`, because the ranking runs over a `vec0` shadow index
+/// when the corpus has a usable one and over an exhaustive scan when it does
+/// not. The two return the same hits; they do not take the same time, so which
+/// one ran is a fact the caller is owed rather than one to infer from a
+/// stopwatch.
+async fn corpus_search(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Response {
+    let mode = query.mode.as_deref().unwrap_or("semantic");
+    if !SEARCH_MODES.contains(&mode) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("unsupported search mode {mode:?}"),
+                        "modes": SEARCH_MODES})),
+        )
+            .into_response();
+    }
+    let text = query.q.as_deref().unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"q is required and must not be blank"})),
+        )
+            .into_response();
+    }
+    let fast = mode == FAST_MODE;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .clamp(1, MAX_HITS);
+    let output = match resolve_output(&state, query.output.as_deref()) {
+        Ok(path) => path,
+        Err(response) => return response.into_response(),
+    };
+    let embedder = match state.embedder.acquire().await {
+        Acquired::Ready(embedder) => embedder,
+        Acquired::Warming { warming_ms } => {
+            return Json(search_response(
+                &text,
+                mode,
+                limit,
+                SearchOutcome::Warming { warming_ms },
+            ))
+            .into_response()
+        }
+        Acquired::Unavailable { reason } => {
+            return Json(search_response(
+                &text,
+                mode,
+                limit,
+                // `acquire` armed a fresh load on the way out; say so, or a
+                // caller has no way to know retrying is worth anything.
+                SearchOutcome::Unavailable {
+                    reason,
+                    retrying: true,
+                },
+            ))
+            .into_response();
+        }
+    };
+    let scan = {
+        let text = text.clone();
+        tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            // Embed under the lock, then drop it before the scan: the scan is
+            // the long half, and holding the single embedder across it would
+            // serialize every concurrent search on the wrong resource.
+            //
+            // A panic inside `embed_query` (never observed, but the ONNX call
+            // is not something this code controls) would otherwise poison the
+            // mutex and brick every later search behind an opaque 503 with no
+            // way back short of a restart — unlike a failed *load*, which
+            // explicitly re-arms. `embed_query` only reads the model to
+            // produce a `Result`, so the guarded data is not left structurally
+            // broken by a panic while holding it; recovering the guard keeps
+            // this failure mode self-healing like the rest of this surface.
+            let query_vector = {
+                let mut guard = embedder
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.embed_query(&text)
+            };
+            let query_vector = match query_vector {
+                Ok(vector) => vector,
+                // A model that loaded but cannot embed is a service fault, not
+                // an empty result.
+                Err(error) => {
+                    return Ok(SearchOutcome::Unavailable {
+                        reason: format!("embedding the query failed: {error:#}"),
+                        // The model is loaded and stays loaded: this query
+                        // failed, not the embedder, so nothing is being retried.
+                        retrying: false,
+                    });
+                }
+            };
+            semantic_scan(&output, &query_vector, limit, fast, started)
+        })
+        .await
+    };
+    match scan {
+        Ok(Ok(outcome)) => Json(search_response(&text, mode, limit, outcome)).into_response(),
+        Ok(Err(error)) => read_error(&error),
+        Err(error) => unreadable(&format!("search task failed: {error}")),
+    }
+}
+
+/// Rank one corpus against an already-embedded query.
+///
+/// `started` is passed in so the reported `elapsed_ms` covers the whole
+/// server-side cost the caller waited on — embedding included — rather than
+/// just the scan.
+fn semantic_scan(
+    output: &Path,
+    query_vector: &[f32],
+    limit: usize,
+    fast: bool,
+    started: Instant,
+) -> Result<SearchOutcome, ReadError> {
+    let connection = match open_ro(output) {
+        Corpus::Absent => {
+            let name = output.file_name().unwrap_or_default().to_string_lossy();
+            return Ok(SearchOutcome::NoEmbeddings {
+                reason: format!("no corpus database at {name} yet"),
+                other_models: Vec::new(),
+            });
+        }
+        Corpus::Ready(connection) => connection,
+        Corpus::Busy => return Err(ReadError::Busy),
+        Corpus::Unreadable(error) => return Err(ReadError::Unreadable(error)),
+    };
+    // A corpus written before the chunks table existed has no embeddings and no
+    // table to scan; that is a shape of "nothing to search", not a failed query.
+    let embedded: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if embedded.is_none() {
+        return Ok(SearchOutcome::NoEmbeddings {
+            reason: "this corpus has no chunks table; it was written by a build without \
+                     embeddings"
+                .into(),
+            other_models: Vec::new(),
+        });
+    }
+    let scan = if fast {
+        rank_chunks_fast(&connection, EMBEDDING_MODEL, query_vector, limit)?
+    } else {
+        rank_chunks(&connection, EMBEDDING_MODEL, query_vector, limit)?
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if scan.compared > 0 {
+        return Ok(SearchOutcome::Ranked { scan, elapsed_ms });
+    }
+    // Nothing comparable. Which of the two reasons it is matters: one says
+    // "turn embedding on and reindex", the other says "this corpus is on a
+    // different model and reindexing it would migrate, not fix".
+    let reason = if scan.skipped > 0 {
+        format!(
+            "every one of the {} embeddings in this corpus was written by another model; \
+             queries here are embedded with {EMBEDDING_MODEL}, and cosine across two \
+             embedding spaces is meaningless",
+            scan.skipped
+        )
+    } else {
+        "this corpus holds no embeddings: no indexed file has been embedded yet".into()
+    };
+    Ok(SearchOutcome::NoEmbeddings {
+        reason,
+        other_models: scan.other_models,
+    })
+}
+
+/// What one semantic request resolved to. Every variant is a `200`: the only
+/// `/corpus/search` failures are a malformed request (`400`) and a corpus that
+/// exists but cannot be read (`503`, via [`read_error`]).
+enum SearchOutcome {
+    /// A scan ran over comparable vectors. `hits` may still be short of `limit`
+    /// — or empty, if the corpus holds fewer chunks than that.
+    Ranked { scan: VectorScan, elapsed_ms: u64 },
+    /// There was nothing to rank, and this is why.
+    NoEmbeddings {
+        reason: String,
+        other_models: Vec<String>,
+    },
+    /// The query embedder is loading. Reported rather than waited on.
+    Warming { warming_ms: u64 },
+    /// The query embedder could not be loaded, or could not embed. `retrying`
+    /// says whether a fresh load is already in flight.
+    Unavailable { reason: String, retrying: bool },
+}
+
+/// The `/corpus/search` envelope.
+///
+/// `mode`, `status`, `limit` and `hits` are present in every response so a
+/// consumer branches on `status` and never has to interpret an empty `hits`.
+/// `hits` mirrors `llm-search`'s `/search/vector` rows (`path`, `name`,
+/// `chunk_index`, `score`, `content`) so the two search surfaces stay one shape.
+fn search_response(query: &str, mode: &str, limit: usize, outcome: SearchOutcome) -> Value {
+    let mut body = json!({
+        "mode": mode,
+        "query": query,
+        "limit": limit,
+        "model": EMBEDDING_MODEL,
+        "hits": Vec::<Value>::new(),
+    });
+    match outcome {
+        SearchOutcome::Ranked { scan, elapsed_ms } => {
+            body["status"] = json!("ready");
+            body["hits"] = json!(scan.hits);
+            body["compared_chunks"] = json!(scan.compared);
+            body["skipped_chunks"] = json!(scan.skipped);
+            body["elapsed_ms"] = json!(elapsed_ms);
+            // Which ranking path served this. The exact paths' hits and scores
+            // are the same either way; their latency is not, by more than an
+            // order of magnitude on a large corpus, so a consumer that sees a
+            // slow answer can tell "this corpus has no shadow index" from "this
+            // corpus has one and it was not used" without guessing.
+            body["path"] = json!(scan.path.as_str());
+            // And whether that path is the scan's own answer, stated rather
+            // than left to be looked up: `semantic_fast` over a corpus with no
+            // quantised index is answered EXACTLY, and a consumer that has to
+            // label its results has no other way to know which it got.
+            body["exact"] = json!(scan.path.is_exact());
+            if let Some(candidates) = scan.candidates {
+                body["candidates"] = json!(candidates);
+            }
+            if let Some(note) = scan.index_note {
+                body["index_note"] = json!(note);
+            }
+        }
+        SearchOutcome::NoEmbeddings {
+            reason,
+            other_models,
+        } => {
+            body["status"] = json!("no_embeddings");
+            body["reason"] = json!(reason);
+            if !other_models.is_empty() {
+                body["other_models"] = json!(other_models);
+            }
+        }
+        SearchOutcome::Warming { warming_ms } => {
+            body["status"] = json!("warming");
+            body["reason"] = json!(
+                "the query embedding model is loading (first semantic search in this \
+                 process); retry shortly"
+            );
+            body["warming_ms"] = json!(warming_ms);
+        }
+        SearchOutcome::Unavailable { reason, retrying } => {
+            body["status"] = json!("unavailable");
+            body["reason"] = json!(reason);
+            body["retrying"] = json!(retrying);
+        }
+    }
+    body
+}
+
+/// The query half of semantic search: the embedding model, loaded once, lazily,
+/// on the first `mode=semantic` request.
+///
+/// An index job builds its own embedder; a serve process that has only ever
+/// answered reads has none, and building one is not free — it opens an ONNX
+/// session and reads the model out of the fastembed cache (measured on the
+/// workhorse: see docs/HTTP_API.md). Paying that inside the request would make
+/// the first search sit there with nothing to tell the caller apart from a slow
+/// scan, so the first request ARMS the load and answers `status: "warming"` at
+/// once. The load runs on a blocking worker; a later request finds it ready.
+///
+/// This embedder only ever embeds QUERIES. It shares the model and the code
+/// path with indexing but writes nothing, so no corpus row and no job outcome
+/// depends on whether serve happens to have one loaded.
+struct QueryEmbedder {
+    config_path: Option<PathBuf>,
+    state: RwLock<EmbedderState>,
+}
+
+#[derive(Clone)]
+enum EmbedderState {
+    /// Never asked for. The first request moves this to `Loading`.
+    Cold,
+    Loading {
+        since: Instant,
+    },
+    Ready(Arc<Mutex<Embedder>>),
+    /// The last load failed. Kept — a caller is owed the reason — but not
+    /// terminal: the next request re-arms, so a transient failure (a cache not
+    /// yet populated, a disk hiccup) does not disable search until restart.
+    Failed(String),
+}
+
+/// What a caller gets when it asks for the embedder. Never blocks on a load.
+enum Acquired {
+    Ready(Arc<Mutex<Embedder>>),
+    Warming {
+        warming_ms: u64,
+    },
+    /// The previous load failed. Returning it also ARMS a fresh attempt, so the
+    /// reason is history rather than a standing verdict.
+    Unavailable {
+        reason: String,
+    },
+}
+
+impl QueryEmbedder {
+    fn new(config_path: Option<PathBuf>) -> Self {
+        Self {
+            config_path,
+            state: RwLock::new(EmbedderState::Cold),
+        }
+    }
+
+    async fn acquire(self: &Arc<Self>) -> Acquired {
+        // Fast path: a loaded embedder must not queue behind a write lock.
+        if let EmbedderState::Ready(embedder) = &*self.state.read().await {
+            return Acquired::Ready(embedder.clone());
+        }
+        let mut state = self.state.write().await;
+        match state.clone() {
+            EmbedderState::Ready(embedder) => Acquired::Ready(embedder),
+            EmbedderState::Loading { since } => Acquired::Warming {
+                warming_ms: since.elapsed().as_millis() as u64,
+            },
+            // `Loading` is claimed under the write lock, which is what keeps a
+            // burst of first requests to exactly one load attempt.
+            previous @ (EmbedderState::Cold | EmbedderState::Failed(_)) => {
+                *state = EmbedderState::Loading {
+                    since: Instant::now(),
+                };
+                drop(state);
+                self.clone().spawn_load();
+                match previous {
+                    EmbedderState::Failed(reason) => Acquired::Unavailable { reason },
+                    _ => Acquired::Warming { warming_ms: 0 },
+                }
+            }
+        }
+    }
+
+    fn spawn_load(self: Arc<Self>) {
+        let config_path = self.config_path.clone();
+        tokio::spawn(async move {
+            let loaded = tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let config = Config::load(config_path.as_deref())?;
+                let embedder = Embedder::new(&config)?;
+                Ok::<_, anyhow::Error>((embedder, started.elapsed()))
+            })
+            .await;
+            let next = match loaded {
+                Ok(Ok((embedder, elapsed))) => {
+                    tracing::info!(
+                        load_ms = elapsed.as_millis() as u64,
+                        "query embedding model loaded; semantic search is ready"
+                    );
+                    EmbedderState::Ready(Arc::new(Mutex::new(embedder)))
+                }
+                Ok(Err(error)) => {
+                    let detail = format!("{error:#}");
+                    tracing::warn!(error = %detail, "loading the query embedding model failed");
+                    EmbedderState::Failed(detail)
+                }
+                Err(error) => EmbedderState::Failed(format!("embedder load task failed: {error}")),
+            };
+            *self.state.write().await = next;
+        });
+    }
+}
+
 fn prune_history(jobs: &mut HashMap<String, Value>) {
     if jobs.len() < MAX_HISTORY {
         return;
@@ -1661,7 +2251,10 @@ fn now() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_settings, read_only, requested_paths, root_name, valid_output_name, Corpus};
+    use super::{
+        build_settings, constant_time_eq, read_only, requested_paths, root_name, valid_output_name,
+        Corpus,
+    };
     use crate::config::{Config, MAX_WORKERS};
     use crate::settings::{
         OcrSettings, VisionSettings, OCR_DPI_RANGE, OCR_MAX_PAGES_RANGE, OCR_PSM_RANGE,
@@ -1817,13 +2410,47 @@ mod tests {
         // Vision block: cap, gated tiers, per-sub-model present flags, defaults.
         assert_eq!(value["vision"]["max_tier"], "off");
         assert!(value["vision"]["tiers_available"].is_array());
-        for category in ["detectors", "taggers", "captioners"] {
+        for category in ["detectors", "taggers", "captioners", "faces"] {
             let list = value["vision"][category].as_array().unwrap();
             assert_eq!(list.len(), 1, "{category}");
             assert!(list[0]["id"].is_string());
             assert!(list[0]["present"].is_boolean());
         }
         assert!(value["vision"]["defaults"]["detector_conf"].is_number());
+        // Faces is discoverable and its advertised default is `off` — an app
+        // reading this can offer the control without ever pre-selecting it.
+        assert_eq!(value["vision"]["faces"][0]["id"], "yunet-sface");
+        assert_eq!(value["vision"]["defaults"]["faces"], "off");
+        assert!(value["vision"]["defaults"]["face_score"].is_number());
+        assert!(value["vision"]["defaults"]["max_faces"].is_number());
+    }
+
+    /// The capability half of the faces opt-in: a box that has not staged the
+    /// pair says so, a box with a wrongly-hashed one still says so, and neither
+    /// changes which vision TIERS are on offer.
+    #[test]
+    fn faces_presence_is_reported_without_touching_the_tier_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_pointing_at(temp.path());
+        let vision_dir = temp.path().join("vision");
+        std::fs::create_dir_all(&vision_dir).unwrap();
+
+        let value = build_settings(Some(&config), VisionMode::Captions, 4).unwrap();
+        assert_eq!(value["vision"]["faces"][0]["present"], false);
+        let tiers = value["vision"]["tiers_available"].clone();
+
+        // Half a pair is not a capability.
+        std::fs::write(vision_dir.join("yunet.onnx"), b"bogus").unwrap();
+        let value = build_settings(Some(&config), VisionMode::Captions, 4).unwrap();
+        assert_eq!(value["vision"]["faces"][0]["present"], false);
+        // Both halves present but unpinned-hash bogus: still absent.
+        std::fs::write(vision_dir.join("sface.onnx"), b"bogus").unwrap();
+        let value = build_settings(Some(&config), VisionMode::Captions, 4).unwrap();
+        assert_eq!(value["vision"]["faces"][0]["present"], false);
+        assert_eq!(
+            value["vision"]["tiers_available"], tiers,
+            "face models must never move the tier gates"
+        );
     }
 
     #[test]
@@ -1915,6 +2542,20 @@ mod tests {
         assert_eq!(defaults["timeout_secs"], vision.timeout_secs.unwrap());
     }
 
+    /// The submit-token fold must agree with `==` on every outcome — its whole
+    /// point is to change the TIMING of the answer, never the answer.
+    #[test]
+    fn submit_token_comparison_matches_equality() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        // Same length, one byte off — the case the fold (rather than an
+        // early-exit compare) exists for.
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"Xecret", b"secret"));
+        // Different lengths differ by length alone, which is not secret.
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+        assert!(!constant_time_eq(b"", b"secret"));
+    }
+
     #[test]
     fn root_name_uses_the_final_path_component() {
         assert_eq!(root_name(Path::new("/input")), "input");
@@ -1965,5 +2606,328 @@ mod tests {
                 .to_string()
         ));
         assert!(requested_paths(&[root], Some(vec!["../escape.txt".into()])).is_err());
+    }
+
+    /// Semantic search below the HTTP layer: `semantic_scan` is where "no
+    /// results" has to become a stated reason, and it is reachable without the
+    /// embedding model because the query vector is already an argument.
+    mod semantic {
+        use super::super::{search_response, semantic_scan, ReadError, SearchOutcome, FAST_MODE};
+        use crate::embedding::{vector_to_bytes, EMBEDDING_MODEL};
+        use rusqlite::Connection;
+        use serde_json::Value;
+        use std::path::Path;
+        use std::time::Instant;
+
+        /// A corpus with `files` + `chunks`, holding one chunk per `(model,
+        /// vector)`. `chunks: None` writes a corpus with no chunks TABLE at all
+        /// — what a build older than embeddings left behind.
+        fn corpus(path: &Path, chunks: Option<&[(&str, Vec<f32>)]>) {
+            crate::vec0::register();
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, name TEXT);
+                     INSERT INTO files(id,path,name) VALUES(1,'/corpus/a.txt','a.txt');",
+                )
+                .unwrap();
+            let Some(chunks) = chunks else { return };
+            connection
+                .execute_batch(
+                    "CREATE TABLE chunks(id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL,
+                       chunk_index INTEGER NOT NULL, content TEXT NOT NULL,
+                       embedding BLOB NOT NULL, dimensions INTEGER NOT NULL, model TEXT NOT NULL,
+                       page_start INTEGER, page_end INTEGER);",
+                )
+                .unwrap();
+            for (index, (model, vector)) in chunks.iter().enumerate() {
+                connection
+                    .execute(
+                        "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model) \
+                         VALUES(1,?1,?2,?3,?4,?5)",
+                        rusqlite::params![
+                            index as i64,
+                            format!("chunk {index}"),
+                            vector_to_bytes(vector),
+                            vector.len() as i64,
+                            model
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+
+        fn scan(path: &Path) -> SearchOutcome {
+            rank(path, false)
+        }
+
+        /// `mode=semantic_fast`: the same request, routed at the quantised
+        /// index instead of the exact one.
+        fn fast(path: &Path) -> SearchOutcome {
+            rank(path, true)
+        }
+
+        fn rank(path: &Path, fast: bool) -> SearchOutcome {
+            match semantic_scan(path, &[1.0, 0.0, 0.0], 5, fast, Instant::now()) {
+                Ok(outcome) => outcome,
+                Err(ReadError::Busy) => panic!("a fixture corpus cannot be busy"),
+                Err(ReadError::Unreadable(detail)) => panic!("fixture unreadable: {detail}"),
+            }
+        }
+
+        fn body(outcome: SearchOutcome) -> Value {
+            search_response("beach at sunset", "semantic", 5, outcome)
+        }
+
+        fn fast_body(outcome: SearchOutcome) -> Value {
+            search_response("beach at sunset", FAST_MODE, 5, outcome)
+        }
+
+        #[test]
+        fn an_absent_corpus_answers_empty_with_a_reason_not_an_error() {
+            let temp = tempfile::tempdir().unwrap();
+            let body = body(scan(&temp.path().join("corpus.sqlite")));
+            assert_eq!(body["status"], "no_embeddings");
+            assert_eq!(body["hits"].as_array().unwrap().len(), 0);
+            assert!(
+                body["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no corpus database"),
+                "{body}"
+            );
+            // The honest fields a caller branches on are there either way.
+            assert_eq!(body["mode"], "semantic");
+            assert_eq!(body["model"], EMBEDDING_MODEL);
+            assert_eq!(body["query"], "beach at sunset");
+        }
+
+        #[test]
+        fn a_corpus_without_a_chunks_table_degrades_rather_than_failing() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(&path, None);
+            let body = body(scan(&path));
+            assert_eq!(body["status"], "no_embeddings");
+            assert!(
+                body["reason"].as_str().unwrap().contains("no chunks table"),
+                "{body}"
+            );
+        }
+
+        #[test]
+        fn a_corpus_indexed_with_embedding_off_says_so() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(&path, Some(&[]));
+            let body = body(scan(&path));
+            assert_eq!(body["status"], "no_embeddings");
+            assert!(
+                body["reason"].as_str().unwrap().contains("no embeddings"),
+                "{body}"
+            );
+            assert!(body.get("other_models").is_none(), "{body}");
+        }
+
+        #[test]
+        fn a_corpus_embedded_by_another_model_names_it() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(
+                &path,
+                Some(&[
+                    ("clip-vit-b32", vec![1.0, 0.0, 0.0]),
+                    ("clip-vit-b32", vec![0.9, 0.1, 0.0]),
+                ]),
+            );
+            let body = body(scan(&path));
+            assert_eq!(body["status"], "no_embeddings");
+            assert_eq!(
+                body["other_models"],
+                serde_json::json!(["clip-vit-b32 (3d)"])
+            );
+            let reason = body["reason"].as_str().unwrap();
+            assert!(reason.contains("another model"), "{reason}");
+            assert!(reason.contains(EMBEDDING_MODEL), "{reason}");
+        }
+
+        #[test]
+        fn a_ranked_scan_reports_hits_scores_and_what_it_compared() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(
+                &path,
+                Some(&[
+                    (EMBEDDING_MODEL, vec![0.0, 1.0, 0.0]),
+                    (EMBEDDING_MODEL, vec![1.0, 0.0, 0.0]),
+                    ("clip-vit-b32", vec![1.0, 0.0, 0.0]),
+                ]),
+            );
+            let body = body(scan(&path));
+            assert_eq!(body["status"], "ready");
+            assert_eq!(body["compared_chunks"], 2);
+            assert_eq!(body["skipped_chunks"], 1);
+            let hits = body["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0]["content"], "chunk 1");
+            assert_eq!(hits[0]["path"], "/corpus/a.txt");
+            assert!((hits[0]["score"].as_f64().unwrap() - 1.0).abs() < 0.0001);
+            assert!(hits[1]["score"].as_f64().unwrap().abs() < 0.0001);
+            assert!(body["elapsed_ms"].is_number(), "{body}");
+            // No shadow index, so the scan served it — stated, not implied, and
+            // with nothing to say about an index that is not there.
+            assert_eq!(body["path"], "scan");
+            assert!(body.get("index_note").is_none(), "{body}");
+        }
+
+        /// The same corpus after `llm-index vector-index --tier TIER`.
+        fn with_shadow_index(path: &Path, tier: crate::vec0::Tier, dimensions: usize) {
+            let mut connection = Connection::open(path).unwrap();
+            crate::vec0::build(
+                &mut connection,
+                tier,
+                EMBEDDING_MODEL,
+                dimensions,
+                |_, _| {},
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn a_shadow_index_answers_the_same_request_and_the_response_says_so() {
+            // Same fixture, same query, same hits and scores as the scan test
+            // above — the only difference a consumer can see is `path`.
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(
+                &path,
+                Some(&[
+                    (EMBEDDING_MODEL, vec![0.0, 1.0, 0.0]),
+                    (EMBEDDING_MODEL, vec![1.0, 0.0, 0.0]),
+                    ("clip-vit-b32", vec![1.0, 0.0, 0.0]),
+                ]),
+            );
+            with_shadow_index(&path, crate::vec0::Tier::Float, 3);
+            let body = body(scan(&path));
+            assert_eq!(body["status"], "ready");
+            assert_eq!(body["path"], "vec0");
+            assert_eq!(body["exact"], true);
+            assert_eq!(body["compared_chunks"], 2);
+            assert_eq!(body["skipped_chunks"], 1);
+            let hits = body["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0]["content"], "chunk 1");
+            assert!((hits[0]["score"].as_f64().unwrap() - 1.0).abs() < 0.0001);
+            assert!(body.get("index_note").is_none(), "{body}");
+        }
+
+        #[test]
+        fn semantic_fast_ranks_through_the_quantised_index_and_labels_itself() {
+            // The opt-in path as a consumer sees it: same envelope, same score
+            // arithmetic, a `path` naming the quantisation and `exact: false`
+            // so nothing has to infer the promise from the path name.
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(
+                &path,
+                Some(&[
+                    (EMBEDDING_MODEL, vec![0.0, 1.0, 0.0]),
+                    (EMBEDDING_MODEL, vec![1.0, 0.0, 0.0]),
+                    ("clip-vit-b32", vec![1.0, 0.0, 0.0]),
+                ]),
+            );
+            with_shadow_index(&path, crate::vec0::Tier::Int8, 3);
+            let body = fast_body(fast(&path));
+            assert_eq!(body["mode"], FAST_MODE);
+            assert_eq!(body["status"], "ready");
+            assert_eq!(body["path"], "vec0_int8");
+            assert_eq!(body["exact"], false);
+            // The pool is `limit x` the measured oversample, bounded by what
+            // the corpus actually holds: three chunks, two of them this model's.
+            assert_eq!(body["candidates"], 2);
+            let hits = body["hits"].as_array().unwrap();
+            assert_eq!(hits[0]["content"], "chunk 1");
+            // The score is the float cosine, not a quantised distance: the
+            // quantisation chooses the candidates and never the numbers.
+            assert!((hits[0]["score"].as_f64().unwrap() - 1.0).abs() < 0.0001);
+            assert!(body.get("index_note").is_none(), "{body}");
+        }
+
+        #[test]
+        fn semantic_fast_over_a_corpus_without_one_answers_exactly_and_says_so() {
+            // The fallback that matters most: asking for the fast path on a
+            // corpus that has no quantised index returns the EXACT answer, and
+            // labels it exact rather than pretending the request was served.
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(
+                &path,
+                Some(&[
+                    (EMBEDDING_MODEL, vec![0.0, 1.0, 0.0]),
+                    (EMBEDDING_MODEL, vec![1.0, 0.0, 0.0]),
+                ]),
+            );
+            let body = fast_body(fast(&path));
+            assert_eq!(body["status"], "ready");
+            assert_eq!(body["path"], "scan");
+            assert_eq!(body["exact"], true);
+            assert!(
+                body["index_note"].as_str().unwrap().contains("--tier int8"),
+                "{body}"
+            );
+            assert_eq!(body["hits"][0]["content"], "chunk 1");
+        }
+
+        #[test]
+        fn a_corpus_whose_index_cannot_be_trusted_says_which_path_served_it() {
+            // The capability fallback as a consumer sees it: still `ready`, still
+            // the right hits, but `path: scan` with the reason attached — the
+            // difference between "no index here" and "the index is stale".
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("corpus.sqlite");
+            corpus(&path, Some(&[(EMBEDDING_MODEL, vec![1.0, 0.0, 0.0])]));
+            with_shadow_index(&path, crate::vec0::Tier::Float, 3);
+            Connection::open(&path)
+                .unwrap()
+                .execute(
+                    "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model) \
+                     VALUES(1,9,'written behind the index',?1,3,?2)",
+                    rusqlite::params![vector_to_bytes(&[1.0, 0.0, 0.0]), EMBEDDING_MODEL],
+                )
+                .unwrap();
+
+            let body = body(scan(&path));
+            assert_eq!(body["status"], "ready");
+            assert_eq!(body["path"], "scan");
+            assert!(
+                body["index_note"].as_str().unwrap().contains("stale"),
+                "{body}"
+            );
+            // And the row the index never saw is in the answer.
+            let hits = body["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 2);
+            assert!(hits
+                .iter()
+                .any(|hit| hit["content"] == "written behind the index"));
+        }
+
+        #[test]
+        fn warming_and_unavailable_are_stated_never_hidden_behind_zero_hits() {
+            let warming = body(SearchOutcome::Warming { warming_ms: 40 });
+            assert_eq!(warming["status"], "warming");
+            assert_eq!(warming["warming_ms"], 40);
+            assert_eq!(warming["hits"].as_array().unwrap().len(), 0);
+            assert!(warming["reason"].as_str().unwrap().contains("loading"));
+
+            let broken = body(SearchOutcome::Unavailable {
+                reason: "no model cache".into(),
+                retrying: true,
+            });
+            assert_eq!(broken["status"], "unavailable");
+            assert_eq!(broken["reason"], "no model cache");
+            assert_eq!(broken["retrying"], true);
+            assert_eq!(broken["hits"].as_array().unwrap().len(), 0);
+        }
     }
 }
