@@ -1,6 +1,47 @@
 # HTTP API
 The container listens on TCP 9801. All API requests and responses are JSON.
 
+## Submit token — gating the job-mutating routes
+
+By default every route below is open to anything that can reach the port. That
+is the right default for a standalone container, and the wrong one for an
+app-managed engine: the managing app is supposed to hold absolute control over
+the job surface, and an engine whose loopback port accepts direct
+`POST /index` calls leaves that app honestly reporting an "engine-native job"
+it can neither pause nor cancel.
+
+`serve --submit-token <secret>` (env fallback `LLM_SUBMIT_TOKEN`; the flag
+wins, and an explicitly empty value is refused at startup) closes that hole.
+When set, every **job-mutating** route requires the same secret in an
+`X-Submit-Token` header:
+
+- `POST /index`
+- `POST /jobs/{id}/cancel`
+- `POST /runtime` and `POST /jobs/{id}/runtime`
+
+A missing or wrong token answers `401` before the handler runs, so a refusal
+has no side effects — no job row, no cancellation flag, no persisted envelope:
+
+```json
+{"status": "error", "error": "missing or invalid X-Submit-Token header; job-mutating routes on this server require the submit token", "header": "X-Submit-Token"}
+```
+
+Every read-only route — `GET /health`, `GET /settings`, the job and runtime
+GETs, and the whole `/corpus/*` read surface including `/corpus/search` —
+stays open, so an app's search proxy, monitor panels and read tools work
+without the token. That split is what makes the token an app-held **write
+credential** rather than a service password. The gate keys on the request
+method: every mutation this service exposes is a POST and every GET is
+read-only by construction, so a job-mutating route added later is gated by
+default instead of depending on someone remembering to enrol it.
+
+The comparison is constant-time, and without the flag the gate is not even
+installed — an ungated `serve` behaves exactly as it always has.
+
+The flag and header names are shared verbatim with the vlm-indexing engine's
+identical gate (whose env fallback is `VLM_SUBMIT_TOKEN`), so an app managing
+both engines configures and calls them uniformly.
+
 ## `GET /health`
 
 Returns service version/readiness and whether a job is queued or running.
@@ -36,10 +77,14 @@ apart.
     "detectors": [{"id": "nano", "present": true}],
     "taggers": [{"id": "clip", "present": true}],
     "captioners": [{"id": "florence2", "present": false}],
+    "faces": [{"id": "yunet-sface", "present": false}],
     "defaults": {
       "detector_conf": 0.5,
       "tag_threshold": 0.22,
       "tag_top_k": 8,
+      "faces": "off",
+      "face_score": 0.9,
+      "max_faces": 20,
       "max_frames": 12,
       "timeout_secs": 60
     }
@@ -59,11 +104,20 @@ apart.
   files are present under `<data_dir>/vision` **and** pass the pinned SHA-256
   check (`available_tiers`/`corrupt_models`) — so an entry here is a real
   guarantee the tier will run, not just that the tier name is known.
-- `vision.detectors`/`taggers`/`captioners` list every selectable sub-model id
-  (`ocr_opts`/`vision_opts`' accepted enum values, minus `off`) with a
-  `present` flag backed by the same model-file existence + hash check
-  (`detector_present`/`tagger_present`/`captioner_present`). In v1 each
-  category has exactly one model, so all its ids currently share one flag.
+- `vision.detectors`/`taggers`/`captioners`/`faces` list every selectable
+  sub-model id (`ocr_opts`/`vision_opts`' accepted enum values, minus `off`)
+  with a `present` flag backed by the same model-file existence + hash check
+  (`detector_present`/`tagger_present`/`captioner_present`/`faces_present`). In
+  v1 each category has exactly one model, so all its ids currently share one
+  flag.
+- `vision.faces` is the **opt-in, privacy-sensitive** face pair (YuNet + SFace).
+  It differs from the other three in two ways worth reading carefully:
+  `defaults.faces` is `"off"` on every server (nothing enables it by omission),
+  and `present: false` means the capability is **absent**, not that a job will
+  fail — a job that asks for faces on a box that has not run
+  `fetch-data --faces` runs the rest of its tier and writes no faces. It also
+  never appears in `tiers_available`: faces is a sub-model of the `tags` tier,
+  not a tier, so an unstaged pair can never gate a tier off.
 - `vision.defaults` and `ocr.dpi.default`/`psm.default`/`preprocess_default`/
   `max_pages.default` are read live from the loaded `Config` — the same
   `OcrSettings::from_config`/`VisionSettings::from_config` base every
@@ -78,7 +132,9 @@ apart.
 
 ## `POST /index`
 
-Queues one job and returns `202 Accepted` with an `id`.
+Queues one job and returns `202 Accepted` with an `id`. On a server started
+with `--submit-token` this route requires the `X-Submit-Token` header — see
+[Submit token](#submit-token--gating-the-job-mutating-routes).
 
 ```json
 {
@@ -90,6 +146,7 @@ Queues one job and returns `202 Accepted` with an `id`.
   "include_paths": ["Customers/new.pdf", "Meetings/changed.mp4"],
   "resume": true,
   "overwrite": true,
+  "retry_errors": false,
   "vision": "tags",
   "ocr_opts": {
     "dpi": 300,
@@ -105,6 +162,9 @@ Queues one job and returns `202 Accepted` with an `id`.
     "tag_threshold": 0.22,
     "tag_top_k": 8,
     "captioner": "florence2",
+    "faces": "off",
+    "face_score": 0.9,
+    "max_faces": 20,
     "max_frames": 12,
     "timeout_secs": 60
   }
@@ -134,6 +194,16 @@ the job writes into directly (there is no staged copy renamed in at the end):
   that leaves a partial new corpus, not the one it replaced, so keep a copy
   first if the previous corpus still matters;
 - both set → `resume` wins.
+
+`retry_errors` (default `false`) applies only to a `resume`. A row that has
+failed three times without finishing is left alone, because re-extracting a file
+the engine cannot read costs the same on every resume and produces the same row;
+setting this reopens those rows for one run. It changes which rows are attempted,
+never how one is processed. Leave it off unless the reason for the failures has
+been fixed OUTSIDE the engine (a drive that was not mounted, a dependency that
+was not installed, files that have since been repaired) — a fix inside the engine
+moves the extraction-capability revision and reopens them by itself. The
+completed job reports how many rows were held back as `capped`.
 
 A job that fails part-way leaves what it had committed, so a database now exists
 where a failed job used to publish nothing — including the empty one a job that
@@ -183,8 +253,28 @@ violation:
 | `vision_opts.tag_threshold` | float | `0.0..=1.0` | Minimum CLIP tag score kept. |
 | `vision_opts.tag_top_k` | integer | `1..=32` | Max tags kept per file. |
 | `vision_opts.captioner` | string | `off`\|`florence2` | Captioner selection. |
+| `vision_opts.faces` | string | `off`\|`yunet-sface` | Face detection + embedding. **Default `off`**; see the privacy note below. |
+| `vision_opts.face_score` | float | `0.05..=0.99` | Minimum face-detection score kept. |
+| `vision_opts.max_faces` | integer | `1..=200` | Max faces kept per file. |
 | `vision_opts.max_frames` | integer | `1..=64` | Max video keyframes analysed. |
 | `vision_opts.timeout_secs` | integer | `5..=1800` | Per-file vision timeout (seconds). |
+
+`vision_opts.faces` is the one knob here that produces data about **people**
+rather than files, so it behaves differently on purpose:
+
+- it is `off` by default in config, in the merge, and on the CLI — no request
+  turns it on by omission;
+- its models are staged only by an explicit `llm-index fetch-data --faces`
+  (`fetch-data --vision` does **not** fetch them);
+- if the pair is not staged the capability is absent and the job succeeds
+  without faces — an unavailable privacy feature never fails a job. A pair that
+  IS staged but fails its pinned SHA-256 does fail the job, since bytes nobody
+  vouched for must not compute claims about a person's identity;
+- results land only in the corpus's own `faces` table
+  (`file_id, face_index, x, y, width, height, quality, embedding, dimensions,
+  model, frame`). They are never rendered into `fts.content`, sidecars,
+  manifests, or the job summary — which reports only a `faces` COUNT — and this
+  engine never transmits them anywhere.
 
 Unknown top-level fields anywhere in the job body remain permissively ignored
 (existing forward-compat serde posture) — only the fields above are validated.
@@ -193,7 +283,9 @@ Unknown top-level fields anywhere in the job body remain permissively ignored
 
 Returns `queued`, `running`, `cancelling`, `cancelled`, `complete` or `error`.
 Running jobs include live `processed` and `total` file counters. A completed job includes the
-database path, file/OCR/error/incomplete counts, embedded chunk count, removed
+database path, file/OCR/error/incomplete counts, the `capped` count of rows resume
+declined because they have failed too often, embedded chunk count, the `faces`
+count of faces stored (0 unless the opt-in faces sub-tier ran), removed
 source count, elapsed time and OCR languages.
 
 ## `POST /jobs/{id}/cancel`
@@ -203,13 +295,17 @@ before the next extraction/embedding boundary and commits the files it had
 already finished, which stay in the published corpus. Poll the job until its
 state becomes `cancelled`; that result carries the `output` name and reports the
 partial corpus as retained. Resubmit with `"resume": true` to continue from it.
-A job cancelled before it started leaves the output untouched.
+A job cancelled before it started leaves the output untouched. Gated by the
+[submit token](#submit-token--gating-the-job-mutating-routes) when one is
+configured, like every job-mutating route.
 
 ## Runtime stage tuning
 
 Concurrency knobs that can be changed **while a job is running**. Values are
 integers; out-of-range values are **clamped, not rejected**, and the response
-always reports what actually landed.
+always reports what actually landed. Both POSTs here mutate how jobs run, so
+they sit behind the [submit token](#submit-token--gating-the-job-mutating-routes)
+when one is configured; the GETs stay open.
 
 ### `GET /runtime`
 
@@ -263,8 +359,15 @@ to the standalone `llm-search` repository (commit `5dcd054`, "move HTTP search
 to the standalone search service") — this service is a pure indexer. It still
 publishes the `chunks` embedding table those endpoints read; the CLI's
 `search`/`vector-search` debug subcommands and the underlying
-`store`/`normalize`/`embedding` code are unchanged here. Point search traffic
-at the `llm-search` service instead of this one.
+`store`/`normalize`/`embedding` code are unchanged here. Point keyword search
+traffic at the `llm-search` service instead of this one.
+
+`GET /corpus/search` (below) is **not** a walk-back of that split. `llm-search`
+holds every chunk vector RESIDENT to serve a search-as-you-type socket, which
+is a multi-gigabyte process on a corpus this size; the route below is the
+streaming, nothing-resident half — one exhaustive scan per request, `O(limit)`
+memory, no second service to deploy — added because on the live corpora 4.1 GB
+of already-computed vectors were otherwise reachable only from the CLI.
 
 ## Corpus read surface
 
@@ -349,3 +452,125 @@ Cheap corpus-wide aggregates:
 `output`: the counts are then a snapshot of a corpus still being built, and will
 grow. It is the replacement for the guarantee the old rename-on-success
 publication gave for free — that a corpus you could see was a finished one.
+
+### `GET /corpus/search?q=TEXT`
+
+Semantic search over the embeddings index jobs already wrote. `q` is embedded
+with the same model the corpus rows were embedded with
+(`intfloat/multilingual-e5-small`) and `chunks` is ranked by cosine similarity.
+
+| param | default | meaning |
+|---|---|---|
+| `q` | — | required; blank or missing is `400` |
+| `mode` | `semantic` | `semantic` (exact) or `semantic_fast` (quantised, approximate); anything else is `400` listing the accepted modes |
+| `limit` | `20` | clamped to `1..=100` |
+| `output` | `corpus.sqlite` | same plain-filename rule as every other route here |
+
+```json
+{
+  "mode": "semantic",
+  "status": "ready",
+  "query": "beach at sunset",
+  "limit": 20,
+  "model": "intfloat/multilingual-e5-small",
+  "hits": [
+    {
+      "path": "C:\photos\2019\IMG_4021.txt",
+      "name": "IMG_4021.txt",
+      "chunk_index": 0,
+      "score": 0.8269,
+      "content": "the chunk text that was embedded…"
+    }
+  ],
+  "compared_chunks": 100000,
+  "skipped_chunks": 0,
+  "elapsed_ms": 1204,
+  "path": "scan",
+  "exact": true
+}
+```
+
+`hits` matches `llm-search`'s `/search/vector` rows so the two search surfaces
+are one shape. `score` is cosine similarity in `-1.0..=1.0`; ordering is
+descending score, ties broken by ascending `chunks.id`, so the same query over
+the same corpus always returns the same list in the same order.
+
+**`mode` chooses the promise.** `semantic` (the default) is exact: the answer is
+the corpus' true top-k, however long that takes. `semantic_fast` ranks through
+the corpus' QUANTISED shadow index instead — sub-second where `semantic` is
+seconds, at the cost of returning an approximation of the same list. It is a
+separate mode rather than a tolerance knob because approximate and exact are
+different promises, and a caller has to choose one deliberately.
+
+**`path` says how the answer was produced**, and **`exact` says whether it is
+the scan's own answer.** Never infer the second from the first: a
+`semantic_fast` request over a corpus with no quantised index is answered
+exactly, and only `exact` tells you so.
+
+| `path` | `exact` | meaning |
+|---|---|---|
+| `scan` | `true` | the exhaustive cosine scan over every stored vector |
+| `vec0` | `true` | a k-NN lookup against the corpus' exact `vec0` shadow index, with the candidates re-scored from the same BLOBs — same hits, same scores, same order as the scan |
+| `vec0_int8` | `false` | a k-NN over the int8-quantised index, oversampled and re-scored from the float BLOBs |
+| `vec0_bit` | `false` | the same over the 1-bit-quantised index |
+
+On the two quantised paths `candidates` reports how many rows the k-NN nominated
+before the float re-score picked the page out of them — the one number behind how
+good the approximation is. Every `score` is a true cosine against the stored
+vector on every path; what quantisation changes is which rows were scored at all.
+
+A corpus has a shadow index only after `llm-index vector-index` has been run
+against it; without one, `path` is always `scan` and nothing else changes. When a
+corpus HAS one that was not used, `index_note` says why — an interrupted build,
+another model's vectors, or an index that a build without index maintenance has
+written behind (`--rebuild` is the repair). Asking for `semantic_fast` on a
+corpus with no quantised index also fills `index_note`, with the command that
+would build one. A missing `index_note` on `path: scan` means there is no index
+to talk about.
+
+**`status` is the field to branch on.** An empty `hits` is never ambiguous:
+
+| `status` | meaning |
+|---|---|
+| `ready` | the ranking ran; `compared_chunks`/`skipped_chunks` say over what and `path` says how |
+| `no_embeddings` | nothing to rank, and `reason` says why: no corpus written yet, a corpus with no `chunks` table, a corpus indexed without embeddings, or one whose vectors came from another model (then `other_models` names them) |
+| `warming` | the query embedding model is still loading; `warming_ms` is how long it has been at it |
+| `unavailable` | the model could not be loaded, or could not embed this query; `reason` carries the failure and `retrying` says whether a fresh load is already in flight |
+
+Only two things are errors: a malformed request (`400`) and a corpus that exists
+but cannot be read (`503`, the same `busy`/`unreadable` bodies the rest of this
+surface uses). A corpus indexed with embedding disabled is a `200`.
+
+**First-call cost.** A serve process that has only ever answered reads has no
+embedding model loaded. The first `mode=semantic` request does not wait for it:
+it arms the load, returns `status: "warming"` immediately (measured: 207 ms
+wall, `warming_ms: 0`), and later requests report a growing `warming_ms` until
+the model is ready — measured 5,336 ms end to end on the workhorse, logged as
+`query embedding model loaded; semantic search is ready load_ms=5336`. A failed
+load is reported with its reason and re-armed on the next request, so it never
+latches. Consumers that want the first *user* query to be fast should fire one
+throwaway search at startup.
+
+**Per-query cost.** The scan is exhaustive, so latency scales with the corpus:
+measured 0.24 s per 100 k vectors and 13.7 s over the live 2.68 M-vector /
+15.6 GB corpus. A corpus with an exact `vec0` shadow index reads the vectors only
+and answers roughly an order of magnitude faster — best warm passes 1.32 s at
+869 k vectors and 3.9 s at 2.68 M, against 13.9 s and 45.6 s for the scan measured
+back to back on the same loaded workstation.
+
+`mode=semantic_fast` over an `int8` index is faster again, and it is the only
+configuration that is ever interactive — measured over 20 real query embeddings,
+`limit=10`, **recall@10 1.0000 against the exact answer at both sizes**:
+
+| vectors | `semantic` (exact index) | `semantic_fast` (`int8`) |
+|---|---|---|
+| 869,267 | 916 ms best | **571 ms best, 586 ms median** |
+| 2,684,125 | 3,787 ms best | 1,860 ms best, 1,945 ms median |
+
+So sub-second arrives below about a million vectors and not at 2.68 M, where the
+`int8` k-NN is bound by `sqlite-vec` 0.1.9's scalar int8 kernel rather than by
+I/O. The `bit` tier IS sub-second there (143 - 399 ms) at recall@10 0.125 - 0.445,
+which is why it is not what `semantic_fast` suggests building. `docs/ARCHITECTURE.md`
+carries every pool, both tiers, both corpora, the build costs, and why `vec0`
+0.1.9 is a faster brute force rather than an ANN. None of this is a
+search-as-you-type endpoint at 2.68 M vectors.

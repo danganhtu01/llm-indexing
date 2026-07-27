@@ -137,6 +137,44 @@ pub struct TagScore {
     pub score: f32,
 }
 
+/// One face located by the (opt-in) faces sub-tier, with its SFace embedding.
+///
+/// **Privacy posture.** These are biometric facts about identifiable people, so
+/// they are the one part of a vision result that is deliberately *not* woven
+/// into anything that travels: they never reach [`VisionResult::content_block`]
+/// (so they are never searchable text, never a sidecar, never part of a report),
+/// they are written only into the corpus's own `faces` table on the machine that
+/// indexed the file, and no code path in this engine sends them anywhere. The
+/// sub-tier that produces them is off by default at every layer — see
+/// [`crate::vision::faces`].
+///
+/// Geometry is in the pixel space of the image that was analysed: the file
+/// itself for a still, or the keyframe named by `frame` for a video.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaceDetection {
+    /// Left edge of the face box, in analysed-image pixels.
+    pub x: i32,
+    /// Top edge of the face box, in analysed-image pixels.
+    pub y: i32,
+    /// Face box width, in analysed-image pixels.
+    pub width: u32,
+    /// Face box height, in analysed-image pixels.
+    pub height: u32,
+    /// Detector confidence in `[0, 1]` — the face-quality gate an app clusters
+    /// on (a low-scoring face is typically small, blurred, or steeply posed, and
+    /// its embedding is the kind that poisons clusters).
+    pub quality: f32,
+    /// The 128-d SFace embedding of the aligned crop, or `None` when the
+    /// embedder could not produce one for this face.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+    /// Video only: the 0-based ordinal of the keyframe this face was found in
+    /// (`None` for stills). Keyframes are extracted in a fixed order, so the
+    /// ordinal is stable for a given file and `max_frames`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<u32>,
+}
+
 /// The full result of analysing one image or video. Fields map 1:1 onto the
 /// `vision` table columns (see `store::SCHEMA`); tiers fill in what they own and
 /// leave the rest at their defaults.
@@ -169,6 +207,22 @@ pub struct VisionResult {
     pub embedding_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<usize>,
+    /// Faces located by the opt-in faces sub-tier. Empty unless a job turned
+    /// faces on AND the models are staged; never rendered into
+    /// [`VisionResult::content_block`] (see [`FaceDetection`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub faces: Vec<FaceDetection>,
+    /// The face model pair that actually scanned this file (`yunet-sface`), or
+    /// `None` when the faces sub-tier did not run for it.
+    ///
+    /// This is the *evidence that a scan happened*, not the evidence that a face
+    /// was found: a photo of a landscape gets `Some("yunet-sface")` and an empty
+    /// [`faces`](Self::faces). It is what lets a later resume tell "already
+    /// scanned, no faces here" from "never scanned", so turning faces on for an
+    /// existing corpus reprocesses exactly once instead of either never (the row
+    /// looks complete) or every run (no row is ever proof of a scan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faces_model: Option<String>,
     /// Video: number of keyframes analysed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frames: Option<usize>,
@@ -259,6 +313,45 @@ mod tests {
     #[test]
     fn default_result_renders_no_block() {
         assert!(VisionResult::default().content_block().is_none());
+    }
+
+    /// The privacy invariant [`FaceDetection`] documents, asserted rather than
+    /// asserted-by-reading: faces are the one vision output that must never be
+    /// rendered into the searchable content block (which becomes `fts.content`
+    /// and, through the sidecar writer, a `.txt` next to the original). A result
+    /// carrying ONLY faces renders no block at all, and adding faces to a result
+    /// that does render one leaves that block byte-identical.
+    #[test]
+    fn faces_never_reach_the_searchable_content_block() {
+        let face = FaceDetection {
+            x: 10,
+            y: 20,
+            width: 64,
+            height: 80,
+            quality: 0.97,
+            embedding: Some(vec![0.1; 128]),
+            frame: None,
+        };
+        let faces_only = VisionResult {
+            mode: VisionMode::Tags,
+            faces: vec![face.clone()],
+            faces_model: Some("yunet-sface".into()),
+            ..Default::default()
+        };
+        assert!(faces_only.content_block().is_none());
+
+        let mut tagged = VisionResult {
+            mode: VisionMode::Tags,
+            tags: vec![TagScore {
+                tag: "beach".into(),
+                score: 0.4,
+            }],
+            ..Default::default()
+        };
+        let without = tagged.content_block();
+        tagged.faces = vec![face];
+        tagged.faces_model = Some("yunet-sface".into());
+        assert_eq!(without, tagged.content_block());
     }
 
     #[test]

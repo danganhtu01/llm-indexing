@@ -21,14 +21,19 @@ this component.
   in exhaustive mode
 - English stemming, Vietnamese segmentation, abbreviation expansion and
   diacritic-insensitive FTS5 search
-- 384-dimensional `multilingual-e5-small` embeddings and cosine vector search
+- 384-dimensional `multilingual-e5-small` embeddings and cosine vector search,
+  over the `vector-search` CLI subcommand and `GET /corpus/search?mode=semantic`
+  alike, with optional `vec0` k-NN shadow indexes (`vector-index`) — an exact one
+  and a quantised one for `mode=semantic_fast` — that an existing corpus can gain
+  without re-embedding anything
 - Crash-safe batched writes, resume/change detection, removal pruning, authentic
   incomplete/error counts, folder aggregation, manifests, reports and optional
   sidecars
 - Bounded HTTP job queue with input/output path confinement, live per-file
   counters and cooperative cancellation
 - Optional local vision analysis of photos/video (EXIF, perceptual hash,
-  quality, CLIP tags, object detection, best-effort captions), off by default
+  quality, CLIP tags, object detection, best-effort captions), plus a separate
+  opt-in local faces sub-model, all off by default
   — see [Vision (photos & video)](#vision-photos--video)
 
 `ocr: exhaustive` removes the normal byte, character and PDF-page caps. It OCRs
@@ -65,6 +70,19 @@ the service writes only a plain `.sqlite` filename under `/output`. Port 9801 is
 bound to localhost by the standalone Compose file and is internal-only in the
 `ff-lc-app` deployment.
 
+A localhost binding still leaves the job surface open to every process on the
+box. When the engine is managed by an app that must hold absolute control over
+its jobs, start it with `serve --submit-token <secret>` (env fallback
+`LLM_SUBMIT_TOKEN`; the flag wins): every job-mutating route (`POST /index`,
+`POST /jobs/{id}/cancel`, the `/runtime` POSTs) then requires that secret in an
+`X-Submit-Token` header, while the read-only surface (health, settings, job
+GETs, `/corpus/*` including search) stays open for monitors and search proxies.
+The managing app generates the secret, passes it at launch and keeps it to
+itself, making it the only caller that can create, cancel or retune jobs — so
+it never again has to report a directly-submitted job it cannot pause or
+cancel. Without the flag, nothing changes. See
+[`docs/HTTP_API.md`](docs/HTTP_API.md#submit-token--gating-the-job-mutating-routes).
+
 ## Native CLI
 
 ```bash
@@ -75,8 +93,32 @@ cargo build --release --locked
 ./target/release/llm-index search "know your customer" --index index_out
 ./target/release/llm-index vector-search "customer due diligence" \
   --index index_out/index.sqlite
+./target/release/llm-index vector-index --index index_out/index.sqlite
+./target/release/llm-index vector-index --index index_out/index.sqlite --tier int8
 ./target/release/llm-index top-folder "hoa don" --index index_out --limit 10
 ```
+
+`vector-index` builds the optional `vec0` shadow indexes from the vectors a
+corpus already holds — nothing is re-embedded — and turns semantic search from an
+exhaustive scan into a k-NN lookup. It is opt-in per corpus: without it,
+`vector-search` and `/corpus/search` scan exactly as before, and the response
+says which path served it. `--status` reports what a corpus has, `--rebuild`
+replaces it after a build that does not maintain it has written to the corpus,
+and `--drop` removes it.
+
+`--tier` picks which of the two indexes to touch. The default `float` tier is
+exact — `mode=semantic` uses it and returns what the scan returns, only sooner.
+The `int8` and `bit` tiers are QUANTISED: much smaller, much faster, and they
+change which rows come back, so only `mode=semantic_fast` reads them and the
+response labels itself `exact: false`. A corpus can carry one of each.
+
+Build `int8` unless you have measured otherwise: on both live corpora it returned
+the exact top-10 (recall@10 1.0000) in 571 ms at 869 k vectors and 1,860 ms at
+2.68 M. `bit` is three to twelve times faster again and much less accurate
+(recall@10 0.16 - 0.80), which is why sub-second and exact-enough are not the same
+answer at 2.68 M vectors. See
+[Cost of the vector scan](docs/ARCHITECTURE.md#cost-of-the-vector-scan) for every
+number, both tiers, both corpora.
 
 Copy `config.example.yaml` to override OCR, extraction, Whisper, embedding,
 worker, sidecar and skip settings.
@@ -85,7 +127,7 @@ worker, sidecar and skip settings.
 
 Beyond the service-wide `config.yaml` defaults, every `index` job (native CLI
 or `POST /index`) can override OCR quality (`dpi`, `psm`, `preprocess`,
-`max_pages`, `langs`) and vision quality (`detector`, `detector_conf`,
+`max_pages`, `langs`) and vision quality (`detector`, `detector_conf`, `faces`,
 `tagger`, `tag_threshold`, `tag_top_k`, `captioner`, `max_frames`,
 `timeout_secs`) for that job alone:
 
@@ -125,10 +167,27 @@ values and FTS content are byte-identical until a caller opts in.
 ./target/release/llm-index serve --vision-max tags        # allow jobs up to `tags`
 ```
 
+A separate, **opt-in** faces sub-model (YuNet detect + SFace embed, both
+Apache-2.0) writes face boxes and 128-d embeddings into their own `faces`
+table. It is off by default at every layer and its models are staged only by
+their own command — `fetch-data --vision` never downloads them:
+
+```bash
+./target/release/llm-index fetch-data --faces            # opt-in, pinned SHA-256
+./target/release/llm-index index ./photos --out index_out \
+  --vision tags --vision-faces yunet-sface
+```
+
+Face data is local-only: no network at index time, and embeddings never reach
+the searchable FTS content, sidecars, manifests or job summaries — a job
+reports a `faces` count and nothing more. A box that has not staged the pair
+reports the capability as absent (`GET /settings`) and runs jobs without it
+rather than failing them.
+
 Full tier reference, config knobs (`--vision`, `--vision-max` /
-`INDEX_VISION_MAX`, `VisionConfig`), the model/license table, consumer
-compatibility notes and performance/security details:
-[`docs/VISION.md`](docs/VISION.md).
+`INDEX_VISION_MAX`, `VisionConfig`), the faces privacy posture, the
+model/license table, consumer compatibility notes and performance/security
+details: [`docs/VISION.md`](docs/VISION.md).
 
 ## Output and incremental behavior
 
@@ -149,11 +208,16 @@ intact, but irreversibly once indexing has begun.
 Resume uses path, size and mtime and also repairs records missing vectors or
 marked partial/error. It reprocesses older PDF methods when exhaustive OCR is
 requested, and PDFs whose stored chunks carry no page anchors (see
-[Page anchors](#page-anchors)). Source files removed from the mounted tree are pruned from `files`,
-FTS and vector chunks — unless the walk found no files at all, which is treated
-as an unmounted or mistyped root rather than an instruction to empty the corpus.
-The job result reports `incomplete`, `embedded_chunks` and `removed`, allowing
-callers to show authentic state.
+[Page anchors](#page-anchors)). A record that has failed three times without
+finishing is then left alone: re-extracting a file the engine cannot read costs
+the same on every resume and produces the same row. Changed bytes, an available
+upgrade, a changed embedding model, a build whose extraction capability has
+moved, and the explicit `retry_errors` / `--retry-errors` flag (default off)
+each reopen it. Source files removed from the mounted tree are pruned from
+`files`, FTS and vector chunks — unless the walk found no files at all, which is
+treated as an unmounted or mistyped root rather than an instruction to empty the
+corpus. The job result reports `incomplete`, `capped`, `embedded_chunks` and
+`removed`, allowing callers to show authentic state.
 
 Service callers may additionally provide a confined `include_paths` list of
 relative file paths. The engine still scans the mounted tree to prune deletions,

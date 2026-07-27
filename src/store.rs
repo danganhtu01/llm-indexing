@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::model::{ProcessedFile, SearchHit};
 use crate::normalize::{fold, words, Normalizer};
-use crate::vision::VisionResult;
+use crate::pipeline::{row_complete, MAX_ATTEMPTS};
+use crate::vision::{FaceDetection, VisionResult};
 
 /// One entry per schema version, applied in order starting from wherever the
 /// database's own `PRAGMA user_version` says it is. Index 0 is version 1 — the
@@ -44,7 +45,10 @@ CREATE TABLE IF NOT EXISTS files(
   pages INTEGER,
   chars INTEGER,
   sha1 TEXT,
-  indexed_at REAL
+  indexed_at REAL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at REAL,
+  elapsed_ms INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_files_dir ON files(dir);
 CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext);
@@ -74,11 +78,49 @@ CREATE TABLE IF NOT EXISTS vision(
   caption TEXT,
   embedding BLOB, embedding_model TEXT, dimensions INTEGER,
   frames INTEGER,
-  elapsed_ms INTEGER, error TEXT
+  elapsed_ms INTEGER, error TEXT,
+  faces_model TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_vision_phash ON vision(phash);
+CREATE TABLE IF NOT EXISTS faces(
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  face_index INTEGER NOT NULL,
+  x INTEGER NOT NULL, y INTEGER NOT NULL,
+  width INTEGER NOT NULL, height INTEGER NOT NULL,
+  quality REAL NOT NULL,
+  embedding BLOB, dimensions INTEGER,
+  model TEXT NOT NULL,
+  frame INTEGER,
+  PRIMARY KEY(file_id, face_index)
+);
+CREATE INDEX IF NOT EXISTS idx_faces_file ON faces(file_id);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
+
+/// Columns added to `files` after the corpus format's first release, in the order
+/// they must be applied.
+///
+/// [`SCHEMA_V1`] is all `IF NOT EXISTS`, which is why new TABLES appear on a live
+/// corpus by themselves — but it never touches a `files` table that already
+/// exists, so a corpus keeps whatever column set it was created with. Every
+/// column added since therefore has to be re-added here, per corpus, at open.
+/// Kept as data rather than a script so the check is `PRAGMA table_info` and the
+/// migration is a no-op on a corpus that already has them: re-running is free,
+/// and a corpus written by a NEWER build than the one opening it keeps its extra
+/// columns untouched.
+const ADDED_FILE_COLUMNS: &[(&str, &str)] = &[
+    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_attempt_at", "REAL"),
+    ("elapsed_ms", "INTEGER"),
+];
+
+/// The same story for the `vision` table: [`SCHEMA`] created it once and never
+/// revisits it, so a column added later has to be re-added per corpus at open.
+///
+/// `faces_model` needs no backfill and must not get one. NULL is already the
+/// truthful value for every pre-existing row — nothing scanned those files for
+/// faces — and it is exactly what makes the first faces job pick them up.
+const ADDED_VISION_COLUMNS: &[(&str, &str)] = &[("faces_model", "TEXT")];
 
 /// P0-8: page anchoring on `chunks`. Both columns are nullable — `NULL` is
 /// what every extraction path that cannot attribute a chunk to a page (every
@@ -234,6 +276,140 @@ pub fn remove_database(out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Bring an existing `files` table up to the current column set.
+///
+/// Runs on every open, straight after [`SCHEMA`], and is a no-op once the columns
+/// are there — `ALTER TABLE ADD COLUMN` is a schema-only edit in SQLite, so on a
+/// corpus with hundreds of thousands of rows the columns themselves cost nothing
+/// and existing rows simply read back the declared default.
+///
+/// The one-off cost is the backfill, and it runs EXACTLY when the `attempts`
+/// column is first created — the column's own absence is the "this corpus has
+/// never been counted" evidence, so no separate marker can drift from it. All of
+/// it lands in one transaction: an ALTER that committed without its backfill
+/// would look counted while claiming every unfinished row had never been tried,
+/// and the whole corpus would be re-attempted [`MAX_ATTEMPTS`] more times before
+/// converging.
+///
+/// See [`attempts_backfill`] for what the stamped value means.
+fn migrate_files_table(connection: &Connection) -> Result<()> {
+    let present = existing_columns(connection, "files")?;
+    let missing = ADDED_FILE_COLUMNS
+        .iter()
+        .filter(|(name, _)| !present.contains(*name))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut script = String::from("BEGIN IMMEDIATE;\n");
+    for (name, declaration) in &missing {
+        script.push_str(&format!(
+            "ALTER TABLE files ADD COLUMN {name} {declaration};\n"
+        ));
+    }
+    if missing.iter().any(|(name, _)| *name == "attempts") {
+        script.push_str(&attempts_backfill());
+    }
+    script.push_str("COMMIT;");
+    connection
+        .execute_batch(&script)
+        .context("migrating the files table")?;
+    Ok(())
+}
+
+/// The column names an existing table already has, by `PRAGMA table_info`. The
+/// one source both migrations ask, so neither can drift into believing a column
+/// is there because a `CREATE TABLE IF NOT EXISTS` mentions it.
+fn existing_columns(connection: &Connection, table: &str) -> Result<HashSet<String>> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let present = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .flatten()
+        .collect::<HashSet<_>>();
+    Ok(present)
+}
+
+/// Bring an existing `vision` table up to the current column set — the same
+/// no-op-when-current, additive `ALTER TABLE ADD COLUMN` shape as
+/// [`migrate_files_table`], with no backfill to do (see
+/// [`ADDED_VISION_COLUMNS`]).
+///
+/// A corpus that predates the vision table has no `vision` table to migrate;
+/// [`SCHEMA`] has just created it with the current columns, so `present` already
+/// contains them and this returns immediately.
+fn migrate_vision_table(connection: &Connection) -> Result<()> {
+    let present = existing_columns(connection, "vision")?;
+    if present.is_empty() {
+        return Ok(());
+    }
+    let missing = ADDED_VISION_COLUMNS
+        .iter()
+        .filter(|(name, _)| !present.contains(*name))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut script = String::from("BEGIN IMMEDIATE;\n");
+    for (name, declaration) in &missing {
+        script.push_str(&format!(
+            "ALTER TABLE vision ADD COLUMN {name} {declaration};\n"
+        ));
+    }
+    script.push_str("COMMIT;");
+    connection
+        .execute_batch(&script)
+        .context("migrating the vision table")?;
+    Ok(())
+}
+
+/// What a corpus that predates the attempt counter is stamped with.
+///
+/// Every row it matches is one the resume predicate would re-process — the
+/// unfinished ones — and every one of them is the durable record of at least one
+/// completed attempt, timestamped by `indexed_at`. On the live corpora these rows
+/// have been re-attempted on every resume for as long as the corpus has existed;
+/// starting them at zero would assert the opposite and mandate
+/// [`MAX_ATTEMPTS`] more full passes over exactly the files that have never once
+/// succeeded. They are stamped as spent instead, so the first resume after this
+/// migration converges rather than re-burning them.
+///
+/// Nothing is closed off by that. A row re-opens when its file changes (size or
+/// mtime), when an upgrade makes a better extraction available (exhaustive OCR, a
+/// higher vision tier), when the embedding model changes, when
+/// [`crate::extract::extractor_revision`] moves because the build learned a new
+/// format, or when a run is submitted with `retry_errors`.
+///
+/// `excluded:` rows are left alone: they are terminal by decision, not by
+/// exhaustion, and stamping them as burned attempts would misreport why they were
+/// never processed.
+fn attempts_backfill() -> String {
+    format!(
+        "UPDATE files \
+            SET attempts = {MAX_ATTEMPTS}, last_attempt_at = indexed_at \
+          WHERE method NOT LIKE 'excluded:%' \
+            AND (method = 'name-only' \
+                 OR method LIKE 'error:%' \
+                 OR method LIKE '%-partial' \
+                 OR NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = files.id));"
+    )
+}
+
+/// One stored row as resume sees it: everything the skip predicate compares,
+/// nothing else. Returned by [`IndexStore::existing_keys`] keyed by path.
+#[derive(Debug, Clone)]
+pub struct ExistingRow {
+    pub size: u64,
+    /// Truncated to whole seconds (`mtime as i64`), the comparison every caller
+    /// makes; the column itself is a float.
+    pub mtime: i64,
+    pub method: String,
+    pub has_chunks: bool,
+    /// Attempts that have ended without finishing this row. Reset to 0 by a
+    /// finished outcome and by a change to the file's bytes, so it counts
+    /// CONSECUTIVE failures on the file as it stands rather than lifetime ones.
+    pub attempts: u32,
+}
+
 pub struct IndexStore {
     out: PathBuf,
     connection: Connection,
@@ -251,6 +427,18 @@ pub struct IndexStore {
     /// Set when a per-file rollback itself failed, leaving the open transaction
     /// in an unknown state. `finish` then discards it instead of committing.
     poisoned: bool,
+    /// The corpus' `vec0` shadow indexes, when it has any — EMPTY for every
+    /// corpus that has never been through `llm-index vector-index`, which is
+    /// every corpus by default and the reason nothing here costs anything
+    /// unless an operator asked for it. At most two: the exact slot and the
+    /// quantised one (`crate::vec0::Slot`).
+    ///
+    /// Held in memory because each is a pair of counts that has to move with the
+    /// rows: [`crate::vec0::IndexState::vectors`] and
+    /// [`crate::vec0::IndexState::chunks`] are what let a reader prove an index
+    /// still covers the corpus, so they are re-stamped inside the same per-file
+    /// savepoint that writes the chunks themselves.
+    vec0: Vec<crate::vec0::Maintained>,
 }
 
 impl IndexStore {
@@ -260,6 +448,12 @@ impl IndexStore {
         // addressed it.
         let root = database.parent().unwrap_or(Path::new(".")).to_path_buf();
         fs::create_dir_all(&root)?;
+        // Must precede the open: a connection only picks up the `vec0` module
+        // from SQLite's auto-extension list as it is created, so a writer opened
+        // first could not maintain a corpus that has a shadow index — it would
+        // fail on `no such module: vec0` mid-job. Inert for the corpora that
+        // have none, which is all of them by default.
+        crate::vec0::register();
         let connection = Connection::open(&database)?;
         // Journal mode is left at the rollback-journal default on purpose: the
         // corpus is copied and served as a bare single file, and WAL would add
@@ -281,6 +475,11 @@ impl IndexStore {
             connection.pragma_update(None, "synchronous", "NORMAL")?;
         }
         migrate(&connection).context("applying schema migrations")?;
+        // Only ever a no-op for a corpus this build created; the live ones were
+        // created by builds whose `files` table stops at `indexed_at`.
+        migrate_files_table(&connection)?;
+        // Likewise for `vision`, whose column set grew after the tiers shipped.
+        migrate_vision_table(&connection)?;
         // Self-description (previously the corpus was anonymous — after a
         // restart nothing recorded what produced it): created_at once, plus
         // per-job values the pipeline stamps via `set_meta`. `IF NOT EXISTS`
@@ -327,6 +526,12 @@ impl IndexStore {
         } else {
             None
         };
+        // Read BEFORE the write transaction opens, like the rest of open's
+        // inspection. A shadow index whose table exists but whose build never
+        // finished has no state to load, and is left exactly as it is: this job
+        // will not maintain a table it cannot vouch for, and the build the
+        // operator re-runs replaces it wholesale.
+        let vec0 = crate::vec0::maintained(&connection)?;
         connection.execute_batch("BEGIN IMMEDIATE")?;
         Ok(Self {
             out: root,
@@ -338,31 +543,31 @@ impl IndexStore {
             committed: Instant::now(),
             commit_batch: config.commit_batch.max(1),
             poisoned: false,
+            vec0,
         })
     }
 
-    pub fn existing_keys(&self) -> Result<HashMap<String, (u64, i64, String, bool)>> {
+    pub fn existing_keys(&self) -> Result<HashMap<String, ExistingRow>> {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT f.path,f.size,f.mtime,f.method,EXISTS(SELECT 1 FROM chunks c WHERE c.file_id=f.id) \
+                "SELECT f.path,f.size,f.mtime,f.method,EXISTS(SELECT 1 FROM chunks c WHERE c.file_id=f.id),\
+                 f.attempts \
                  FROM files f",
             )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)? as u64,
-                row.get::<_, f64>(2)? as i64,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)? != 0,
+                ExistingRow {
+                    size: row.get::<_, i64>(1)? as u64,
+                    mtime: row.get::<_, f64>(2)? as i64,
+                    method: row.get::<_, String>(3)?,
+                    has_chunks: row.get::<_, i64>(4)? != 0,
+                    attempts: row.get::<_, i64>(5)?.clamp(0, i64::from(u32::MAX)) as u32,
+                },
             ))
         })?;
-        Ok(rows
-            .flatten()
-            .map(|(path, size, mtime, method, has_chunks)| {
-                (path, (size, mtime, method, has_chunks))
-            })
-            .collect())
+        Ok(rows.flatten().collect())
     }
 
     /// Paths whose stored chunks carry NO page attribution at all — every
@@ -401,6 +606,25 @@ impl IndexStore {
         Ok(rows.flatten().collect())
     }
 
+    /// The face model recorded per file path, for the faces change-detection
+    /// rule. A path present with `None` was scanned by a build that wrote no
+    /// model id; a path ABSENT from the map has no vision row at all. Both mean
+    /// "not scanned by the pair this job runs", which is what the rule needs.
+    ///
+    /// A sibling of [`existing_vision_modes`](Self::existing_vision_modes)
+    /// rather than a widening of it: the pipeline only asks when a job has faces
+    /// enabled AND staged, so a corpus that never uses the feature never pays
+    /// for the scan.
+    pub fn existing_face_models(&self) -> Result<HashMap<String, Option<String>>> {
+        let mut statement = self.connection.prepare(
+            "SELECT f.path, v.faces_model FROM vision v JOIN files f ON f.id = v.file_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
     /// Delete rows for files that have disappeared — but ONLY under the job's
     /// own roots. A row outside every walked root was never visible to this
     /// job's walk, so its absence from `current` says nothing about the file:
@@ -430,15 +654,19 @@ impl IndexStore {
             .collect::<Vec<_>>();
         drop(statement);
         for (id, _) in &stale {
+            self.unindex_chunks_of(*id)?;
             self.connection
                 .execute("DELETE FROM chunks WHERE file_id=?1", [id])?;
             self.connection
                 .execute("DELETE FROM vision WHERE file_id=?1", [id])?;
             self.connection
+                .execute("DELETE FROM faces WHERE file_id=?1", [id])?;
+            self.connection
                 .execute("DELETE FROM fts WHERE rowid=?1", [id])?;
             self.connection
                 .execute("DELETE FROM files WHERE id=?1", [id])?;
         }
+        self.stamp_vec0()?;
         Ok(stale.len())
     }
 
@@ -467,7 +695,13 @@ impl IndexStore {
         // would never be repaired. Rolling back leaves the file absent instead,
         // which is precisely what makes resume redo it.
         self.connection.execute_batch("SAVEPOINT file")?;
+        // The shadow index' counts live in memory as well as in `meta`, and only
+        // the `meta` half is inside the savepoint. Snapshot them so a rolled-back
+        // file leaves both halves agreeing — a stranded in-memory count would be
+        // stamped onto the NEXT file and make the index look stale for good.
+        let vec0 = self.vec0.clone();
         if let Err(error) = self.write_rows(file, indexed_at) {
+            self.vec0 = vec0;
             if let Err(rollback) = self
                 .connection
                 .execute_batch("ROLLBACK TO file; RELEASE file")
@@ -491,6 +725,121 @@ impl IndexStore {
         Ok(())
     }
 
+    /// Count an attempt that produced nothing to store.
+    ///
+    /// The keep-on-failure path drops its result entirely to preserve a still
+    /// valid stored row, so without this the work it burned leaves no trace at
+    /// all: the row's `indexed_at` still points at the successful run that wrote
+    /// it, and a file whose upgrade fails on every resume looks, from the corpus,
+    /// like a file nobody has touched since it succeeded. Only the attempt
+    /// columns move; the row's content and `indexed_at` describe what is stored
+    /// and must keep describing it.
+    ///
+    /// Rides the store's open transaction like every other write here.
+    pub fn record_failed_attempt(&mut self, path: &str, elapsed_ms: u64, at: f64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE files SET attempts=attempts+1,last_attempt_at=?2,elapsed_ms=?3 WHERE path=?1",
+            params![path, at, elapsed_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Mirror one just-written `chunks` row into every shadow index the corpus
+    /// carries.
+    ///
+    /// A no-op — not a branch taken cheaply, but no work at all — for a corpus
+    /// without one, which is every corpus that has not been through
+    /// `llm-index vector-index`. That is what makes the indexes optional at
+    /// index time as well as at query time: a job on an unindexed corpus writes
+    /// exactly the rows it wrote before this existed.
+    ///
+    /// A chunk an index does not cover (another embedding model, another width)
+    /// is counted and not inserted, which is the same rule
+    /// [`crate::vec0::build`] applies. Both counters move here so the state a
+    /// reader validates against is written by the code that writes the rows.
+    /// Each index is encoded into its OWN tier from the same `f32` bytes, so a
+    /// corpus carrying both an exact and a quantised index stays consistent
+    /// across both without the caller knowing either exists.
+    fn index_chunk(&mut self, id: i64, embedding: &[u8]) -> Result<()> {
+        for index in &mut self.vec0 {
+            index.state.chunks += 1;
+            if index.state.model != crate::embedding::EMBEDDING_MODEL {
+                continue;
+            }
+            let Some(encoded) = index.state.encode(embedding) else {
+                continue;
+            };
+            index.state.vectors += 1;
+            crate::vec0::insert(&self.connection, index.state.tier, id, encoded.as_ref())?;
+        }
+        Ok(())
+    }
+
+    /// Drop a file's chunks out of every shadow index, ahead of the `DELETE`
+    /// that removes the rows themselves.
+    ///
+    /// Ahead, not after: the ids and the widths this needs live in the rows
+    /// being deleted, so reading them afterwards would read nothing and leave
+    /// an index holding vectors for chunks that no longer exist — which a later
+    /// k-NN would return as candidates and the re-score would silently drop,
+    /// quietly shrinking every result page near a re-indexed file.
+    fn unindex_chunks_of(&mut self, file_id: i64) -> Result<()> {
+        if self.vec0.is_empty() {
+            return Ok(());
+        }
+        let mut statement = self
+            .connection
+            .prepare("SELECT id,model,LENGTH(embedding) FROM chunks WHERE file_id=?1")?;
+        let doomed = statement
+            .query_map([file_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (id, row_model, length) in doomed {
+            for index in &mut self.vec0 {
+                let indexed =
+                    row_model == index.state.model && length as usize == index.state.dimensions * 4;
+                if indexed {
+                    crate::vec0::delete(&self.connection, index.slot, id)?;
+                    index.state.vectors = index.state.vectors.saturating_sub(1);
+                }
+                index.state.chunks = index.state.chunks.saturating_sub(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-stamp every shadow index' `meta` record from the in-memory counters.
+    ///
+    /// Called at the end of every unit of work that moved them, INSIDE that
+    /// unit's savepoint/transaction, so the counts a reader validates against
+    /// are published by exactly the commit that published the rows they
+    /// describe. A corpus without an index has nothing to stamp.
+    ///
+    /// The job stamp is re-read here rather than captured at open: the pipeline
+    /// writes `meta.last_job_started_at` AFTER opening the store, so a value
+    /// captured at open would be the PREVIOUS job's and leave this job's own
+    /// work looking like a foreign build's. Reading it back is one indexed row
+    /// lookup against the extraction cost of the file that triggered it.
+    fn stamp_vec0(&mut self) -> Result<()> {
+        // Checked before the lookup, not after: a corpus with no index must not
+        // pay a `meta` query per file for a stamp it will never write.
+        if self.vec0.is_empty() {
+            return Ok(());
+        }
+        let job = crate::vec0::job_stamp(&self.connection);
+        for index in &mut self.vec0 {
+            index.state.job = job.clone();
+            crate::vec0::write_state(&self.connection, index.slot, &index.state)?;
+        }
+        Ok(())
+    }
+
     /// Every database row one file contributes, run inside the caller's
     /// savepoint so the set lands whole or not at all.
     fn write_rows(&mut self, file: &ProcessedFile, indexed_at: f64) -> Result<()> {
@@ -505,18 +854,36 @@ impl IndexStore {
         let old = self
             .connection
             .query_row(
-                "SELECT id,size,mtime FROM files WHERE path=?1",
+                "SELECT id,size,mtime,attempts FROM files WHERE path=?1",
                 [&file.rec.path],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, f64>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )
             .ok();
-        let old_id = old.map(|(id, _, _)| id);
+        let old_id = old.map(|(id, _, _, _)| id);
+        // Byte-for-byte identical to the stored row, by the same truncated-mtime
+        // comparison resume uses. Needed twice below: the attempt counter and the
+        // vision carry-forward both key on it.
+        let unchanged = old.is_some_and(|(_, size, mtime, _)| {
+            size == file.rec.size as i64 && mtime as i64 == file.rec.mtime as i64
+        });
+        // A CHANGED file is a different file, whatever the path says, so it opens
+        // with a full budget rather than inheriting the failures of the bytes it
+        // replaced.
+        let attempts = if row_complete(&file.method, !file.chunks.is_empty()) {
+            0
+        } else if unchanged {
+            old.map_or(0, |(_, _, _, attempts)| attempts)
+                .saturating_add(1)
+        } else {
+            1
+        };
         // Capture the old vision row BEFORE the INSERT OR REPLACE below: the
         // bundled SQLite runs with foreign_keys ON, so replacing the files row
         // cascade-deletes its vision row. A carry-forward therefore has to
@@ -528,26 +895,49 @@ impl IndexStore {
                 .connection
                 .query_row(
                     "SELECT mode,width,height,phash,exif_json,quality_json,objects_json,\
-                     tags_json,caption,embedding,embedding_model,dimensions,frames,elapsed_ms,error \
-                     FROM vision WHERE file_id=?1",
+                     tags_json,caption,embedding,embedding_model,dimensions,frames,elapsed_ms,\
+                     error,faces_model FROM vision WHERE file_id=?1",
                     [old_id],
-                    |row| (0..15).map(|i| row.get::<_, rusqlite::types::Value>(i)).collect(),
+                    |row| {
+                        (0..16)
+                            .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                            .collect()
+                    },
                 )
                 .optional()?,
             _ => None,
         };
+        // The same capture for the face rows, on its own condition. Faces has to
+        // be asked separately because it is a sub-tier, not a tier: a job can run
+        // vision with faces OFF over a file whose faces were recorded by an
+        // earlier job, and the vision carry-forward above would not fire (this
+        // job DID produce a vision result). Dropping the rows then would make
+        // turning faces off destructive, which the rest of vision never is.
+        let carried_faces: Option<Vec<Vec<rusqlite::types::Value>>> = match old_id {
+            Some(old_id)
+                if file
+                    .vision
+                    .as_ref()
+                    .is_none_or(|result| result.faces_model.is_none()) =>
+            {
+                Some(self.stored_faces(old_id)?)
+            }
+            _ => None,
+        };
         if let Some(old_id) = old_id {
+            self.unindex_chunks_of(old_id)?;
             self.connection
                 .execute("DELETE FROM chunks WHERE file_id=?1", [old_id])?;
             self.connection
                 .execute("DELETE FROM fts WHERE rowid=?1", [old_id])?;
         }
         self.connection.execute(
-            "INSERT OR REPLACE INTO files(path,drive,dir,name,ext,size,mtime,lang,method,ocr_used,pages,chars,sha1,indexed_at) \
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            "INSERT OR REPLACE INTO files(path,drive,dir,name,ext,size,mtime,lang,method,ocr_used,pages,chars,sha1,indexed_at,attempts,last_attempt_at,elapsed_ms) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![file.rec.path, file.rec.drive, file.rec.dir, file.rec.name, file.rec.ext,
                 file.rec.size as i64, file.rec.mtime, file.lang, file.method, file.ocr_used as i64,
-                file.pages as i64, file.content.chars().count() as i64, file.sha1, indexed_at])?;
+                file.pages as i64, file.content.chars().count() as i64, file.sha1, indexed_at,
+                attempts, indexed_at, file.elapsed_ms as i64])?;
         let id = self.connection.last_insert_rowid();
         self.connection.execute(
             "INSERT INTO fts(rowid,name,path,content,tokens) VALUES(?1,?2,?3,?4,?5)",
@@ -560,6 +950,7 @@ impl IndexStore {
             ],
         )?;
         for chunk in &file.chunks {
+            let embedding = crate::embedding::vector_to_bytes(&chunk.vector);
             self.connection.execute(
                 "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model,\
                  page_start,page_end) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -567,13 +958,14 @@ impl IndexStore {
                     id,
                     chunk.index as i64,
                     chunk.content,
-                    crate::embedding::vector_to_bytes(&chunk.vector),
+                    embedding,
                     chunk.vector.len() as i64,
                     crate::embedding::EMBEDDING_MODEL,
                     chunk.page_start.map(|value| value as i64),
                     chunk.page_end.map(|value| value as i64),
                 ],
             )?;
+            self.index_chunk(self.connection.last_insert_rowid(), &embedding)?;
         }
         // Vision reconciliation across the rowid change on resume. The REPLACE
         // above cascade-dropped any old vision row (foreign_keys ON):
@@ -585,31 +977,52 @@ impl IndexStore {
         match (&file.vision, old_id) {
             (Some(result), _) => {
                 self.upsert_vision(id, result)?;
+                if result.faces_model.is_some() {
+                    self.upsert_faces(id, &result.faces)?;
+                }
             }
             (None, Some(old_id)) => {
                 // Belt-and-braces: on a foreign_keys=OFF build the old row would
                 // survive under the stale id, so clear it before re-attaching.
                 self.connection
                     .execute("DELETE FROM vision WHERE file_id=?1", [old_id])?;
-                let unchanged = old.is_some_and(|(_, size, mtime)| {
-                    size == file.rec.size as i64 && mtime as i64 == file.rec.mtime as i64
-                });
                 if let (true, Some(values)) = (unchanged, carried_vision) {
-                    let mut row: Vec<rusqlite::types::Value> = Vec::with_capacity(16);
+                    let mut row: Vec<rusqlite::types::Value> = Vec::with_capacity(17);
                     row.push(rusqlite::types::Value::Integer(id));
                     row.extend(values);
                     self.connection.execute(
                         "INSERT OR REPLACE INTO vision(file_id,mode,width,height,phash,exif_json,\
                          quality_json,objects_json,tags_json,caption,embedding,embedding_model,\
-                         dimensions,frames,elapsed_ms,error) \
-                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                         dimensions,frames,elapsed_ms,error,faces_model) \
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                         rusqlite::params_from_iter(row),
                     )?;
                 }
             }
             (None, None) => {}
         }
-        Ok(())
+        // Face rows follow the same three-way rule as the vision row, evaluated
+        // on its own capture: scanned this run -> already written above;
+        // not scanned and the bytes are UNCHANGED -> carry the old rows forward
+        // (turning faces off, or running a plain OCR pass, must not erase them);
+        // not scanned and the bytes CHANGED -> leave them dropped, since boxes
+        // and vectors describing the previous content would now be a claim about
+        // a person that the file no longer supports.
+        if let Some(carried) = &carried_faces {
+            if let Some(old_id) = old_id {
+                // Belt-and-braces on a foreign_keys=OFF build, exactly as above:
+                // clear the stale id before deciding whether to re-attach. Only
+                // reachable when this run wrote no faces of its own, so it can
+                // never delete what was just written — including the case where
+                // SQLite hands the replaced row's freed rowid straight back.
+                self.connection
+                    .execute("DELETE FROM faces WHERE file_id=?1", [old_id])?;
+            }
+            if unchanged {
+                self.restore_faces(id, carried)?;
+            }
+        }
+        self.stamp_vec0()
     }
 
     /// The manifest/catalog/sidecar views of one stored file.
@@ -641,10 +1054,15 @@ impl IndexStore {
                 &file.content.chars().count().to_string(),
             ])?;
         }
+        // `excluded:` rows carry the name+dir fallback as content, same as
+        // `name-only`, and nothing was extracted from the file itself — a sidecar
+        // for one would be a `.txt` restating the filename next to every object
+        // file on the drive.
         if self.sidecar != "none"
             && !file.content.trim().is_empty()
             && !matches!(file.method.as_str(), "text" | "name-only")
             && !file.method.starts_with("error:")
+            && !file.method.starts_with("excluded:")
         {
             self.write_sidecar(file);
         }
@@ -679,6 +1097,12 @@ impl IndexStore {
             self.connection.execute_batch("ROLLBACK")?;
             anyhow::bail!("transaction discarded after a failed per-file rollback")
         }
+        // Unconditional, not only when files were written: this job stamped
+        // `meta.last_job_started_at` at its start, which is exactly the witness
+        // a reader compares the shadow index against. A run that wrote nothing
+        // would otherwise leave its own index looking stale — a maintained
+        // corpus must not lose its fast path to a no-op job.
+        self.stamp_vec0()?;
         self.connection.execute_batch("COMMIT")?;
         if let Some(writer) = &mut self.jsonl {
             writer.flush()?
@@ -714,8 +1138,9 @@ impl IndexStore {
             .map(|vector| crate::embedding::vector_to_bytes(vector));
         self.connection.execute(
             "INSERT OR REPLACE INTO vision(file_id,mode,width,height,phash,exif_json,quality_json,\
-             objects_json,tags_json,caption,embedding,embedding_model,dimensions,frames,elapsed_ms,error) \
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+             objects_json,tags_json,caption,embedding,embedding_model,dimensions,frames,elapsed_ms,\
+             error,faces_model) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 file_id,
                 vision.mode.as_str(),
@@ -733,8 +1158,76 @@ impl IndexStore {
                 vision.frames.map(|value| value as i64),
                 vision.elapsed_ms.map(|value| value as i64),
                 vision.error,
+                vision.faces_model,
             ],
         )?;
+        Ok(())
+    }
+
+    /// Replace the `faces` rows for `file_id` with `faces`.
+    ///
+    /// `face_index` is the position in the detector's deterministic best-first
+    /// order, so re-running the same file against the same models rewrites the
+    /// same rows. The old rows are deleted first rather than upserted over: a
+    /// re-analysis that finds FEWER faces must not leave the tail of the
+    /// previous one behind, still attributed to a file that no longer shows
+    /// those people.
+    pub fn upsert_faces(&self, file_id: i64, faces: &[FaceDetection]) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM faces WHERE file_id=?1", [file_id])?;
+        for (index, face) in faces.iter().enumerate() {
+            let embedding = face
+                .embedding
+                .as_ref()
+                .map(|vector| crate::embedding::vector_to_bytes(vector));
+            self.connection.execute(
+                "INSERT INTO faces(file_id,face_index,x,y,width,height,quality,embedding,\
+                 dimensions,model,frame) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    file_id,
+                    index as i64,
+                    face.x,
+                    face.y,
+                    face.width,
+                    face.height,
+                    face.quality,
+                    embedding,
+                    face.embedding.as_ref().map(|vector| vector.len() as i64),
+                    crate::vision::faces::FACE_MODEL_ID,
+                    face.frame,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The face rows recorded for `file_id`, in stored order — the capture half
+    /// of the carry-forward that has to survive the rowid change on a re-add.
+    fn stored_faces(&self, file_id: i64) -> Result<Vec<Vec<rusqlite::types::Value>>> {
+        let mut statement = self.connection.prepare(
+            "SELECT face_index,x,y,width,height,quality,embedding,dimensions,model,frame \
+             FROM faces WHERE file_id=?1 ORDER BY face_index",
+        )?;
+        let rows = statement.query_map([file_id], |row| {
+            (0..10)
+                .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Re-attach captured face rows under a new `file_id`.
+    fn restore_faces(&self, file_id: i64, faces: &[Vec<rusqlite::types::Value>]) -> Result<()> {
+        for face in faces {
+            let mut row: Vec<rusqlite::types::Value> = Vec::with_capacity(11);
+            row.push(rusqlite::types::Value::Integer(file_id));
+            row.extend(face.iter().cloned());
+            self.connection.execute(
+                "INSERT OR REPLACE INTO faces(file_id,face_index,x,y,width,height,quality,\
+                 embedding,dimensions,model,frame) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                rusqlite::params_from_iter(row),
+            )?;
+        }
         Ok(())
     }
 
@@ -761,6 +1254,11 @@ pub fn connect(index: &Path) -> Result<Connection> {
     } else {
         index.to_path_buf()
     };
+    // Before the open: `vec0` reaches a connection through SQLite's
+    // auto-extension list, consulted once as the connection is created, so a
+    // connection opened first could never query a corpus' shadow index. See
+    // [`crate::vec0::register`].
+    crate::vec0::register();
     let connection = Connection::open(path).context("opening index database")?;
     // A corpus can be read while a job is writing into it; wait out the writer's
     // commit instead of failing the query.
@@ -932,6 +1430,7 @@ mod tests {
             sha1: None,
             chunks: Vec::new(),
             vision: None,
+            elapsed_ms: 0,
             page_segments: Vec::new(),
         }
     }
@@ -1252,12 +1751,23 @@ mod tests {
 
         let store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
         let existing = store.existing_keys().unwrap();
-        let (_, _, method, has_chunks) = existing.get("/a/done.txt").unwrap();
-        assert_eq!(method, "text");
-        assert!(has_chunks, "a completed file is not redone on resume");
-        let (_, _, method, has_chunks) = existing.get("/a/broken.pdf").unwrap();
-        assert_eq!(method, "error:poppler");
-        assert!(!has_chunks, "an unfinished file must be visible as such");
+        let done = existing.get("/a/done.txt").unwrap();
+        assert_eq!(done.method, "text");
+        assert!(done.has_chunks, "a completed file is not redone on resume");
+        assert_eq!(
+            done.attempts, 0,
+            "a finished row carries no failed attempts"
+        );
+        let broken = existing.get("/a/broken.pdf").unwrap();
+        assert_eq!(broken.method, "error:poppler");
+        assert!(
+            !broken.has_chunks,
+            "an unfinished file must be visible as such"
+        );
+        assert_eq!(
+            broken.attempts, 1,
+            "the failure that wrote it counts as one"
+        );
     }
 
     #[test]
@@ -1372,5 +1882,881 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "vision row carried forward on unchanged bytes");
         assert_eq!(phash, "aaaaaaaaaaaaaaaa");
+    }
+
+    fn face(x: i32, quality: f32) -> FaceDetection {
+        FaceDetection {
+            x,
+            y: 5,
+            width: 64,
+            height: 80,
+            quality,
+            embedding: Some(vec![0.25, -0.5, 0.75]),
+            frame: None,
+        }
+    }
+
+    fn scanned_photo(path: &str, faces: Vec<FaceDetection>) -> ProcessedFile {
+        let mut file = sample_file(path);
+        file.vision = Some(VisionResult {
+            mode: VisionMode::Tags,
+            phash: Some("aaaaaaaaaaaaaaaa".into()),
+            faces,
+            faces_model: Some("yunet-sface".into()),
+            ..Default::default()
+        });
+        file
+    }
+
+    fn stored_face_rows(temp: &Path) -> Vec<(i64, i64, f64, i64, String, Option<i64>)> {
+        let connection = connect(temp).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT face_index,x,quality,dimensions,model,frame FROM faces \
+                 ORDER BY file_id,face_index",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows
+    }
+
+    #[test]
+    fn faces_round_trip_through_add_and_the_off_path_writes_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        // One scanned photo with two faces, one ordinary file with no vision.
+        store
+            .add(
+                &scanned_photo("/a/photo.jpg", vec![face(10, 0.98), face(90, 0.91)]),
+                0.0,
+            )
+            .unwrap();
+        store.add(&sample_file("/a/notes.txt"), 0.0).unwrap();
+        store.finish().unwrap();
+
+        assert_eq!(
+            stored_face_rows(temp.path()),
+            vec![
+                (0, 10, 0.98_f32 as f64, 3, "yunet-sface".to_string(), None),
+                (1, 90, 0.91_f32 as f64, 3, "yunet-sface".to_string(), None),
+            ]
+        );
+        let connection = connect(temp.path()).unwrap();
+        let stamped: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM vision WHERE faces_model='yunet-sface'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 1, "the scan is stamped on the vision row");
+        // The 128-d-shaped blob is little-endian f32, readable exactly as the
+        // chunk vectors are — the app's clustering pass reads it the same way.
+        let blob: Vec<u8> = connection
+            .query_row(
+                "SELECT embedding FROM faces WHERE face_index=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blob, crate::embedding::vector_to_bytes(&[0.25, -0.5, 0.75]));
+    }
+
+    #[test]
+    fn a_scan_that_found_nothing_is_recorded_as_a_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        store
+            .add(&scanned_photo("/a/landscape.jpg", Vec::new()), 0.0)
+            .unwrap();
+        store.finish().unwrap();
+        assert!(stored_face_rows(temp.path()).is_empty());
+        let connection = connect(temp.path()).unwrap();
+        let model: Option<String> = connection
+            .query_row("SELECT faces_model FROM vision", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(model.as_deref(), Some("yunet-sface"));
+    }
+
+    #[test]
+    fn re_scanning_replaces_rather_than_accumulates() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        store
+            .add(
+                &scanned_photo("/a/photo.jpg", vec![face(10, 0.98), face(90, 0.91)]),
+                0.0,
+            )
+            .unwrap();
+        store.finish().unwrap();
+        // A re-scan that finds ONE face must leave one row, not two: the tail of
+        // the previous scan would otherwise keep claiming a person is in this file.
+        let mut store = IndexStore::open(temp.path(), &off_config(), true, false).unwrap();
+        store
+            .add(&scanned_photo("/a/photo.jpg", vec![face(10, 0.99)]), 1.0)
+            .unwrap();
+        store.finish().unwrap();
+        let rows = stored_face_rows(temp.path());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, 0);
+    }
+
+    #[test]
+    fn turning_faces_off_keeps_the_rows_but_changed_bytes_drop_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        store
+            .add(&scanned_photo("/a/photo.jpg", vec![face(10, 0.98)]), 0.0)
+            .unwrap();
+        store.finish().unwrap();
+
+        // Resume with faces OFF but vision still ON over identical bytes: the
+        // vision row is rewritten by THIS job, so the face rows only survive
+        // because they are carried forward on their own condition.
+        let mut store = IndexStore::open(temp.path(), &off_config(), true, false).unwrap();
+        let mut faces_off = sample_file("/a/photo.jpg");
+        faces_off.vision = Some(VisionResult {
+            mode: VisionMode::Tags,
+            phash: Some("aaaaaaaaaaaaaaaa".into()),
+            ..Default::default()
+        });
+        store.add(&faces_off, 1.0).unwrap();
+        store.finish().unwrap();
+        assert_eq!(
+            stored_face_rows(temp.path()).len(),
+            1,
+            "turning faces off must not delete faces"
+        );
+
+        // Same again, but the bytes changed: the faces described the old content,
+        // so they go.
+        let mut store = IndexStore::open(temp.path(), &off_config(), true, false).unwrap();
+        let mut changed = sample_file("/a/photo.jpg");
+        changed.rec.size = 999;
+        changed.rec.mtime = 123.0;
+        store.add(&changed, 2.0).unwrap();
+        store.finish().unwrap();
+        assert!(
+            stored_face_rows(temp.path()).is_empty(),
+            "stale faces must be dropped on content change"
+        );
+    }
+
+    #[test]
+    fn pruning_a_vanished_file_takes_its_faces_with_it() {
+        let temp = tempfile::tempdir().unwrap();
+        // Walker-shaped paths: `prune_missing` matches root prefixes with the
+        // platform separator, so a POSIX literal would prune nothing on Windows.
+        let separator = std::path::MAIN_SEPARATOR;
+        let root = format!("{separator}a");
+        let gone = format!("{root}{separator}photo.jpg");
+        let mut store = IndexStore::open(temp.path(), &off_config(), false, false).unwrap();
+        store
+            .add(&scanned_photo(&gone, vec![face(10, 0.98)]), 0.0)
+            .unwrap();
+        store.finish().unwrap();
+        assert_eq!(stored_face_rows(temp.path()).len(), 1);
+
+        let mut store = IndexStore::open(temp.path(), &off_config(), true, false).unwrap();
+        let removed = store.prune_missing(&[root], &HashSet::new()).unwrap();
+        store.finish().unwrap();
+        assert_eq!(removed, 1);
+        assert!(
+            stored_face_rows(temp.path()).is_empty(),
+            "a file that is gone takes the faces attributed to it with it"
+        );
+    }
+
+    /// The `vision` table exactly as the shipped tiers created it — no
+    /// `faces_model`. Written out in full for the same reason as
+    /// [`LEGACY_SCHEMA`]: a fixture derived from [`SCHEMA`] would track the
+    /// current columns and silently stop testing the migration.
+    const PRE_FACES_VISION_SCHEMA: &str = "\
+CREATE TABLE vision(
+  file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL,
+  width INTEGER, height INTEGER,
+  phash TEXT,
+  exif_json TEXT, quality_json TEXT,
+  objects_json TEXT,
+  tags_json TEXT,
+  caption TEXT,
+  embedding BLOB, embedding_model TEXT, dimensions INTEGER,
+  frames INTEGER,
+  elapsed_ms INTEGER, error TEXT
+);
+";
+
+    #[test]
+    fn opening_a_pre_faces_corpus_adds_faces_model_and_keeps_the_vision_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.sqlite");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(LEGACY_SCHEMA).unwrap();
+            connection.execute_batch(PRE_FACES_VISION_SCHEMA).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO files(id,path,method,size,mtime,indexed_at) \
+                     VALUES(1,'/a/photo.jpg','text',10,0.0,1700.0)",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO vision(file_id,mode,phash) VALUES(1,'tags','abcdabcdabcdabcd')",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // Opening a STORE over it migrates in place (that is where the schema is
+        // applied): the column appears, the existing tier/phash survive, and
+        // `faces_model` is NULL — the truthful value, and exactly what makes the
+        // first faces job pick the file up.
+        IndexStore::open(&path, &off_config(), true, false)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let connection = connect(&path).unwrap();
+        let (mode, phash, faces_model): (String, String, Option<String>) = connection
+            .query_row(
+                "SELECT mode,phash,faces_model FROM vision WHERE file_id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(mode, "tags");
+        assert_eq!(phash, "abcdabcdabcdabcd");
+        assert_eq!(faces_model, None);
+        // The faces table itself arrives by `CREATE TABLE IF NOT EXISTS`, like
+        // every other new table here, and starts empty.
+        let faces: i64 = connection
+            .query_row("SELECT COUNT(*) FROM faces", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(faces, 0);
+        drop(connection);
+
+        // Idempotent: a second open is a no-op, not a duplicate-column error.
+        IndexStore::open(&path, &off_config(), true, false)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let connection = connect(&path).unwrap();
+        let columns = existing_columns(&connection, "vision").unwrap();
+        assert!(columns.contains("faces_model"));
+        assert_eq!(
+            columns.iter().filter(|name| *name == "faces_model").count(),
+            1
+        );
+    }
+
+    /// The `files` table exactly as every corpus on disk was created: no attempt
+    /// columns, because the release that wrote them had none. Written out in full
+    /// rather than derived from [`SCHEMA`] — the whole point of the migration is
+    /// the gap between the two, and a fixture that tracks the current schema
+    /// would close that gap silently.
+    const LEGACY_SCHEMA: &str = "\
+CREATE TABLE files(
+  id INTEGER PRIMARY KEY, path TEXT UNIQUE, drive TEXT, dir TEXT, name TEXT, ext TEXT,
+  size INTEGER, mtime REAL, lang TEXT, method TEXT, ocr_used INTEGER, pages INTEGER,
+  chars INTEGER, sha1 TEXT, indexed_at REAL
+);
+CREATE TABLE chunks(
+  id INTEGER PRIMARY KEY,
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL, content TEXT NOT NULL, embedding BLOB NOT NULL,
+  dimensions INTEGER NOT NULL, model TEXT NOT NULL, UNIQUE(file_id, chunk_index)
+);
+";
+
+    /// A pre-migration corpus holding one row of every shape the live corpora
+    /// hold: a finished file with its chunk, the three unfinished shapes that are
+    /// re-attempted on every resume, and a terminal `excluded:` row.
+    fn legacy_corpus(destination: &Path) {
+        let connection = Connection::open(destination).unwrap();
+        connection.execute_batch(LEGACY_SCHEMA).unwrap();
+        for (id, path, method) in [
+            (1, "/a/done.txt", "text"),
+            (2, "/a/broken.pdf", "error:poppler"),
+            (3, "/a/photo.heic", "name-only-partial"),
+            (4, "/a/build.o", "name-only"),
+            (5, "/a/~$memo.docx", "excluded:office-lock"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO files(id,path,method,size,mtime,indexed_at) \
+                     VALUES(?1,?2,?3,10,0.0,1700.0)",
+                    params![id, path, method],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO chunks(file_id,chunk_index,content,embedding,dimensions,model) \
+                 VALUES(1,0,'text',X'00',2,'m')",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn attempt_columns(destination: &Path) -> Vec<(String, i64, Option<f64>)> {
+        let connection = connect(destination).unwrap();
+        let mut statement = connection
+            .prepare("SELECT path,attempts,last_attempt_at FROM files ORDER BY id")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows
+    }
+
+    #[test]
+    fn opening_a_legacy_corpus_adds_the_attempt_columns_and_stamps_the_unfinished_rows() {
+        // The migration a live corpus gets on its first open by this build. The
+        // unfinished rows — the ~69% re-attempted on every resume — are stamped as
+        // spent, so the resume right after the deploy converges instead of
+        // re-burning them MAX_ATTEMPTS more times. Finished and `excluded:` rows
+        // are left at zero: neither has ever failed.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        legacy_corpus(&destination);
+
+        IndexStore::open(&destination, &off_config(), true, false)
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        assert_eq!(
+            attempt_columns(&destination),
+            vec![
+                ("/a/done.txt".into(), 0, None),
+                (
+                    "/a/broken.pdf".into(),
+                    i64::from(MAX_ATTEMPTS),
+                    Some(1700.0)
+                ),
+                (
+                    "/a/photo.heic".into(),
+                    i64::from(MAX_ATTEMPTS),
+                    Some(1700.0)
+                ),
+                ("/a/build.o".into(), i64::from(MAX_ATTEMPTS), Some(1700.0)),
+                ("/a/~$memo.docx".into(), 0, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_migration_is_idempotent_across_reopens() {
+        // Every open runs it, so it has to be free the second time AND must not
+        // re-stamp: a row that has since succeeded is back at zero attempts, and a
+        // backfill that fired again would declare it spent.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        legacy_corpus(&destination);
+        IndexStore::open(&destination, &off_config(), true, false)
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        // The repair a later resume performs: the file finally extracted, so its
+        // row is finished and its counter reset.
+        connect(&destination)
+            .unwrap()
+            .execute(
+                "UPDATE files SET method='pdf',attempts=0,last_attempt_at=NULL \
+                 WHERE path='/a/broken.pdf'",
+                [],
+            )
+            .unwrap();
+
+        for _ in 0..2 {
+            IndexStore::open(&destination, &off_config(), true, false)
+                .unwrap()
+                .finish()
+                .unwrap();
+        }
+
+        let after = attempt_columns(&destination);
+        assert_eq!(
+            after[1],
+            ("/a/broken.pdf".into(), 0, None),
+            "a repaired row must not be re-stamped by a later open"
+        );
+        assert_eq!(
+            after[2],
+            (
+                "/a/photo.heic".into(),
+                i64::from(MAX_ATTEMPTS),
+                Some(1700.0)
+            ),
+            "and the rows stamped once must not climb on every open"
+        );
+    }
+
+    #[test]
+    fn a_corpus_this_build_created_needs_no_migration() {
+        // The other half of idempotency: SCHEMA already carries the columns, so a
+        // fresh corpus must come out of open with nothing stamped — the backfill
+        // fires on the column's creation, and here it was never absent.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        let mut failed = sample_file("/a/broken.pdf");
+        failed.method = "error:poppler".into();
+        store.add(&failed, 1700.0).unwrap();
+        store.finish().unwrap();
+
+        IndexStore::open(&destination, &off_config(), true, false)
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        assert_eq!(
+            attempt_columns(&destination),
+            vec![("/a/broken.pdf".into(), 1, Some(1700.0))],
+            "the row's own single failure, not a backfill"
+        );
+    }
+
+    #[test]
+    fn attempts_accumulate_on_failure_and_reset_on_success() {
+        // What makes the cap reachable at all. A file that keeps failing counts
+        // up; the run that finally reads it puts the counter back to zero so a
+        // later failure gets the full budget again.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut failed = sample_file("/a/broken.pdf");
+        failed.method = "error:poppler".into();
+        failed.elapsed_ms = 4200;
+        for expected in 1..=3 {
+            let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+            store.add(&failed, 1700.0).unwrap();
+            store.finish().unwrap();
+            assert_eq!(
+                attempt_columns(&destination)[0].1,
+                expected,
+                "each failing attempt counts once"
+            );
+        }
+        let elapsed: i64 = connect(&destination)
+            .unwrap()
+            .query_row("SELECT elapsed_ms FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(elapsed, 4200, "an error row carries what it cost");
+
+        let mut fixed = sample_file("/a/broken.pdf");
+        fixed.method = "pdf".into();
+        fixed.chunks = vec![chunk(0)];
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store.add(&fixed, 1800.0).unwrap();
+        store.finish().unwrap();
+        assert_eq!(attempt_columns(&destination)[0].1, 0);
+    }
+
+    #[test]
+    fn changed_bytes_open_a_fresh_attempt_budget() {
+        // The row's failures belong to the bytes that produced them. A file that
+        // has since been rewritten is a different file at the same path, so it
+        // starts its own count rather than inheriting a spent one.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut failed = sample_file("/a/broken.pdf");
+        failed.method = "error:poppler".into();
+        for _ in 0..3 {
+            let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+            store.add(&failed, 1700.0).unwrap();
+            store.finish().unwrap();
+        }
+        assert_eq!(attempt_columns(&destination)[0].1, 3);
+
+        let mut rewritten = failed.clone();
+        rewritten.rec.size = 999;
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store.add(&rewritten, 1800.0).unwrap();
+        store.finish().unwrap();
+        assert_eq!(
+            attempt_columns(&destination)[0].1,
+            1,
+            "new bytes, first failure"
+        );
+    }
+
+    /// A corpus with BOTH shadow indexes over `dimensions`-wide vectors, built
+    /// from whatever `chunks` already holds.
+    ///
+    /// Both, because the writer has to keep whatever it finds in step and the
+    /// interesting failure is maintaining one slot and forgetting the other.
+    /// The tiers differ only in their encoder, which has its own tests; what
+    /// these exercise is that every maintenance site walks the whole set.
+    fn indexed_corpus(destination: &Path, dimensions: usize) {
+        let mut connection = connect(destination).unwrap();
+        for tier in [crate::vec0::Tier::Float, crate::vec0::Tier::Int8] {
+            crate::vec0::build(
+                &mut connection,
+                tier,
+                crate::embedding::EMBEDDING_MODEL,
+                dimensions,
+                |_, _| {},
+            )
+            .unwrap();
+        }
+    }
+
+    /// `(rows in the index, recorded state)` for one slot of a corpus on disk.
+    fn shadow(destination: &Path, slot: crate::vec0::Slot) -> (i64, crate::vec0::IndexState) {
+        let connection = connect(destination).unwrap();
+        let rows = connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {}", slot.table()),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (
+            rows,
+            crate::vec0::state(&connection, slot).unwrap().unwrap(),
+        )
+    }
+
+    /// A file carrying `count` chunks whose vectors are 2 floats wide, matching
+    /// [`chunk`].
+    fn embedded_file(path: &str, count: usize) -> ProcessedFile {
+        let mut file = sample_file(path);
+        file.chunks = (0..count).map(chunk).collect();
+        file
+    }
+
+    /// The same, 8 floats wide — the narrowest a `bit` index can pack, and the
+    /// only reason this exists.
+    fn wide_file(path: &str, count: usize) -> ProcessedFile {
+        let mut file = sample_file(path);
+        file.chunks = (0..count)
+            .map(|index| crate::embedding::EmbeddedChunk {
+                index,
+                content: format!("chunk {index}"),
+                vector: (0..8)
+                    .map(|dimension| (index as f32 + 1.0) * 0.1 - dimension as f32 * 0.05)
+                    .collect(),
+                page_start: None,
+                page_end: None,
+            })
+            .collect();
+        file
+    }
+
+    #[test]
+    fn an_index_job_maintains_a_centring_index_through_its_own_quantiser() {
+        // The `bit` tier's writer path. It differs from every other index only
+        // in needing the corpus centre to encode at all, so the failure this
+        // catches is a writer that mirrors rows into it without one — which
+        // would leave the counts moving and the vectors not.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&wide_file("/a/one.txt", 2), 0.0).unwrap();
+        store.finish().unwrap();
+        let mut connection = connect(&destination).unwrap();
+        crate::vec0::build(
+            &mut connection,
+            crate::vec0::Tier::Bit,
+            crate::embedding::EMBEDDING_MODEL,
+            8,
+            |_, _| {},
+        )
+        .unwrap();
+        drop(connection);
+
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store.add(&wide_file("/a/two.txt", 3), 1.0).unwrap();
+        store.finish().unwrap();
+
+        let (rows, state) = shadow(&destination, crate::vec0::Slot::Quantised);
+        assert_eq!(rows, 5, "the job's own chunks were quantised and stored");
+        assert_eq!(state.vectors, 5);
+        assert_eq!(state.chunks, 5);
+        // One byte per vector, which is the tier actually doing its job rather
+        // than the writer having fallen back to something wider.
+        let bytes: i64 = connect(&destination)
+            .unwrap()
+            .query_row(
+                &format!(
+                    "SELECT LENGTH(embedding) FROM {} LIMIT 1",
+                    crate::vec0::Slot::Quantised.table()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, 1);
+        let connection = connect(&destination).unwrap();
+        assert!(matches!(
+            crate::vec0::usable(
+                &connection,
+                crate::vec0::Slot::Quantised,
+                crate::embedding::EMBEDDING_MODEL,
+                8
+            )
+            .unwrap(),
+            crate::vec0::Usable::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn a_job_leaves_a_centring_index_alone_when_its_centre_has_gone() {
+        // Half-maintaining is worse than not maintaining: the chunk count would
+        // climb while the vector count stood still, so an index a reader already
+        // declines would also start lying about itself. The writer skips it.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&wide_file("/a/one.txt", 2), 0.0).unwrap();
+        store.finish().unwrap();
+        let mut connection = connect(&destination).unwrap();
+        crate::vec0::build(
+            &mut connection,
+            crate::vec0::Tier::Bit,
+            crate::embedding::EMBEDDING_MODEL,
+            8,
+            |_, _| {},
+        )
+        .unwrap();
+        connection
+            .execute(
+                "DELETE FROM meta WHERE key=?1",
+                [crate::vec0::Slot::Quantised.centre_key()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store.add(&wide_file("/a/two.txt", 3), 1.0).unwrap();
+        store.finish().unwrap();
+
+        let (rows, state) = shadow(&destination, crate::vec0::Slot::Quantised);
+        assert_eq!(rows, 2, "untouched");
+        assert_eq!(state.vectors, 2, "and its own numbers are untouched too");
+        assert_eq!(state.chunks, 2);
+    }
+
+    #[test]
+    fn an_index_job_keeps_an_existing_shadow_index_in_step_with_the_chunks() {
+        // Incremental maintenance, end to end through the writer that jobs use:
+        // new chunks are mirrored as they are written, a re-indexed file's old
+        // vectors go with its old rows, and the recorded counts move with both
+        // so a reader can still prove the index covers the corpus.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&embedded_file("/a/one.txt", 2), 0.0).unwrap();
+        store.finish().unwrap();
+        indexed_corpus(&destination, 2);
+        for slot in crate::vec0::Slot::ALL {
+            assert_eq!(shadow(&destination, slot).0, 2, "{slot:?}");
+        }
+
+        // A later job adds a file and re-indexes the first with fewer chunks.
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store.add(&embedded_file("/a/two.txt", 3), 1.0).unwrap();
+        let mut shrunk = embedded_file("/a/one.txt", 1);
+        shrunk.rec.size = 999; // changed bytes, so the row is genuinely replaced
+        store.add(&shrunk, 1.0).unwrap();
+        store.finish().unwrap();
+
+        let live: i64 = connect(&destination)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+            .unwrap();
+        for slot in crate::vec0::Slot::ALL {
+            let (rows, state) = shadow(&destination, slot);
+            assert_eq!(
+                rows, 4,
+                "3 new + 1 replacement, the old 2 removed; {slot:?}"
+            );
+            assert_eq!(state.vectors, 4, "{slot:?}");
+            // The witness a reader checks: recorded == live chunk count.
+            assert_eq!(live as usize, state.chunks, "{slot:?}");
+        }
+    }
+
+    #[test]
+    fn a_pruned_file_takes_its_vectors_out_of_the_shadow_index() {
+        // The other deletion path. Without it a k-NN keeps nominating chunks of
+        // a file that no longer exists, and every such candidate is dropped by
+        // the re-score — silently shortening result pages.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        // Walker-shaped paths: `prune_missing` matches root prefixes with the
+        // platform separator, so a POSIX literal would prune nothing on Windows.
+        let separator = std::path::MAIN_SEPARATOR;
+        let root = format!("{separator}a");
+        let kept = format!("{root}{separator}kept.txt");
+        let gone = format!("{root}{separator}gone.txt");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&embedded_file(&kept, 1), 0.0).unwrap();
+        store.add(&embedded_file(&gone, 2), 0.0).unwrap();
+        store.finish().unwrap();
+        indexed_corpus(&destination, 2);
+
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        let pruned = store
+            .prune_missing(&[root], &HashSet::from([kept]))
+            .unwrap();
+        store.finish().unwrap();
+
+        assert_eq!(pruned, 1);
+        for slot in crate::vec0::Slot::ALL {
+            let (rows, state) = shadow(&destination, slot);
+            assert_eq!(rows, 1, "{slot:?}");
+            assert_eq!(state.vectors, 1, "{slot:?}");
+            assert_eq!(state.chunks, 1, "{slot:?}");
+        }
+    }
+
+    #[test]
+    fn a_rolled_back_file_leaves_the_shadow_index_counts_where_it_found_them() {
+        // `add` rolls a failed file back, and the index' counts live in memory
+        // as well as in the transaction. A count stranded by the failure would
+        // be stamped onto the NEXT file and mark the index stale for good.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&embedded_file("/a/good.txt", 1), 0.0).unwrap();
+        store.finish().unwrap();
+        indexed_corpus(&destination, 2);
+
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_second_chunk BEFORE INSERT ON chunks \
+                 WHEN NEW.chunk_index = 1 \
+                 BEGIN SELECT RAISE(ABORT,'simulated chunk write failure'); END",
+            )
+            .unwrap();
+        store
+            .add(&embedded_file("/a/broken.txt", 2), 1.0)
+            .unwrap_err();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_second_chunk")
+            .unwrap();
+        store.add(&embedded_file("/a/later.txt", 1), 1.0).unwrap();
+        store.finish().unwrap();
+
+        let connection = connect(&destination).unwrap();
+        for slot in crate::vec0::Slot::ALL {
+            let (rows, state) = shadow(&destination, slot);
+            assert_eq!(rows, 2, "the failed file left nothing behind; {slot:?}");
+            assert_eq!(state.vectors, 2, "{slot:?}");
+            assert_eq!(state.chunks, 2, "{slot:?}");
+            assert!(
+                matches!(
+                    crate::vec0::usable(&connection, slot, crate::embedding::EMBEDDING_MODEL, 2)
+                        .unwrap(),
+                    crate::vec0::Usable::Ready(_)
+                ),
+                "{slot:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_corpus_without_a_shadow_index_gains_neither_table_nor_marker() {
+        // The default. An index job on an unindexed corpus writes exactly what
+        // it wrote before the index existed — no table, no `meta` key, and
+        // nothing in the write path that fires.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let separator = std::path::MAIN_SEPARATOR;
+        let root = format!("{separator}a");
+        let only = format!("{root}{separator}one.txt");
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&embedded_file(&only, 2), 0.0).unwrap();
+        store
+            .prune_missing(&[root], &HashSet::from([only]))
+            .unwrap();
+        store.finish().unwrap();
+
+        let connection = connect(&destination).unwrap();
+        for slot in crate::vec0::Slot::ALL {
+            assert!(
+                !crate::vec0::present(&connection, slot).unwrap(),
+                "{slot:?}"
+            );
+            assert!(
+                crate::vec0::state(&connection, slot).unwrap().is_none(),
+                "{slot:?}"
+            );
+            assert!(
+                matches!(
+                    crate::vec0::usable(&connection, slot, crate::embedding::EMBEDDING_MODEL, 2)
+                        .unwrap(),
+                    crate::vec0::Usable::Absent
+                ),
+                "{slot:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kept_row_still_records_the_attempt_that_was_thrown_away() {
+        // Keep-on-failure writes nothing, so without this the run that re-read,
+        // re-OCR'd and re-embedded the file and then discarded the result leaves
+        // no trace of having spent anything. The row's own content and
+        // `indexed_at` must not move — they describe what is stored.
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("corpus.sqlite");
+        let mut good = sample_file("/a/report.pdf");
+        good.method = "pdf".into();
+        good.chunks = vec![chunk(0)];
+        let mut store = IndexStore::open(&destination, &off_config(), false, false).unwrap();
+        store.add(&good, 1700.0).unwrap();
+        store.finish().unwrap();
+
+        let mut store = IndexStore::open(&destination, &off_config(), true, false).unwrap();
+        store
+            .record_failed_attempt("/a/report.pdf", 9000, 1800.0)
+            .unwrap();
+        store.finish().unwrap();
+
+        let (method, indexed_at, attempts, last, elapsed): (String, f64, i64, f64, i64) =
+            connect(&destination)
+                .unwrap()
+                .query_row(
+                    "SELECT method,indexed_at,attempts,last_attempt_at,elapsed_ms FROM files",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+        assert_eq!(method, "pdf", "the kept row keeps its content");
+        assert_eq!(indexed_at, 1700.0, "and the time that content was indexed");
+        assert_eq!(attempts, 1);
+        assert_eq!(last, 1800.0);
+        assert_eq!(elapsed, 9000, "the burned time is now measurable");
     }
 }
