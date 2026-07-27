@@ -30,6 +30,7 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
         max_pending: 2,
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
+        submit_token: None,
     })
     .unwrap();
 
@@ -135,6 +136,7 @@ fn guard_router_with_config(
         max_pending: 2,
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
+        submit_token: None,
     })
     .unwrap()
 }
@@ -648,6 +650,7 @@ async fn corpus_tree_rejects_an_unknown_root() {
         max_pending: 2,
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
+        submit_token: None,
     })
     .unwrap();
 
@@ -676,6 +679,7 @@ async fn corpus_surface_degrades_to_empty_before_any_index_job() {
         max_pending: 2,
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
+        submit_token: None,
     })
     .unwrap();
 
@@ -722,6 +726,7 @@ async fn corpus_tree_status_and_document_text_join_the_published_database() {
         max_pending: 2,
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
+        submit_token: None,
     })
     .unwrap();
 
@@ -789,6 +794,7 @@ async fn corpus_status_reports_pending_files_from_meta_not_a_tree_walk() {
         max_pending: 2,
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
+        submit_token: None,
     })
     .unwrap();
 
@@ -842,6 +848,7 @@ async fn corpus_status_reports_embedded_chunks_when_the_table_exists() {
         max_pending: 2,
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
+        submit_token: None,
     })
     .unwrap();
 
@@ -889,6 +896,7 @@ async fn corpus_status_pending_files_never_goes_negative() {
         max_pending: 2,
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
+        submit_token: None,
     })
     .unwrap();
 
@@ -929,6 +937,7 @@ fn vision_router(vision_max: VisionMode) -> axum::Router {
         max_pending: 2,
         max_body: 1024 * 1024,
         vision_max,
+        submit_token: None,
     })
     .unwrap()
 }
@@ -1081,6 +1090,7 @@ async fn settings_route_serves_the_capability_contract() {
         max_body: 1024 * 1024,
         // A high cap; with no models staged the endpoint still only offers `meta`.
         vision_max: VisionMode::Tags,
+        submit_token: None,
     })
     .unwrap();
 
@@ -1118,6 +1128,7 @@ fn runtime_app(input: &std::path::Path, output: &std::path::Path) -> axum::Route
         max_pending: 4,
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
+        submit_token: None,
     })
     .unwrap()
 }
@@ -1546,4 +1557,264 @@ async fn a_failed_embedder_load_is_retried_rather_than_disabling_search() {
     }
     assert_eq!(again["status"], "unavailable", "{again}");
     assert_eq!(again["retrying"], true, "{again}");
+}
+
+// ── Submit-token gate (serve --submit-token / LLM_SUBMIT_TOKEN) ──────────────
+//
+// Owner directive: every job routes through the web app, so the app holds
+// absolute control over the jobs. A gated engine accepts a job mutation only
+// with the app's `X-Submit-Token`; the read surface stays open so monitors and
+// the search proxy keep working tokenless. Flag and header names are shared
+// verbatim with vlm-indexing's identical gate so the app treats both engines
+// uniformly.
+
+const TOKEN: &str = "app-held-secret";
+
+fn gated_router(output: &std::path::Path, input: &std::path::Path) -> axum::Router {
+    fs::create_dir_all(input).unwrap();
+    fs::create_dir_all(output).unwrap();
+    router(ServiceConfig {
+        output_root: output.to_path_buf(),
+        allowed_roots: vec![input.to_path_buf()],
+        default_paths: vec![input.to_path_buf()],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers: 1,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
+        submit_token: Some(TOKEN.into()),
+    })
+    .unwrap()
+}
+
+/// POST with an optional `X-Submit-Token`. The header name is a literal on
+/// purpose: it is the wire contract the app is written against, so the tests
+/// pin the string rather than importing the constant they exist to verify.
+async fn post_with_token(
+    app: &axum::Router,
+    uri: &str,
+    body: Value,
+    token: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        request = request.header("X-Submit-Token", token);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn a_gated_submit_without_the_token_is_refused_with_nothing_created() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = gated_router(&output, &input);
+
+    // No header, a wrong token, and a SAME-LENGTH wrong token (which exercises
+    // the byte comparison rather than the length gate) are all the same 401.
+    for token in [None, Some("wrong-secret"), Some("app-held-secreT")] {
+        let (status, body) = post_with_token(
+            &app,
+            "/index",
+            json!({"id":"stopped","paths":[input.clone()],"output":"corpus.sqlite","ocr":"off"}),
+            token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{token:?}: {body}");
+        // The body names the header, so a refused integrator learns what to
+        // send rather than just that they were refused.
+        assert_eq!(body["header"], "X-Submit-Token", "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("X-Submit-Token"),
+            "{body}"
+        );
+    }
+
+    // Refused BEFORE the handler ran, so nothing was created: no in-memory job
+    // and no persisted envelope (this GET falls back to `jobs.sqlite`, so one
+    // 404 rules out both).
+    let (status, _) = get_json_status(&app, "/jobs/stopped").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_gated_submit_with_the_correct_token_is_accepted_and_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = gated_router(&output, &input);
+    fs::write(input.join("hello.txt"), "compliance report").unwrap();
+    // An existing corpus without resume/overwrite makes the admitted job fail
+    // fast and deterministically — before the (network-fetched) embedding
+    // model is ever touched. What is under test is that the token ADMITS the
+    // job; the "already exists" verdict is proof it was truly queued and run.
+    write_stale_corpus(&output.join("corpus.sqlite"));
+
+    let (status, body) = post_with_token(
+        &app,
+        "/index",
+        json!({"id":"admitted","paths":[input],"output":"corpus.sqlite","ocr":"off"}),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    // The tokenless polling inside `wait_for_job` doubles as proof the job GET
+    // stays open while the engine is gated.
+    let job = wait_for_job(&app, "admitted").await;
+    assert_eq!(job["status"], "error", "{job}");
+    assert!(
+        job["error"].as_str().unwrap().contains("already exists"),
+        "{job}"
+    );
+}
+
+#[tokio::test]
+async fn a_gated_cancel_requires_the_same_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = gated_router(&output, &input);
+
+    let (status, body) = post_with_token(&app, "/jobs/any-id/cancel", json!({}), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["header"], "X-Submit-Token", "{body}");
+
+    // With the token the request reaches the real handler, whose verdict for
+    // an unknown id is the ordinary 404 — the gate never shadows it.
+    let (status, _) = post_with_token(&app, "/jobs/any-id/cancel", json!({}), Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn gated_runtime_posts_require_the_token_and_a_refusal_applies_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = gated_router(&output, &input);
+
+    let (status, _) = post_with_token(&app, "/runtime", json!({"extract": 7}), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // The refused write really applied nothing: the tokenless GET (open, like
+    // every read) still reports the configured default.
+    assert_eq!(
+        get_json(&app, "/runtime").await["stages"]["extract"]["value"],
+        json!(1)
+    );
+
+    let (status, body) =
+        post_with_token(&app, "/runtime", json!({"extract": 7}), Some(TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stages"]["extract"]["value"], json!(7));
+
+    // The per-job POST sits behind the same gate; with the token it answers
+    // its ordinary 404 for an unknown job.
+    let (status, _) =
+        post_with_token(&app, "/jobs/nope/runtime", json!({"extract": 2}), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = post_with_token(
+        &app,
+        "/jobs/nope/runtime",
+        json!({"extract": 2}),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_read_surface_stays_open_while_gated() {
+    // The other half of the contract: gating the writes must cost the app's
+    // search proxy, monitor panels and read tools nothing — none of them holds
+    // the token.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = gated_router(&output, &input);
+
+    assert_eq!(get(&app, "/health").await.status(), StatusCode::OK);
+    assert_eq!(get(&app, "/settings").await.status(), StatusCode::OK);
+    assert_eq!(get(&app, "/runtime").await.status(), StatusCode::OK);
+    assert_eq!(
+        get(&app, "/corpus/tree?root=input").await.status(),
+        StatusCode::OK
+    );
+    let status = get_json(&app, "/corpus/status").await;
+    assert_eq!(status["indexed_files"], 0, "{status}");
+    // 404 (the handler's verdict), not 401 (the gate's): the read got through.
+    let (status, _) = get_json_status(&app, "/jobs/never-existed").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // A blank q reaches /corpus/search's own validation — its 400, not a 401 —
+    // without arming the (network-fetched) query embedder.
+    let (status, body) = get_json_status(&app, "/corpus/search?q=").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("q is required"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn an_ungated_serve_accepts_tokenless_submits_exactly_as_before() {
+    // Back-compat is the contract: without --submit-token the gate is not even
+    // installed, so a bare submit — and one carrying a stray token header —
+    // behaves exactly as today.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = guard_router(&output, &input);
+    fs::write(input.join("hello.txt"), "compliance report").unwrap();
+    write_stale_corpus(&output.join("corpus.sqlite"));
+
+    let (status, _) = post_with_token(
+        &app,
+        "/index",
+        json!({"id":"open-1","paths":[input.clone()],"output":"corpus.sqlite","ocr":"off"}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    // A header nobody asked for is ignored, not validated.
+    let (status, _) = post_with_token(
+        &app,
+        "/index",
+        json!({"id":"open-2","paths":[input],"output":"corpus.sqlite","ocr":"off"}),
+        Some("stray-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn an_empty_submit_token_refuses_to_serve() {
+    // An empty secret is a gate any caller passes with an empty header — worse
+    // than no gate, because it looks locked. Startup is the only honest place
+    // to say so.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let error = router(ServiceConfig {
+        output_root: temp.path().join("output"),
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers: 1,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
+        submit_token: Some(String::new()),
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("submit-token"), "{error}");
 }
