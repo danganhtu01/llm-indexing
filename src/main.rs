@@ -83,6 +83,11 @@ struct IndexArgs {
     workers: Option<usize>,
     #[arg(long)]
     max_bytes: Option<u64>,
+    /// Resource headroom percent (0..=50; cross-engine contract, see the
+    /// `headroom` module). Wins over the YAML `headroom_pct`; 0 turns the
+    /// feature fully off.
+    #[arg(long, value_parser = headroom_pct_parser())]
+    headroom: Option<u8>,
     /// Vision analysis tier: off (default), meta, tags, or captions.
     #[arg(long, value_enum)]
     vision: Option<VisionMode>,
@@ -279,6 +284,22 @@ struct ServeArgs {
     /// existed.
     #[arg(long = "submit-token")]
     submit_token: Option<String>,
+    /// Resource headroom percent (0..=50): leave that share of the machine
+    /// free while jobs run — BelowNormal process priority plus CPU-thread caps
+    /// on every stage (the cross-engine contract in the `headroom` module).
+    /// Wins over the YAML `headroom_pct`; unset defers to it; 0 turns the
+    /// feature fully off. Passed by the drives-analytics app.
+    #[arg(long, value_parser = headroom_pct_parser())]
+    headroom: Option<u8>,
+}
+
+/// clap range validator for `--headroom`, built from the SAME
+/// `settings::HEADROOM_PCT_RANGE` bounds `Config::finalize` clamps the YAML
+/// value to, so the flag and the config field can never accept different
+/// ranges.
+fn headroom_pct_parser() -> clap::builder::RangedI64ValueParser<u8> {
+    let (min, max) = llm_indexing::settings::HEADROOM_PCT_RANGE;
+    clap::value_parser!(u8).range(i64::from(min)..=i64::from(max))
 }
 
 #[derive(Args)]
@@ -481,6 +502,14 @@ fn index(args: IndexArgs) -> Result<()> {
     if let Some(max_bytes) = args.max_bytes {
         config.max_bytes = max_bytes
     }
+    // `--headroom` wins over the YAML `headroom_pct`. The caps derive inside
+    // the `config.finalize()` that `run_index` runs; the priority class is the
+    // one process-wide effect and belongs here, before any work starts. A zero
+    // effective percent changes nothing — including the priority.
+    config.override_headroom(args.headroom);
+    if config.headroom_pct > 0 {
+        llm_indexing::headroom::lower_process_priority();
+    }
     if let Some(vision) = args.vision {
         config.vision.max = vision
     }
@@ -643,6 +672,22 @@ fn serve(args: ServeArgs) -> Result<()> {
             .ok()
             .filter(|token| !token.is_empty())
     });
+    // Resolve the effective headroom percent now (flag over YAML, the same
+    // precedence `router` applies per job) because the ONE process-wide effect
+    // — BelowNormal priority — must land at startup, before any job runs, and
+    // every child the jobs spawn then inherits it. An unreadable config reads
+    // as "no YAML value" here; the per-job path reports the config error
+    // itself.
+    let effective_headroom = args.headroom.unwrap_or_else(|| {
+        args.config
+            .as_deref()
+            .and_then(|path| Config::load(Some(path)).ok())
+            .map(|config| config.headroom_pct)
+            .unwrap_or(0)
+    });
+    if effective_headroom > 0 {
+        llm_indexing::headroom::lower_process_priority();
+    }
     let config = ServiceConfig {
         output_root: args.output_root,
         allowed_roots,
@@ -654,6 +699,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         max_body: args.max_body,
         vision_max,
         submit_token,
+        headroom_pct: args.headroom,
     };
     let address: SocketAddr = args.listen.parse().context("--listen must be HOST:PORT")?;
     let runtime = tokio::runtime::Runtime::new()?;
@@ -940,4 +986,52 @@ fn env_paths(key: &str, default: &str) -> Vec<PathBuf> {
         .filter(|part| !part.is_empty())
         .map(PathBuf::from)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--headroom` parses on `serve`, `0..=50` enforced at the parser (the
+    /// same `settings::HEADROOM_PCT_RANGE` bounds `Config::finalize` clamps
+    /// the YAML value to), absent meaning "defer to YAML".
+    #[test]
+    fn serve_headroom_flag_parses_and_enforces_the_contract_range() {
+        let cli = Cli::try_parse_from(["llm-index", "serve", "--headroom", "10"]).unwrap();
+        let Command::Serve(args) = cli.command else {
+            panic!("expected the serve subcommand")
+        };
+        assert_eq!(args.headroom, Some(10));
+
+        let cli = Cli::try_parse_from(["llm-index", "serve"]).unwrap();
+        let Command::Serve(args) = cli.command else {
+            panic!("expected the serve subcommand")
+        };
+        assert_eq!(args.headroom, None, "unset defers to the YAML headroom_pct");
+
+        // 0 is a VALID value — the explicit off that outranks a YAML percent —
+        // while anything above the contract ceiling is refused at parse time.
+        let cli = Cli::try_parse_from(["llm-index", "serve", "--headroom", "0"]).unwrap();
+        let Command::Serve(args) = cli.command else {
+            panic!("expected the serve subcommand")
+        };
+        assert_eq!(args.headroom, Some(0));
+        assert!(Cli::try_parse_from(["llm-index", "serve", "--headroom", "51"]).is_err());
+        assert!(Cli::try_parse_from(["llm-index", "serve", "--headroom", "-1"]).is_err());
+    }
+
+    /// The native `index` command shares the flag (the CLI mode runs the same
+    /// pipeline), with the same bounds.
+    #[test]
+    fn index_headroom_flag_parses_with_the_same_range() {
+        let cli =
+            Cli::try_parse_from(["llm-index", "index", "C:/data", "--headroom", "50"]).unwrap();
+        let Command::Index(args) = cli.command else {
+            panic!("expected the index subcommand")
+        };
+        assert_eq!(args.headroom, Some(50));
+        assert!(
+            Cli::try_parse_from(["llm-index", "index", "C:/data", "--headroom", "99"]).is_err()
+        );
+    }
 }

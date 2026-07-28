@@ -135,12 +135,24 @@ impl RuntimeKnobs {
     /// Seed from a [`Config`], preserving today's effective behaviour exactly:
     /// `extract` from `workers`, ONNX width from the same `workers`-derived
     /// value it used to be hardcoded to, OCR from the OpenMP default.
+    ///
+    /// Under headroom (`Config::headroom_cores_cap`) the OCR seed is capped at
+    /// the core cap — the OpenMP default is "every core", which is exactly the
+    /// number headroom exists to stay under. The cap lands on the SEED only:
+    /// a later `POST /runtime` retune is the operator's own explicit act and
+    /// clamps against `OCR_RANGE` as it always has (headroom is deliberately
+    /// not a runtime stage — see the module header for why the stage set is
+    /// closed). `extract`/`embed` need no cap here because `Config::finalize`
+    /// already capped `workers`/`embed_workers` before they arrive.
     pub fn from_config(config: &Config) -> Self {
         Self {
             extract: AtomicUsize::new(clamp(config.workers, EXTRACT_RANGE)),
             embed: AtomicUsize::new(clamp(config.embed_workers, EMBED_RANGE)),
             ocr: AtomicUsize::new(clamp(
-                config.ocr_threads.unwrap_or_else(default_ocr_threads),
+                crate::headroom::capped(
+                    config.ocr_threads.unwrap_or_else(default_ocr_threads),
+                    config.headroom_cores_cap(),
+                ),
                 OCR_RANGE,
             )),
             embed_intra_threads: AtomicUsize::new(clamp(
@@ -673,6 +685,26 @@ mod tests {
         let mut config = Config::default();
         config.embed_intra_threads = Some(3);
         assert_eq!(RuntimeKnobs::from_config(&config).embed_intra_threads(), 3);
+    }
+
+    #[test]
+    fn headroom_caps_the_ocr_seed_only_when_active() {
+        // Item: the tesseract OMP_THREAD_LIMIT derivation is held under the
+        // headroom core cap. An explicit `ocr_threads: 64` pins the derivation
+        // so the assertion does not depend on this machine's OMP environment.
+        let mut config = Config::default();
+        config.ocr_threads = Some(64);
+        assert_eq!(
+            RuntimeKnobs::from_config(&config).ocr(),
+            64,
+            "headroom off must leave the derivation untouched"
+        );
+        config.headroom_pct = 50;
+        let cap = config.headroom_cores_cap().expect("headroom is on");
+        assert_eq!(
+            RuntimeKnobs::from_config(&config).ocr(),
+            64_usize.min(cap).clamp(OCR_RANGE.0, OCR_RANGE.1)
+        );
     }
 
     #[test]

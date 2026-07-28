@@ -1650,6 +1650,7 @@ dependencies = [
  "unicode-normalization",
  "uuid",
  "whisper-rs",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

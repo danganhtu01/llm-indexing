@@ -67,6 +67,13 @@ pub struct ServiceConfig {
     /// app could neither pause nor cancel. Read-only routes are deliberately
     /// not gated — see [`require_submit_token`].
     pub submit_token: Option<String>,
+    /// Resource headroom percent (`serve --headroom`, `0..=50`): `Some` wins
+    /// over the YAML `headroom_pct` for every job this server runs; `None`
+    /// defers to the YAML value (default 0 = feature off). Config/CLI only by
+    /// contract — deliberately NOT a runtime stage (see the `runtime.rs`
+    /// module header) and not advertised by `GET /settings`; the app that
+    /// passes the flag already knows it did. See [`crate::headroom`].
+    pub headroom_pct: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +151,11 @@ struct AppState {
     /// Default worker count this serve process runs jobs with; advertised by
     /// `GET /settings` as `workers.default`.
     workers: usize,
+    /// Effective headroom core cap (flag over YAML, resolved once at startup),
+    /// or `None` when the feature is off. Submit holds an explicit per-job
+    /// `workers` under it, because that path writes the job's runtime snapshot
+    /// directly and never passes through `Config::finalize`.
+    headroom_cores_cap: Option<usize>,
     /// Lazily loaded query-side embedding model, shared by every
     /// `/corpus/search?mode=semantic` request.
     embedder: Arc<QueryEmbedder>,
@@ -186,7 +198,7 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
     // published corpus untouched when a job cannot run. Turning it into a
     // startup panic would take the whole service down for a fault the job-level
     // path already handles correctly.
-    let defaults = {
+    let (defaults, headroom_cores_cap) = {
         let mut config = match Config::load(normalized.config_path.as_deref()) {
             Ok(config) => config,
             Err(error) => {
@@ -199,7 +211,19 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
             }
         };
         config.workers = clamp_workers(normalized.workers);
-        Arc::new(RuntimeKnobs::from_config(&config))
+        // `serve --headroom` wins over the YAML `headroom_pct`, then finalize
+        // re-derives the caps so the stage defaults (extract target, embedder
+        // pool, tesseract's OMP seed) start under the core cap. Idempotent on
+        // top of the finalize `Config::load` already ran; a no-op when the
+        // feature is off. The resolved cap rides along for submit, which must
+        // hold an explicit per-job `workers` under the SAME cap (it bypasses
+        // `Config::finalize` by writing into the job's runtime snapshot).
+        config.override_headroom(normalized.headroom_pct);
+        config.finalize();
+        (
+            Arc::new(RuntimeKnobs::from_config(&config)),
+            config.headroom_cores_cap(),
+        )
     };
     // P0-11: open (or create) the persisted job store before anything else
     // touches `jobs`, sweep any row a previous process left non-terminal, and
@@ -252,6 +276,7 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         vision_max: normalized.vision_max,
         config_path: normalized.config_path.clone(),
         workers: normalized.workers,
+        headroom_cores_cap,
         embedder: Arc::new(QueryEmbedder::new(normalized.config_path.clone())),
         jobs_store,
     };
@@ -708,11 +733,17 @@ async fn submit(State(state): State<AppState>, Json(mut request): Json<JobReques
     // must not retune this job behind the caller's back.
     let runtime = Arc::new(state.defaults.snapshot());
     // An explicit per-job `workers` is the caller stating this job's extract
-    // width, so it outranks the process-wide default it was snapshotted from.
+    // width, so it outranks the process-wide default it was snapshotted from —
+    // but not the headroom cap: this write lands on the runtime snapshot
+    // directly, never passing through `Config::finalize`, so the cap has to be
+    // applied here or a job submitted with `workers` would silently escape it.
     if let Some(workers) = request.workers {
         let _ = runtime.apply(&Map::from_iter([(
             crate::runtime::EXTRACT.to_string(),
-            json!(clamp_workers(workers)),
+            json!(crate::headroom::capped(
+                clamp_workers(workers),
+                state.headroom_cores_cap
+            )),
         )]));
     }
     state.runtimes.write().await.insert(id.clone(), runtime);
@@ -1144,6 +1175,11 @@ fn run_job(
     // must fail with the old corpus still on disk.
     let overwrite = request.overwrite && !request.resume;
     let mut config = Config::load(service.config_path.as_deref())?;
+    // `serve --headroom` wins over the YAML `headroom_pct` for every job. The
+    // caps themselves land in the `config.finalize()` that `run_index` runs
+    // after the per-job mutations below, so the order here only has to put the
+    // effective percent on the config before that point.
+    config.override_headroom(service.headroom_pct);
     config.ocr = request.ocr;
     config.ocr_langs = request
         .ocr_langs
