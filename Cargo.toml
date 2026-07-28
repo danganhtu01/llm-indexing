@@ -57,5 +57,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 whisper-rs = "0.16"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# Resource headroom (`--headroom`): SetPriorityClass(BELOW_NORMAL_PRIORITY_CLASS)
+# on our own process at startup so index jobs yield to interactive work (see
+# `src/headroom.rs`). Version matches one already in the dependency tree so this
+# adds no second windows-sys build.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
