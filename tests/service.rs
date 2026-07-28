@@ -926,6 +926,167 @@ async fn corpus_status_pending_files_never_goes_negative() {
     assert_eq!(status["pending_files"], 0, "{status}");
 }
 
+// ── GET /export/corpus ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn export_corpus_404s_before_any_index_job_has_published_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = guard_router(&output, &input);
+
+    let response = get(&app, "/export/corpus").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("no corpus"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn export_corpus_rejects_an_unconfined_output_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = guard_router(&output, &input);
+
+    let traversal = get(&app, "/export/corpus?output=../escape.sqlite").await;
+    assert_eq!(traversal.status(), StatusCode::BAD_REQUEST);
+
+    let wrong_ext = get(&app, "/export/corpus?output=corpus.db").await;
+    assert_eq!(wrong_ext.status(), StatusCode::BAD_REQUEST);
+
+    // The job-store reservation applies here exactly like every other corpus
+    // route: `jobs.sqlite` is P0-11's persisted job envelope store, not a
+    // corpus, and must never be handed out as one.
+    let reserved = get(&app, "/export/corpus?output=jobs.sqlite").await;
+    assert_eq!(reserved.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn export_corpus_reports_an_unreadable_database_rather_than_a_hollow_export() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = guard_router(&output, &input);
+    fs::write(
+        output.join("corpus.sqlite"),
+        b"this is not a sqlite database",
+    )
+    .unwrap();
+
+    let response = get(&app, "/export/corpus").await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"], "corpus database unreadable", "{body}");
+}
+
+#[tokio::test]
+async fn export_corpus_streams_a_consistent_vacuumed_copy_of_the_published_database() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    let app = router(ServiceConfig {
+        output_root: output.clone(),
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input.clone()],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers: 1,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
+    })
+    .unwrap();
+
+    write_fixture_corpus(&output, input.join("indexed.txt").to_str().unwrap());
+
+    let response = get(&app, "/export/corpus").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/vnd.sqlite3"
+    );
+    assert_eq!(
+        response.headers().get("content-disposition").unwrap(),
+        "attachment; filename=\"corpus.sqlite\""
+    );
+    let bytes = to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+
+    // The bytes must be a genuine, independently openable SQLite database
+    // holding the same rows as the published corpus — not merely a non-empty
+    // blob — and the scratch copy `VACUUM INTO` wrote it to must be gone.
+    let copy_path = temp.path().join("downloaded.sqlite");
+    fs::write(&copy_path, &bytes).unwrap();
+    let connection = rusqlite::Connection::open(&copy_path).unwrap();
+    let path: String = connection
+        .query_row("SELECT path FROM files WHERE id = 1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(path, input.join("indexed.txt").to_str().unwrap());
+    let content: String = connection
+        .query_row("SELECT content FROM fts WHERE rowid = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(content.contains("laundering"), "{content}");
+
+    // Mutating the published corpus after export must not retroactively
+    // change the bytes already returned — proving this was a point-in-time
+    // copy, not a handle onto the live file.
+    let live = rusqlite::Connection::open(output.join("corpus.sqlite")).unwrap();
+    live.execute("DELETE FROM files WHERE id = 1", []).unwrap();
+    drop(live);
+    let still_there: i64 = connection
+        .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(still_there, 1);
+}
+
+#[tokio::test]
+async fn export_corpus_leaves_no_scratch_file_behind_in_the_system_temp_directory() {
+    // A raw before/after diff of the whole system temp directory is racy under
+    // the default parallel test runner — unrelated tests create and remove
+    // their own `tempfile::tempdir()`s at the same moment, and any one caught
+    // mid-life reads as "this test leaked it". Instead, look for the one
+    // artifact only `vacuum_export` ever creates: a file named exactly
+    // `export.sqlite` inside some temp subdirectory. No other test or library
+    // in this suite writes that name, so this check stays specific regardless
+    // of how much unrelated tempdir churn is happening concurrently.
+    fn any_export_sqlite_under_temp() -> bool {
+        let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+            return false;
+        };
+        entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .any(|entry| entry.path().join("export.sqlite").exists())
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    let app = guard_router(&output, &input);
+    write_fixture_corpus(&output, input.join("indexed.txt").to_str().unwrap());
+
+    let response = get(&app, "/export/corpus").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+
+    assert!(
+        !any_export_sqlite_under_temp(),
+        "export left an export.sqlite scratch file under the system temp directory"
+    );
+}
+
 // ── Vision submit validation (--vision-max cap, unknown tier, missing models) ──
 //
 // All three reject at submit before the job is queued, so they never touch the
