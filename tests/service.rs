@@ -1000,6 +1000,8 @@ async fn export_corpus_streams_a_consistent_vacuumed_copy_of_the_published_datab
         max_pending: 2,
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
+        submit_token: None,
+        headroom_pct: None,
     })
     .unwrap();
 
