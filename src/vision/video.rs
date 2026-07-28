@@ -403,16 +403,22 @@ fn run_ffmpeg_frames(
 ) -> Result<Vec<PathBuf>, String> {
     let pattern = dir.join(format!("{prefix}-%06d.png"));
     let mut command = Command::new("ffmpeg");
-    command.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"]);
+    command.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"]);
+    // Under headroom (`VisionConfig::headroom_cores_cap`), `-threads
+    // <cores_cap>` on BOTH sides of `-i`: the flag is positional, so the
+    // input-side copy is the one that caps the video DECODER — where keyframe
+    // extraction burns its CPU — and the output-side copy caps the
+    // scale/select filtering and PNG encode. Both collapse to nothing at
+    // `headroom_pct == 0`, keeping the fixed argv this doc comment promises.
+    // See `headroom::ffmpeg_thread_args`.
+    command.args(crate::headroom::ffmpeg_thread_args(budget.threads));
+    command.arg("-i");
     command.arg(path);
     command.args(["-vf", filter]);
     if let Some(mode) = fps_mode {
         command.args(["-fps_mode", mode]);
     }
     command.args(["-frames:v", &budget.limit.max(1).to_string()]);
-    // `-threads <cores_cap>` under headroom (`VisionConfig::headroom_cores_cap`),
-    // nothing otherwise — the fixed argv this doc comment promises is unchanged
-    // at `headroom_pct == 0`. See `headroom::ffmpeg_thread_args`.
     command.args(crate::headroom::ffmpeg_thread_args(budget.threads));
     command.arg(&pattern);
     command

@@ -740,16 +740,23 @@ impl Config {
         self.embed_workers = self
             .embed_workers
             .clamp(crate::runtime::EMBED_RANGE.0, crate::runtime::EMBED_RANGE.1);
-        // Resource headroom (`headroom_pct` > 0): cap the extract worker target
-        // and the embedder pool at the derived core cap, and hand the cap to the
-        // vision sub-tiers (whose builders see a `&VisionConfig`, not `Config`).
-        // `cores_cap >= 1` always, so neither value can fall below the minimum
-        // its clamp above just established. At pct == 0 the cap is `None` and
-        // every line here is a no-op — the legacy path, untouched.
-        let cap = self.headroom_cores_cap();
-        self.workers = crate::headroom::capped(self.workers, cap);
-        self.embed_workers = crate::headroom::capped(self.embed_workers, cap);
-        self.vision.headroom_cores_cap = cap;
+        // Resource headroom: finalize only DERIVES — it clamps the percent
+        // (above) and hands the core cap to the vision sub-tiers, whose
+        // builders see a `&VisionConfig`, not the whole `Config`. It must
+        // never overwrite the configured `workers`/`embed_workers` with capped
+        // values: `Config::load` finalizes under the YAML percent BEFORE a
+        // `--headroom` flag is applied (`override_headroom`), so a destructive
+        // write here would burn the YAML cap into the config where no later,
+        // lower flag could loosen it — `--headroom 0` against a YAML
+        // `{workers: 16, headroom_pct: 25}` would leave every derived width
+        // stuck capped. The caps instead land at READ time, where the percent
+        // in effect at USE time decides: [`RuntimeKnobs::from_config`] (the
+        // extract/embed seeds), [`Config::resolved_embed_intra_threads`], and
+        // `Transcriber::new`. At pct == 0 the cap is `None` and every reader
+        // sees the configured values untouched.
+        //
+        // [`RuntimeKnobs::from_config`]: crate::runtime::RuntimeKnobs::from_config
+        self.vision.headroom_cores_cap = self.headroom_cores_cap();
         // Clamp the OCR/vision knobs to the settings-surface bounds (their single
         // definition in `settings.rs`). Only per-job overrides are validated at
         // submit; without this a mis-set config base would flow unvalidated into
@@ -1240,7 +1247,13 @@ mod tests {
     }
 
     #[test]
-    fn finalize_caps_workers_and_the_embed_pool_under_headroom() {
+    fn finalize_derives_the_cap_without_overwriting_configured_widths() {
+        // The caps land at READ time (`RuntimeKnobs::from_config` and the
+        // resolved_* accessors), NEVER by rewriting the configured values:
+        // `Config::load` finalizes under the YAML percent before a CLI flag
+        // can override it, so a destructive write here would leave a lower
+        // flag unable to loosen the YAML cap (the F1 regression, pinned end
+        // to end in `runtime::tests`).
         let mut config = Config {
             workers: 64,
             embed_workers: 8,
@@ -1250,8 +1263,8 @@ mod tests {
         config.finalize();
         let cap = config.headroom_cores_cap().expect("headroom is on");
         assert!(cap >= 1, "cores_cap can never fall below one core");
-        assert_eq!(config.workers, 64_usize.min(cap));
-        assert_eq!(config.embed_workers, 8_usize.min(cap));
+        assert_eq!(config.workers, 64, "the configured value must survive");
+        assert_eq!(config.embed_workers, 8, "the configured value must survive");
         // The derived cap reaches the vision sub-tiers through the carrier
         // field finalize populates (their builders see a &VisionConfig).
         assert_eq!(config.vision.headroom_cores_cap, Some(cap));

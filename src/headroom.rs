@@ -28,20 +28,27 @@
 //!    ([`lower_process_priority`]); child processes (tesseract, ffmpeg,
 //!    magick, pdftoppm, antiword) inherit the class automatically, so the
 //!    subprocess fleet needs no per-spawn handling;
-//! 2. the extract worker target and embedder-pool size are capped in
-//!    `Config::finalize`;
+//! 2. the extract worker target and embedder-pool size are seeded UNDER the
+//!    cap at read time (`RuntimeKnobs::from_config` — the configured
+//!    `workers`/`embed_workers` are never rewritten, so a CLI flag can always
+//!    loosen a YAML percent), and the cap rides on every `RuntimeKnobs`
+//!    instance as a CEILING that `POST /runtime` retunes clamp to;
 //! 3. every ONNX intra-op width (embedding, CLIP, RF-DETR, YuNet/SFace) is
 //!    capped where the session is BUILT — see the session caches' doc
 //!    comments for the first-construction caveat;
 //! 4. the tesseract `OMP_THREAD_LIMIT` derivation and the whisper
 //!    `set_n_threads` derivation are capped;
-//! 5. every ffmpeg spawn gains `-threads <cores_cap>`
-//!    ([`ffmpeg_thread_args`]).
+//! 5. every ffmpeg spawn gains `-threads <cores_cap>` on BOTH sides of `-i`
+//!    (input-side caps the decoder, output-side the encoder/filters — see
+//!    [`ffmpeg_thread_args`] for why the position matters).
 //!
 //! Deliberately NOT a runtime stage: the app in front of these engines
 //! validates `GET /runtime` stage names strictly against its own copy of the
 //! stage list and rejects whole bodies on unknown keys (see the `runtime.rs`
-//! module header), so headroom is Config/CLI only.
+//! module header), so headroom is Config/CLI only. The one deliberate
+//! exemption is the interactive query-side search embedder — see
+//! `service::QueryEmbedder::spawn_load`: it serves the human the feature
+//! protects.
 
 /// `cores_cap` for a machine with `cores` logical cores at `pct` percent
 /// headroom: `max(1, floor(cores * (1 - pct/100)))`.
@@ -81,9 +88,16 @@ pub fn capped(value: usize, cap: Option<usize>) -> usize {
 /// `headroom_pct == 0` must be argv-identical to one from before the feature
 /// existed.
 ///
-/// Placed by callers as an OUTPUT option (before the output path), where
-/// ffmpeg applies it to encoding and filtering and — via the global thread
-/// setting — bounds the decoder pool it would otherwise size to every core.
+/// ffmpeg applies `-threads` POSITIONALLY: as an INPUT option (before `-i`)
+/// it caps the decoder's thread pool; as an output option (before the output
+/// path) it caps encoding and filtering. The decoder is the CPU-heavy half of
+/// every spawn in this crate (tiled-HEVC HEIC stills, video frame and
+/// keyframe extraction), and an output-side flag alone does NOT reach it —
+/// measured on ffmpeg 8.1.2 on this box: with only output-side `-threads 1` a
+/// decode still ran ~7.6x parallel, while input-side `-threads 1` serialized
+/// it. Callers therefore insert this fragment on BOTH sides of `-i`: the
+/// input-side copy bounds the decode, the output-side copy bounds the
+/// encode/filter work, and at `cap == None` both collapse to nothing.
 pub fn ffmpeg_thread_args(cap: Option<usize>) -> Vec<String> {
     match cap {
         Some(cap) => vec!["-threads".to_string(), cap.max(1).to_string()],

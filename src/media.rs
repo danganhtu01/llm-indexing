@@ -35,11 +35,11 @@ impl Transcriber {
             .flatten();
         Self {
             context,
-            // The legacy `workers.clamp(1, 8)` derivation, additionally held
-            // under the headroom core cap. Usually already below it — finalize
-            // caps `workers` first — but an un-finalized config must not leak
-            // a full-width whisper, so the cap is applied to the derivation
-            // itself rather than trusted transitively.
+            // The legacy `workers.clamp(1, 8)` derivation, held under the
+            // headroom core cap AT THIS READ — the configured `workers` is
+            // never rewritten by finalize (see `Config::finalize`), so the
+            // cap must be applied to the derivation itself, with the percent
+            // in effect at construction deciding.
             threads: crate::headroom::capped(
                 config.workers.clamp(1, 8),
                 config.headroom_cores_cap(),
@@ -63,11 +63,15 @@ impl Transcriber {
         let temp = tempdir()?;
         let wav = temp.path().join("audio.wav");
         let output = Command::new("ffmpeg")
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"])
+            // Under headroom, `-threads <cores_cap>` on BOTH sides of `-i`:
+            // the flag is positional, so only an input-side copy reaches the
+            // DECODER and only an output-side copy reaches the encode. Both
+            // collapse to nothing at pct 0. See `headroom::ffmpeg_thread_args`.
+            .args(crate::headroom::ffmpeg_thread_args(self.ffmpeg_threads))
+            .arg("-i")
             .arg(path)
             .args(["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
-            // `-threads <cores_cap>` under headroom, nothing otherwise (see
-            // `headroom::ffmpeg_thread_args`).
             .args(crate::headroom::ffmpeg_thread_args(self.ffmpeg_threads))
             .arg(&wav)
             .output()
