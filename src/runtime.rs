@@ -126,6 +126,13 @@ pub struct RuntimeKnobs {
     /// cannot reach it. Kept here rather than read from the `Config` directly so
     /// the embedder pool has a single place to consult for stage-ish numbers.
     embed_intra_threads: AtomicUsize,
+    /// The headroom core cap in effect when this instance was built
+    /// ([`Config::headroom_cores_cap`]), or `None` when the feature is off.
+    /// Not a stage and not writable over HTTP — it is the CEILING
+    /// [`RuntimeKnobs::apply`] holds the `extract`/`embed` targets under, and
+    /// [`snapshot`](RuntimeKnobs::snapshot) carries it onto every per-job copy
+    /// so a mid-job retune cannot escape it either.
+    headroom_cap: Option<usize>,
     /// Condvars belonging to [`Admission`]/[`EmbedderPool`] instances driven by
     /// these settings, woken on every change so a raise takes effect at once.
     subscribers: Mutex<Vec<Arc<Condvar>>>,
@@ -136,22 +143,30 @@ impl RuntimeKnobs {
     /// `extract` from `workers`, ONNX width from the same `workers`-derived
     /// value it used to be hardcoded to, OCR from the OpenMP default.
     ///
-    /// Under headroom (`Config::headroom_cores_cap`) the OCR seed is capped at
-    /// the core cap — the OpenMP default is "every core", which is exactly the
-    /// number headroom exists to stay under. The cap lands on the SEED only:
-    /// a later `POST /runtime` retune is the operator's own explicit act and
-    /// clamps against `OCR_RANGE` as it always has (headroom is deliberately
-    /// not a runtime stage — see the module header for why the stage set is
-    /// closed). `extract`/`embed` need no cap here because `Config::finalize`
-    /// already capped `workers`/`embed_workers` before they arrive.
+    /// Under headroom (`Config::headroom_cores_cap`) every seed is derived
+    /// UNDER the core cap at this read — the configured
+    /// `workers`/`embed_workers` themselves are never rewritten (see
+    /// `Config::finalize` for why a destructive cap there would break the
+    /// flag-over-YAML precedence), so the percent in effect when an instance
+    /// is built is the one that decides. The cap then stays on the instance as
+    /// a ceiling for later retunes — see [`RuntimeKnobs::apply`]. At pct == 0
+    /// the cap is `None` and both seeding and retuning are byte-identical
+    /// legacy.
     pub fn from_config(config: &Config) -> Self {
+        let cap = config.headroom_cores_cap();
         Self {
-            extract: AtomicUsize::new(clamp(config.workers, EXTRACT_RANGE)),
-            embed: AtomicUsize::new(clamp(config.embed_workers, EMBED_RANGE)),
+            extract: AtomicUsize::new(clamp(
+                crate::headroom::capped(config.workers, cap),
+                EXTRACT_RANGE,
+            )),
+            embed: AtomicUsize::new(clamp(
+                crate::headroom::capped(config.embed_workers, cap),
+                EMBED_RANGE,
+            )),
             ocr: AtomicUsize::new(clamp(
                 crate::headroom::capped(
                     config.ocr_threads.unwrap_or_else(default_ocr_threads),
-                    config.headroom_cores_cap(),
+                    cap,
                 ),
                 OCR_RANGE,
             )),
@@ -159,6 +174,7 @@ impl RuntimeKnobs {
                 config.resolved_embed_intra_threads(),
                 EMBED_INTRA_THREADS_RANGE,
             )),
+            headroom_cap: cap,
             subscribers: Mutex::new(Vec::new()),
         }
     }
@@ -166,12 +182,15 @@ impl RuntimeKnobs {
     /// A detached copy of the CURRENT values — how a job takes its starting
     /// point from the process-wide defaults without aliasing them, so a later
     /// `POST /runtime` does not retroactively retune jobs already in flight.
+    /// The headroom ceiling rides along: detaching the VALUES must not detach
+    /// the machine property that bounds them.
     pub fn snapshot(&self) -> Self {
         Self {
             extract: AtomicUsize::new(self.extract()),
             embed: AtomicUsize::new(self.embed()),
             ocr: AtomicUsize::new(self.ocr()),
             embed_intra_threads: AtomicUsize::new(self.embed_intra_threads()),
+            headroom_cap: self.headroom_cap,
             subscribers: Mutex::new(Vec::new()),
         }
     }
@@ -206,6 +225,16 @@ impl RuntimeKnobs {
     /// what actually landed by reading the returned view. Unknown stage names
     /// are an error naming the valid set, and NOTHING is applied in that case —
     /// a body with one typo does not half-land.
+    ///
+    /// Under headroom the `extract` and `embed` targets additionally clamp to
+    /// the [`headroom_cap`](RuntimeKnobs) ceiling, with exactly the same
+    /// silent-clamp semantics as the stage ranges. Headroom is a machine
+    /// property the operator set once for the whole box, not a per-job
+    /// suggestion, so neither a `POST /runtime` on the defaults nor a mid-job
+    /// `POST /jobs/{id}/runtime` may escape it — without this ceiling either
+    /// call would quietly un-cap the very fleet the feature exists to bound.
+    /// A retune BELOW the ceiling is honoured as ever, and at pct == 0 the cap
+    /// is `None` and this is byte-identical legacy clamping.
     pub fn apply(&self, body: &Map<String, Value>) -> Result<Value, String> {
         let unknown: Vec<&str> = body
             .keys()
@@ -224,12 +253,20 @@ impl RuntimeKnobs {
                 return Err(format!("stage {key} must be an integer"));
             };
             match key.as_str() {
-                EXTRACT => self
-                    .extract
-                    .store(clamp(requested, EXTRACT_RANGE), Ordering::Relaxed),
-                EMBED => self
-                    .embed
-                    .store(clamp(requested, EMBED_RANGE), Ordering::Relaxed),
+                EXTRACT => self.extract.store(
+                    clamp(
+                        crate::headroom::capped(requested, self.headroom_cap),
+                        EXTRACT_RANGE,
+                    ),
+                    Ordering::Relaxed,
+                ),
+                EMBED => self.embed.store(
+                    clamp(
+                        crate::headroom::capped(requested, self.headroom_cap),
+                        EMBED_RANGE,
+                    ),
+                    Ordering::Relaxed,
+                ),
                 OCR => self
                     .ocr
                     .store(clamp(requested, OCR_RANGE), Ordering::Relaxed),
@@ -705,6 +742,106 @@ mod tests {
             RuntimeKnobs::from_config(&config).ocr(),
             64_usize.min(cap).clamp(OCR_RANGE.0, OCR_RANGE.1)
         );
+    }
+
+    #[test]
+    fn a_zero_flag_fully_restores_widths_a_yaml_percent_had_capped() {
+        // F1 regression, exercising the REAL sequence: `Config::load` runs
+        // finalize under the YAML percent, THEN the CLI flag lands via
+        // `override_headroom`, then `run_index` finalizes again. Because
+        // finalize derives without overwriting `workers`/`embed_workers`, an
+        // explicit `--headroom 0` must leave every derived width exactly as if
+        // the YAML percent had never existed.
+        let mut config: Config = serde_yaml::from_str(
+            "workers: 16\nembed_workers: 8\nembed_intra_threads: 8\n\
+             ocr_threads: 64\nheadroom_pct: 25\n",
+        )
+        .expect("valid YAML");
+        config.finalize(); // what Config::load does — YAML pct in effect
+        config.override_headroom(Some(0)); // the CLI flag: explicitly off
+        config.finalize(); // what run_index does before deriving anything
+        assert_eq!(config.headroom_cores_cap(), None);
+        assert_eq!(config.vision.headroom_cores_cap, None);
+        let runtime = RuntimeKnobs::from_config(&config);
+        assert_eq!(runtime.extract(), 16, "extract width must be uncapped");
+        assert_eq!(runtime.embed(), 8, "embed pool must be uncapped");
+        assert_eq!(runtime.ocr(), 64, "OCR seed must be uncapped");
+        assert_eq!(config.resolved_embed_intra_threads(), 8);
+    }
+
+    #[test]
+    fn a_flag_lower_than_the_yaml_percent_loosens_to_the_flag_cap() {
+        // The other half of F1: precedence must hold for the DERIVED widths,
+        // not just the stored percent — a 10% flag over a 50% YAML must cap at
+        // cores_cap(10), not stay stuck at cores_cap(50).
+        let mut config: Config =
+            serde_yaml::from_str("workers: 64\nheadroom_pct: 50\n").expect("valid YAML");
+        config.finalize();
+        config.override_headroom(Some(10));
+        config.finalize();
+        assert_eq!(config.headroom_pct, 10);
+        let cap10 = crate::headroom::cores_cap(10);
+        assert_eq!(config.headroom_cores_cap(), Some(cap10));
+        assert_eq!(
+            RuntimeKnobs::from_config(&config).extract(),
+            64_usize.min(cap10)
+        );
+    }
+
+    #[test]
+    fn headroom_is_a_ceiling_for_defaults_retunes() {
+        // F3: `POST /runtime` on the process-wide defaults must not un-cap
+        // future jobs — the cap is a machine property, so an over-ceiling
+        // retune silently clamps, exactly like the stage-range clamping.
+        let mut config = Config::default();
+        config.workers = 4;
+        config.headroom_pct = 50;
+        config.finalize();
+        let cap = config.headroom_cores_cap().expect("headroom is on");
+        let runtime = RuntimeKnobs::from_config(&config);
+        let view = runtime
+            .apply(&body(json!({"extract": MAX_WORKERS, "embed": 8})))
+            .expect("clamping never errors");
+        assert_eq!(runtime.extract(), MAX_WORKERS.min(cap));
+        assert_eq!(runtime.embed(), 8_usize.min(cap).min(EMBED_RANGE.1));
+        // The response reports what actually landed, not what was asked for.
+        assert_eq!(
+            view["stages"]["extract"]["value"],
+            json!(MAX_WORKERS.min(cap))
+        );
+        // A retune BELOW the ceiling is honoured as ever.
+        runtime
+            .apply(&body(json!({"extract": 1, "embed": 1})))
+            .expect("valid");
+        assert_eq!(runtime.extract(), 1);
+        assert_eq!(runtime.embed(), 1);
+    }
+
+    #[test]
+    fn headroom_is_a_ceiling_for_mid_job_retunes() {
+        // F3: the per-job route applies to a SNAPSHOT of the defaults, so the
+        // ceiling must ride along with `snapshot()` or a mid-job
+        // `POST /jobs/{id}/runtime {"extract": 64}` would escape it.
+        let mut config = Config::default();
+        config.headroom_pct = 50;
+        config.finalize();
+        let cap = config.headroom_cores_cap().expect("headroom is on");
+        let job = RuntimeKnobs::from_config(&config).snapshot();
+        job.apply(&body(json!({"extract": MAX_WORKERS})))
+            .expect("clamping never errors");
+        assert_eq!(job.extract(), MAX_WORKERS.min(cap));
+    }
+
+    #[test]
+    fn at_zero_pct_retunes_are_unclamped_legacy() {
+        // F3's off-path: with the feature off there is no ceiling — a retune
+        // clamps against the stage ranges alone, byte-identical to before.
+        let runtime = RuntimeKnobs::from_config(&Config::default());
+        runtime
+            .apply(&body(json!({"extract": 9999, "embed": 9999})))
+            .expect("clamping never errors");
+        assert_eq!(runtime.extract(), MAX_WORKERS);
+        assert_eq!(runtime.embed(), EMBED_RANGE.1);
     }
 
     #[test]

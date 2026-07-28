@@ -456,7 +456,14 @@ fn media(
         let temp = tempdir()?;
         let pattern = temp.path().join("frame-%06d.png");
         let output = Command::new("ffmpeg")
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"])
+            // Under headroom, `-threads <cores_cap>` on BOTH sides of `-i`:
+            // the flag is positional, so the input-side copy is the one that
+            // caps the video DECODER — the heavy half here — and the
+            // output-side copy caps the PNG encode/scale. Nothing at pct 0.
+            // See `headroom::ffmpeg_thread_args`.
+            .args(crate::headroom::ffmpeg_thread_args(ffmpeg_threads))
+            .arg("-i")
             .arg(path)
             .args([
                 "-vf",
@@ -464,8 +471,6 @@ fn media(
                 "-frames:v",
                 "1000",
             ])
-            // `-threads <cores_cap>` under headroom, nothing otherwise (see
-            // `headroom::ffmpeg_thread_args`).
             .args(crate::headroom::ffmpeg_thread_args(ffmpeg_threads))
             .arg(&pattern)
             .output()?;
@@ -556,12 +561,16 @@ fn heic(
     let temp = tempdir()?;
     let frame = temp.path().join("frame.jpg");
     let mut command = Command::new("ffmpeg");
-    command.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"]);
+    command.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"]);
+    // Under headroom, `-threads <cores_cap>` on BOTH sides of `-i`. The flag
+    // is positional and the INPUT-side copy is the one that bounds the
+    // tiled-HEVC decode — the one CPU-heavy step here; an output-side flag
+    // alone never reaches the decoder. The output-side copy bounds the JPEG
+    // encode. Nothing at pct 0. See `headroom::ffmpeg_thread_args`.
+    command.args(crate::headroom::ffmpeg_thread_args(ffmpeg_threads));
+    command.arg("-i");
     command.arg(path);
     command.args(["-frames:v", "1", "-q:v", "2"]);
-    // `-threads <cores_cap>` under headroom, nothing otherwise (see
-    // `headroom::ffmpeg_thread_args`). Bounds the tiled-HEVC decode, the one
-    // CPU-heavy step here.
     command.args(crate::headroom::ffmpeg_thread_args(ffmpeg_threads));
     command.arg(&frame);
     // stdout/stderr dropped, matching `vision::video`'s bounded ffmpeg calls:

@@ -151,11 +151,6 @@ struct AppState {
     /// Default worker count this serve process runs jobs with; advertised by
     /// `GET /settings` as `workers.default`.
     workers: usize,
-    /// Effective headroom core cap (flag over YAML, resolved once at startup),
-    /// or `None` when the feature is off. Submit holds an explicit per-job
-    /// `workers` under it, because that path writes the job's runtime snapshot
-    /// directly and never passes through `Config::finalize`.
-    headroom_cores_cap: Option<usize>,
     /// Lazily loaded query-side embedding model, shared by every
     /// `/corpus/search?mode=semantic` request.
     embedder: Arc<QueryEmbedder>,
@@ -198,7 +193,7 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
     // published corpus untouched when a job cannot run. Turning it into a
     // startup panic would take the whole service down for a fault the job-level
     // path already handles correctly.
-    let (defaults, headroom_cores_cap) = {
+    let defaults = {
         let mut config = match Config::load(normalized.config_path.as_deref()) {
             Ok(config) => config,
             Err(error) => {
@@ -211,19 +206,19 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
             }
         };
         config.workers = clamp_workers(normalized.workers);
-        // `serve --headroom` wins over the YAML `headroom_pct`, then finalize
-        // re-derives the caps so the stage defaults (extract target, embedder
-        // pool, tesseract's OMP seed) start under the core cap. Idempotent on
+        // `serve --headroom` wins over the YAML `headroom_pct`; finalize then
+        // re-clamps the percent so `RuntimeKnobs::from_config` seeds the stage
+        // defaults (extract target, embedder pool, tesseract's OMP seed) under
+        // the effective cap AT THAT READ — finalize itself never rewrites the
+        // configured widths (see `Config::finalize` for why). Idempotent on
         // top of the finalize `Config::load` already ran; a no-op when the
-        // feature is off. The resolved cap rides along for submit, which must
-        // hold an explicit per-job `workers` under the SAME cap (it bypasses
-        // `Config::finalize` by writing into the job's runtime snapshot).
+        // feature is off. The cap also lands ON the instance as the ceiling
+        // every retune — and every per-job snapshot taken at submit — clamps
+        // to (`RuntimeKnobs::apply`), which is what keeps an explicit per-job
+        // `workers` or a later `POST /runtime` from escaping it.
         config.override_headroom(normalized.headroom_pct);
         config.finalize();
-        (
-            Arc::new(RuntimeKnobs::from_config(&config)),
-            config.headroom_cores_cap(),
-        )
+        Arc::new(RuntimeKnobs::from_config(&config))
     };
     // P0-11: open (or create) the persisted job store before anything else
     // touches `jobs`, sweep any row a previous process left non-terminal, and
@@ -276,7 +271,6 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         vision_max: normalized.vision_max,
         config_path: normalized.config_path.clone(),
         workers: normalized.workers,
-        headroom_cores_cap,
         embedder: Arc::new(QueryEmbedder::new(normalized.config_path.clone())),
         jobs_store,
     };
@@ -734,16 +728,13 @@ async fn submit(State(state): State<AppState>, Json(mut request): Json<JobReques
     let runtime = Arc::new(state.defaults.snapshot());
     // An explicit per-job `workers` is the caller stating this job's extract
     // width, so it outranks the process-wide default it was snapshotted from —
-    // but not the headroom cap: this write lands on the runtime snapshot
-    // directly, never passing through `Config::finalize`, so the cap has to be
-    // applied here or a job submitted with `workers` would silently escape it.
+    // but not the headroom ceiling: the snapshot carries the cap and
+    // `RuntimeKnobs::apply` clamps this write to it, exactly as it does a
+    // mid-job retune, so a job submitted with `workers` cannot escape it.
     if let Some(workers) = request.workers {
         let _ = runtime.apply(&Map::from_iter([(
             crate::runtime::EXTRACT.to_string(),
-            json!(crate::headroom::capped(
-                clamp_workers(workers),
-                state.headroom_cores_cap
-            )),
+            json!(clamp_workers(workers)),
         )]));
     }
     state.runtimes.write().await.insert(id.clone(), runtime);
@@ -1176,9 +1167,10 @@ fn run_job(
     let overwrite = request.overwrite && !request.resume;
     let mut config = Config::load(service.config_path.as_deref())?;
     // `serve --headroom` wins over the YAML `headroom_pct` for every job. The
-    // caps themselves land in the `config.finalize()` that `run_index` runs
-    // after the per-job mutations below, so the order here only has to put the
-    // effective percent on the config before that point.
+    // caps themselves land at READ time inside `run_index` — the
+    // `RuntimeKnobs`/`Transcriber`/intra-thread derivations all consult
+    // `headroom_cores_cap` when they read — so the order here only has to put
+    // the effective percent on the config before `run_index` derives from it.
     config.override_headroom(service.headroom_pct);
     config.ocr = request.ocr;
     config.ocr_langs = request
@@ -2228,7 +2220,18 @@ impl QueryEmbedder {
         tokio::spawn(async move {
             let loaded = tokio::task::spawn_blocking(move || {
                 let started = Instant::now();
-                let config = Config::load(config_path.as_deref())?;
+                let mut config = Config::load(config_path.as_deref())?;
+                // Interactive-query EXEMPTION from resource headroom: this
+                // embedder serves the human at the search box — precisely who
+                // `headroom_pct` exists to keep the machine responsive FOR —
+                // and embeds one short query at a time, never a corpus, so
+                // capping it would slow the person down in order to protect
+                // the person. Zeroing the percent here neutralizes a YAML
+                // `headroom_pct` and keeps the path consistent with
+                // `serve --headroom`, which never reached it anyway (only
+                // `config_path` does); the width falls back to the legacy
+                // `resolved_embed_intra_threads` derivation.
+                config.headroom_pct = 0;
                 let embedder = Embedder::new(&config)?;
                 Ok::<_, anyhow::Error>((embedder, started.elapsed()))
             })

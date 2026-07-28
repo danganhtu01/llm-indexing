@@ -502,10 +502,13 @@ fn index(args: IndexArgs) -> Result<()> {
     if let Some(max_bytes) = args.max_bytes {
         config.max_bytes = max_bytes
     }
-    // `--headroom` wins over the YAML `headroom_pct`. The caps derive inside
-    // the `config.finalize()` that `run_index` runs; the priority class is the
-    // one process-wide effect and belongs here, before any work starts. A zero
-    // effective percent changes nothing — including the priority.
+    // `--headroom` wins over the YAML `headroom_pct`. The caps land at READ
+    // time inside `run_index` (the RuntimeKnobs / Transcriber / intra-thread
+    // derivations consult `headroom_cores_cap` as they read, so the percent
+    // in effect HERE is the one that decides — including an explicit 0
+    // loosening a YAML percent); the priority class is the one process-wide
+    // effect and belongs here, before any work starts. A zero effective
+    // percent changes nothing — including the priority.
     config.override_headroom(args.headroom);
     if config.headroom_pct > 0 {
         llm_indexing::headroom::lower_process_priority();
