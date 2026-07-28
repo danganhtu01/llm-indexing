@@ -417,7 +417,16 @@ struct FaceSessions {
     embedder: Mutex<Session>,
 }
 
-fn build_sessions(models_dir: &Path) -> Result<FaceSessions> {
+/// Build the YuNet + SFace pair.
+///
+/// `intra_cap` is the headroom core cap (`VisionConfig::headroom_cores_cap`):
+/// `Some` builds each session with `.with_intra_threads(cap)`, `None` keeps
+/// ONNX Runtime's every-core default — byte-identical to before the knob
+/// existed. The `map_err(ort::Error::from)` converts the builder's
+/// `Error<SessionBuilder>` (not `Send + Sync`, so not anyhow-compatible) into
+/// the plain `Error<()>` that is — see `detector::build_session`, which owns
+/// the full explanation.
+fn build_sessions(models_dir: &Path, intra_cap: Option<usize>) -> Result<FaceSessions> {
     let open = |relative: &str| -> Result<Mutex<Session>> {
         let path = models_dir.join(relative);
         anyhow::ensure!(
@@ -425,8 +434,14 @@ fn build_sessions(models_dir: &Path) -> Result<FaceSessions> {
             "face model not found at {} (run `llm-index fetch-data --faces`)",
             path.display()
         );
-        let session = Session::builder()
-            .context("creating face session builder")?
+        let mut builder = Session::builder().context("creating face session builder")?;
+        if let Some(cap) = intra_cap {
+            builder = builder
+                .with_intra_threads(cap.max(1))
+                .map_err(ort::Error::<()>::from)
+                .context("capping face session intra-op threads")?;
+        }
+        let session = builder
             .commit_from_file(&path)
             .with_context(|| format!("loading face model {}", path.display()))?;
         Ok(Mutex::new(session))
@@ -442,7 +457,11 @@ fn build_sessions(models_dir: &Path) -> Result<FaceSessions> {
 /// re-fetch must not poison a resident `serve` process until restart. A
 /// dedicated init lock serializes construction so the rayon workers do not all
 /// load 38 MB of SFace at once.
-fn sessions(models_dir: &Path) -> Result<&'static FaceSessions> {
+///
+/// HEADROOM LIMITATION: `intra_cap` is baked into the sessions on the FIRST
+/// build, so the first job's headroom wins for the process lifetime — the same
+/// cache property `detector::session` documents in full.
+fn sessions(models_dir: &Path, intra_cap: Option<usize>) -> Result<&'static FaceSessions> {
     static SESSIONS: OnceLock<FaceSessions> = OnceLock::new();
     static INIT: Mutex<()> = Mutex::new(());
     if let Some(sessions) = SESSIONS.get() {
@@ -452,7 +471,7 @@ fn sessions(models_dir: &Path) -> Result<&'static FaceSessions> {
     if let Some(sessions) = SESSIONS.get() {
         return Ok(sessions);
     }
-    let built = build_sessions(models_dir).context("face model init failed")?;
+    let built = build_sessions(models_dir, intra_cap).context("face model init failed")?;
     Ok(SESSIONS.get_or_init(|| built))
 }
 
@@ -584,7 +603,7 @@ pub(crate) fn fill(
     cfg: &VisionConfig,
     out: &mut VisionResult,
 ) -> Result<()> {
-    let sessions = sessions(models_dir)?;
+    let sessions = sessions(models_dir, cfg.headroom_cores_cap)?;
     let rgb = image.to_rgb8();
     let detections = detect(&rgb, sessions, cfg)?;
     let mut faces = Vec::new();

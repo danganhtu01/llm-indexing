@@ -74,7 +74,13 @@ pub(super) fn analyze(
         }
     };
 
-    let frames = match extract_keyframes(path, temp.path(), cfg.max_frames, cfg.timeout_secs) {
+    let frames = match extract_keyframes(
+        path,
+        temp.path(),
+        cfg.max_frames,
+        cfg.timeout_secs,
+        cfg.headroom_cores_cap,
+    ) {
         Ok(frames) => frames,
         Err(error) => {
             // A per-file timeout records the tier (don't burn the timeout on the
@@ -288,6 +294,19 @@ fn mean_pool(frames: &[VisionResult]) -> Option<(Vec<f32>, String, usize)> {
     ))
 }
 
+/// The resource envelope one ffmpeg frames pass runs under: how many frames it
+/// may write, how long it may run, and — under headroom — how many threads it
+/// may use (`None` keeps ffmpeg's own every-core default). Grouped because the
+/// three always travel together from [`extract_keyframes`] into
+/// [`run_ffmpeg_frames`], and they are budgets, not content: the argv's
+/// meaning lives in `filter`/`fps_mode`, its cost lives here.
+#[derive(Clone, Copy)]
+struct FramesBudget {
+    limit: usize,
+    timeout_secs: u64,
+    threads: Option<usize>,
+}
+
 /// Extract keyframes into `dir`: scene-change detection first, fixed-interval
 /// fallback when it yields fewer than [`MIN_SCENE_FRAMES`], sampled down to
 /// `max_frames`. Returns the sorted PNG paths, or an `Err` string when ffmpeg
@@ -297,6 +316,7 @@ fn extract_keyframes(
     dir: &Path,
     max_frames: usize,
     timeout_secs: u64,
+    threads: Option<usize>,
 ) -> Result<Vec<PathBuf>, String> {
     let scene = run_ffmpeg_frames(
         path,
@@ -304,8 +324,11 @@ fn extract_keyframes(
         "scene",
         &format!("select='gt(scene\\,{SCENE_THRESHOLD})',scale='min(1280,iw)':-2:flags=bicubic"),
         Some("vfr"),
-        SCENE_HARD_CAP,
-        timeout_secs,
+        FramesBudget {
+            limit: SCENE_HARD_CAP,
+            timeout_secs,
+            threads,
+        },
     )?;
 
     let frames = if scene.len() >= MIN_SCENE_FRAMES {
@@ -327,8 +350,11 @@ fn extract_keyframes(
             "interval",
             &filter,
             None,
-            max_frames,
-            timeout_secs,
+            FramesBudget {
+                limit: max_frames,
+                timeout_secs,
+                threads,
+            },
         )?;
         // Prefer whichever pass gave more coverage.
         if interval.len() >= scene.len() {
@@ -373,18 +399,27 @@ fn run_ffmpeg_frames(
     prefix: &str,
     filter: &str,
     fps_mode: Option<&str>,
-    limit: usize,
-    timeout_secs: u64,
+    budget: FramesBudget,
 ) -> Result<Vec<PathBuf>, String> {
     let pattern = dir.join(format!("{prefix}-%06d.png"));
     let mut command = Command::new("ffmpeg");
-    command.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"]);
+    command.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"]);
+    // Under headroom (`VisionConfig::headroom_cores_cap`), `-threads
+    // <cores_cap>` on BOTH sides of `-i`: the flag is positional, so the
+    // input-side copy is the one that caps the video DECODER — where keyframe
+    // extraction burns its CPU — and the output-side copy caps the
+    // scale/select filtering and PNG encode. Both collapse to nothing at
+    // `headroom_pct == 0`, keeping the fixed argv this doc comment promises.
+    // See `headroom::ffmpeg_thread_args`.
+    command.args(crate::headroom::ffmpeg_thread_args(budget.threads));
+    command.arg("-i");
     command.arg(path);
     command.args(["-vf", filter]);
     if let Some(mode) = fps_mode {
         command.args(["-fps_mode", mode]);
     }
-    command.args(["-frames:v", &limit.max(1).to_string()]);
+    command.args(["-frames:v", &budget.limit.max(1).to_string()]);
+    command.args(crate::headroom::ffmpeg_thread_args(budget.threads));
     command.arg(&pattern);
     command
         .stdin(Stdio::null())
@@ -398,11 +433,12 @@ fn run_ffmpeg_frames(
         }
         Err(error) => return Err(format!("ffmpeg keyframe extraction failed: {error}")),
     };
-    match wait_bounded(&mut child, Duration::from_secs(timeout_secs.max(1))) {
+    match wait_bounded(&mut child, Duration::from_secs(budget.timeout_secs.max(1))) {
         Ok(Some(status)) if status.success() => Ok(collect_frames(dir, prefix)),
         Ok(Some(_)) => Ok(Vec::new()),
         Ok(None) => Err(format!(
-            "{VIDEO_TIMEOUT}: ffmpeg exceeded {timeout_secs}s on {}",
+            "{VIDEO_TIMEOUT}: ffmpeg exceeded {}s on {}",
+            budget.timeout_secs,
             path.display()
         )),
         Err(error) => Err(format!("ffmpeg keyframe extraction failed: {error}")),

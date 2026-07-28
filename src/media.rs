@@ -13,6 +13,10 @@ use crate::failure::CapabilityUnavailable;
 pub struct Transcriber {
     context: Option<Arc<WhisperContext>>,
     threads: i32,
+    /// [`Config::headroom_cores_cap`] captured at construction: `Some` adds
+    /// `-threads <cap>` to the audio-extraction ffmpeg spawn, `None` (headroom
+    /// off) leaves that argv byte-identical to before the feature existed.
+    ffmpeg_threads: Option<usize>,
 }
 
 impl Transcriber {
@@ -31,7 +35,16 @@ impl Transcriber {
             .flatten();
         Self {
             context,
-            threads: config.workers.clamp(1, 8) as i32,
+            // The legacy `workers.clamp(1, 8)` derivation, held under the
+            // headroom core cap AT THIS READ — the configured `workers` is
+            // never rewritten by finalize (see `Config::finalize`), so the
+            // cap must be applied to the derivation itself, with the percent
+            // in effect at construction deciding.
+            threads: crate::headroom::capped(
+                config.workers.clamp(1, 8),
+                config.headroom_cores_cap(),
+            ) as i32,
+            ffmpeg_threads: config.headroom_cores_cap(),
         }
     }
 
@@ -50,9 +63,16 @@ impl Transcriber {
         let temp = tempdir()?;
         let wav = temp.path().join("audio.wav");
         let output = Command::new("ffmpeg")
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"])
+            // Under headroom, `-threads <cores_cap>` on BOTH sides of `-i`:
+            // the flag is positional, so only an input-side copy reaches the
+            // DECODER and only an output-side copy reaches the encode. Both
+            // collapse to nothing at pct 0. See `headroom::ffmpeg_thread_args`.
+            .args(crate::headroom::ffmpeg_thread_args(self.ffmpeg_threads))
+            .arg("-i")
             .arg(path)
             .args(["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
+            .args(crate::headroom::ffmpeg_thread_args(self.ffmpeg_threads))
             .arg(&wav)
             .output()
             .with_context(|| format!("running ffmpeg for {}", path.display()))?;
@@ -127,5 +147,25 @@ mod tests {
     #[test]
     fn formats_transcript_timestamps() {
         assert_eq!(timestamp(372_300), "01:02:03");
+    }
+
+    #[test]
+    fn whisper_threads_follow_the_legacy_derivation_when_headroom_is_off() {
+        // The off-path guarantee: `workers.clamp(1, 8)`, untouched.
+        let mut config = Config::default();
+        config.workers = 6;
+        assert_eq!(Transcriber::new(&config).threads, 6);
+        assert_eq!(Transcriber::new(&config).ffmpeg_threads, None);
+    }
+
+    #[test]
+    fn headroom_caps_whisper_threads_and_arms_the_ffmpeg_flag() {
+        let mut config = Config::default();
+        config.workers = 8;
+        config.headroom_pct = 50;
+        let cap = config.headroom_cores_cap().expect("headroom is on");
+        let transcriber = Transcriber::new(&config);
+        assert_eq!(transcriber.threads as usize, 8_usize.min(cap));
+        assert_eq!(transcriber.ffmpeg_threads, Some(cap));
     }
 }

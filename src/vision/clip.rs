@@ -55,18 +55,22 @@ fn vocabulary() -> Vec<String> {
 }
 
 /// ONNX Runtime intra-op threads for the CLIP sessions — every core, capped so
-/// a many-file job's rayon workers don't oversubscribe the CPU.
-fn intra_threads() -> usize {
-    std::thread::available_parallelism()
+/// a many-file job's rayon workers don't oversubscribe the CPU. Under headroom
+/// (`headroom_cap = VisionConfig::headroom_cores_cap`) the result is
+/// additionally held under the core cap; `None` keeps the legacy derivation
+/// untouched.
+fn intra_threads(headroom_cap: Option<usize>) -> usize {
+    let derived = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .clamp(1, 8)
+        .clamp(1, 8);
+    crate::headroom::capped(derived, headroom_cap)
 }
 
 /// Build both CLIP encoders and pre-embed the vocabulary. The text encoder is
 /// only needed for that one-time pass, so it is dropped before returning.
-fn build_engine(models_dir: &Path) -> Result<ClipEngine> {
-    let threads = intra_threads();
+fn build_engine(models_dir: &Path, headroom_cap: Option<usize>) -> Result<ClipEngine> {
+    let threads = intra_threads(headroom_cap);
     let mut text = TextEmbedding::try_new(
         TextInitOptions::new(EmbeddingModel::ClipVitB32)
             .with_cache_dir(models_dir.to_path_buf())
@@ -137,7 +141,10 @@ fn snapshot_has_model(repo_dir: &Path) -> bool {
 /// pass is skipped since we only want the cache side effect. Idempotent: a warm
 /// cache loads locally and re-downloads nothing.
 pub(super) fn prefetch(models_dir: &Path) -> Result<()> {
-    let threads = intra_threads();
+    // No headroom cap here: this is the `fetch-data --vision` staging path, a
+    // one-off operator command with no job (and no `--headroom` flag) behind
+    // it — the encoders are loaded once for their download side effect.
+    let threads = intra_threads(None);
     let _text = TextEmbedding::try_new(
         TextInitOptions::new(EmbeddingModel::ClipVitB32)
             .with_cache_dir(models_dir.to_path_buf())
@@ -161,7 +168,11 @@ pub(super) fn prefetch(models_dir: &Path) -> Result<()> {
 /// instead of the whole resident `serve` process being poisoned until restart. A
 /// dedicated init lock serializes construction so the rayon workers don't all
 /// build at once on the cold path.
-fn engine(models_dir: &Path) -> Result<&'static ClipEngine> {
+///
+/// HEADROOM LIMITATION: `headroom_cap` is baked into the encoders on the FIRST
+/// build, so the first job's headroom wins for the process lifetime — the same
+/// cache property `detector::session` documents in full.
+fn engine(models_dir: &Path, headroom_cap: Option<usize>) -> Result<&'static ClipEngine> {
     static ENGINE: OnceLock<ClipEngine> = OnceLock::new();
     static INIT: Mutex<()> = Mutex::new(());
     if let Some(engine) = ENGINE.get() {
@@ -171,7 +182,7 @@ fn engine(models_dir: &Path) -> Result<&'static ClipEngine> {
     if let Some(engine) = ENGINE.get() {
         return Ok(engine);
     }
-    let engine = build_engine(models_dir).context("CLIP init failed")?;
+    let engine = build_engine(models_dir, headroom_cap).context("CLIP init failed")?;
     Ok(ENGINE.get_or_init(|| engine))
 }
 
@@ -221,7 +232,7 @@ pub(super) fn fill(
     cfg: &VisionConfig,
     out: &mut VisionResult,
 ) -> Result<()> {
-    let engine = engine(models_dir)?;
+    let engine = engine(models_dir, cfg.headroom_cores_cap)?;
     let embedding = {
         let mut model = engine
             .image

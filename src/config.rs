@@ -469,6 +469,15 @@ pub struct VisionConfig {
     /// Cap a single decode allocation (bytes) — image-crate `Limits`.
     #[serde(default = "default_max_alloc_bytes")]
     pub max_alloc_bytes: u64,
+    /// Derived, never parsed: [`Config::headroom_cores_cap`] copied in by
+    /// [`Config::finalize`] (the same pattern as the compiled skip sets on
+    /// [`Config`]). Carried HERE because the vision sub-tiers receive a
+    /// `&VisionConfig`, not the whole `Config`, and this is the value their
+    /// ONNX session builders and ffmpeg spawns cap themselves at. `None` —
+    /// the `headroom_pct == 0` default — leaves every vision code path
+    /// byte-identical to before the field existed.
+    #[serde(skip)]
+    pub(crate) headroom_cores_cap: Option<usize>,
 }
 
 impl Default for VisionConfig {
@@ -490,6 +499,7 @@ impl Default for VisionConfig {
             caption_timeout_secs: default_caption_timeout(),
             max_pixels: default_max_pixels(),
             max_alloc_bytes: default_max_alloc_bytes(),
+            headroom_cores_cap: None,
         }
     }
 }
@@ -546,6 +556,18 @@ pub struct Config {
     /// `None` means "whatever OpenMP would have picked", i.e. today's behaviour.
     #[serde(default)]
     pub ocr_threads: Option<usize>,
+    /// Resource headroom: percent of the machine deliberately left free while a
+    /// job runs (`0..=50`, clamped in [`Config::finalize`] to
+    /// `settings::HEADROOM_PCT_RANGE`). Default 0 — the feature fully off and
+    /// every derived value byte-identical to a build without it. Non-zero, the
+    /// process drops to BelowNormal priority at startup and every CPU-shaped
+    /// derivation (extract workers, embedder pool, ONNX intra-op widths,
+    /// tesseract's `OMP_THREAD_LIMIT`, whisper threads, ffmpeg `-threads`) is
+    /// capped at [`Config::headroom_cores_cap`]. The `--headroom` CLI flag wins
+    /// over this value when provided ([`Config::override_headroom`]); the
+    /// cross-engine contract lives in [`crate::headroom`].
+    #[serde(default)]
+    pub headroom_pct: u8,
     /// Files per batched SQLite commit — the writer throughput lever. Larger
     /// batches amortise each commit's fsync over more work; the cost is re-doing
     /// up to this many files if the job is killed mid-batch, which resume
@@ -623,6 +645,7 @@ impl Default for Config {
             embed_workers: default_embed_workers(),
             embed_intra_threads: None,
             ocr_threads: None,
+            headroom_pct: 0,
             commit_batch: default_commit_batch(),
             sync_normal: false,
             max_bytes: default_max_bytes(),
@@ -674,17 +697,66 @@ impl Config {
     ///
     /// Falls back to the `workers.clamp(1, 8)` expression this value was
     /// hardcoded to before it became its own knob, so an operator who sets
-    /// nothing sees byte-identical behaviour.
+    /// nothing sees byte-identical behaviour. Under headroom the result is
+    /// additionally capped at [`Config::headroom_cores_cap`] — an explicit
+    /// `embed_intra_threads` is a width, not an exemption.
     pub fn resolved_embed_intra_threads(&self) -> usize {
-        self.embed_intra_threads
-            .unwrap_or_else(|| self.workers.clamp(1, 8))
+        let derived = self
+            .embed_intra_threads
+            .unwrap_or_else(|| self.workers.clamp(1, 8));
+        crate::headroom::capped(derived, self.headroom_cores_cap())
+    }
+
+    /// The effective per-process core cap under headroom, or `None` when the
+    /// feature is off (`headroom_pct == 0`) — the ONE accessor every capping
+    /// call site consults, so "off means untouched" is decided in one place.
+    /// `Some(max(1, floor(available_parallelism * (1 - pct/100))))` otherwise;
+    /// the math (and the whole cross-engine contract) lives in
+    /// [`crate::headroom`].
+    pub fn headroom_cores_cap(&self) -> Option<usize> {
+        (self.headroom_pct > 0).then(|| crate::headroom::cores_cap(self.headroom_pct))
+    }
+
+    /// Apply the `--headroom` CLI flag: the flag WINS over the YAML
+    /// `headroom_pct` when provided, and an absent flag leaves the YAML value
+    /// standing — the same flag-over-config precedence `--vision-max` and
+    /// `--submit-token` keep. Clamps into `settings::HEADROOM_PCT_RANGE`
+    /// immediately (clap already validates the range at parse time; this keeps
+    /// the invariant local rather than trusting the caller).
+    pub fn override_headroom(&mut self, flag: Option<u8>) {
+        if let Some(pct) = flag {
+            self.headroom_pct = pct;
+        }
+        let (min, max) = crate::settings::HEADROOM_PCT_RANGE;
+        self.headroom_pct = self.headroom_pct.clamp(min, max);
     }
 
     pub fn finalize(&mut self) {
+        // Clamp the headroom percent BEFORE anything derives from it, so a
+        // mis-set YAML value (200) caps at the contract ceiling instead of
+        // starving the job. Idempotent like the rest of finalize.
+        self.override_headroom(None);
         self.workers = clamp_workers(self.workers);
         self.embed_workers = self
             .embed_workers
             .clamp(crate::runtime::EMBED_RANGE.0, crate::runtime::EMBED_RANGE.1);
+        // Resource headroom: finalize only DERIVES — it clamps the percent
+        // (above) and hands the core cap to the vision sub-tiers, whose
+        // builders see a `&VisionConfig`, not the whole `Config`. It must
+        // never overwrite the configured `workers`/`embed_workers` with capped
+        // values: `Config::load` finalizes under the YAML percent BEFORE a
+        // `--headroom` flag is applied (`override_headroom`), so a destructive
+        // write here would burn the YAML cap into the config where no later,
+        // lower flag could loosen it — `--headroom 0` against a YAML
+        // `{workers: 16, headroom_pct: 25}` would leave every derived width
+        // stuck capped. The caps instead land at READ time, where the percent
+        // in effect at USE time decides: [`RuntimeKnobs::from_config`] (the
+        // extract/embed seeds), [`Config::resolved_embed_intra_threads`], and
+        // `Transcriber::new`. At pct == 0 the cap is `None` and every reader
+        // sees the configured values untouched.
+        //
+        // [`RuntimeKnobs::from_config`]: crate::runtime::RuntimeKnobs::from_config
+        self.vision.headroom_cores_cap = self.headroom_cores_cap();
         // Clamp the OCR/vision knobs to the settings-surface bounds (their single
         // definition in `settings.rs`). Only per-job overrides are validated at
         // submit; without this a mis-set config base would flow unvalidated into
@@ -1128,6 +1200,92 @@ mod tests {
         assert!(!config.skip_path(Path::new("/var/lib/docker-data")));
         // A relative path can never satisfy a rooted pattern.
         assert!(!config.skip_path(Path::new("proc")));
+    }
+
+    #[test]
+    fn headroom_defaults_off_and_touches_nothing() {
+        // The contract's off-path: `headroom_pct == 0` must be byte-identical
+        // legacy behaviour — no cap derived, workers and embed pool untouched,
+        // nothing handed to the vision sub-tiers.
+        let mut config = Config {
+            workers: 64,
+            ..Config::default()
+        };
+        config.finalize();
+        assert_eq!(config.headroom_pct, 0);
+        assert_eq!(config.headroom_cores_cap(), None);
+        assert_eq!(config.workers, 64);
+        assert_eq!(config.vision.headroom_cores_cap, None);
+    }
+
+    #[test]
+    fn yaml_headroom_is_parsed_and_clamped_by_finalize() {
+        let mut config: Config = serde_yaml::from_str("headroom_pct: 10").unwrap();
+        assert_eq!(config.headroom_pct, 10);
+        config.finalize();
+        assert_eq!(config.headroom_pct, 10);
+        // A mis-set YAML percent clamps to the contract ceiling instead of
+        // starving the job (the same treatment the OCR/vision knobs get).
+        let mut config: Config = serde_yaml::from_str("headroom_pct: 200").unwrap();
+        config.finalize();
+        assert_eq!(config.headroom_pct, 50);
+    }
+
+    #[test]
+    fn the_cli_flag_wins_over_yaml_only_when_provided() {
+        // The cross-engine precedence rule: CLI flag > YAML > built-in 0.
+        let mut config: Config = serde_yaml::from_str("headroom_pct: 25").unwrap();
+        config.override_headroom(None);
+        assert_eq!(config.headroom_pct, 25, "absent flag defers to YAML");
+        config.override_headroom(Some(10));
+        assert_eq!(config.headroom_pct, 10, "flag wins over YAML");
+        config.override_headroom(Some(0));
+        assert_eq!(
+            config.headroom_pct, 0,
+            "an explicit 0 turns the feature off"
+        );
+    }
+
+    #[test]
+    fn finalize_derives_the_cap_without_overwriting_configured_widths() {
+        // The caps land at READ time (`RuntimeKnobs::from_config` and the
+        // resolved_* accessors), NEVER by rewriting the configured values:
+        // `Config::load` finalizes under the YAML percent before a CLI flag
+        // can override it, so a destructive write here would leave a lower
+        // flag unable to loosen the YAML cap (the F1 regression, pinned end
+        // to end in `runtime::tests`).
+        let mut config = Config {
+            workers: 64,
+            embed_workers: 8,
+            headroom_pct: 50,
+            ..Config::default()
+        };
+        config.finalize();
+        let cap = config.headroom_cores_cap().expect("headroom is on");
+        assert!(cap >= 1, "cores_cap can never fall below one core");
+        assert_eq!(config.workers, 64, "the configured value must survive");
+        assert_eq!(config.embed_workers, 8, "the configured value must survive");
+        // The derived cap reaches the vision sub-tiers through the carrier
+        // field finalize populates (their builders see a &VisionConfig).
+        assert_eq!(config.vision.headroom_cores_cap, Some(cap));
+    }
+
+    #[test]
+    fn headroom_caps_the_embed_intra_thread_derivation() {
+        // Both the derived default and an explicit width are held under the
+        // cap — `embed_intra_threads` is a width, not an exemption.
+        let mut config = Config {
+            workers: 8,
+            embed_intra_threads: Some(8),
+            headroom_pct: 50,
+            ..Config::default()
+        };
+        config.finalize();
+        let cap = config.headroom_cores_cap().expect("headroom is on");
+        assert_eq!(config.resolved_embed_intra_threads(), 8_usize.min(cap));
+        // And at 0 the legacy derivation is untouched.
+        config.headroom_pct = 0;
+        assert_eq!(config.resolved_embed_intra_threads(), 8);
     }
 
     #[test]
