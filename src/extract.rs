@@ -248,11 +248,16 @@ fn extract_inner(
             && matches!(config.ocr.as_str(), "auto" | "on" | "exhaustive")
             && ocr.available =>
         {
-            heic(path, max_chars, ocr)
+            heic(path, max_chars, ocr, config.headroom_cores_cap())
         }
-        _ if AUDIO_EXTS.contains(&ext) || VIDEO_EXTS.contains(&ext) => {
-            media(path, ext, max_chars, ocr, transcriber)
-        }
+        _ if AUDIO_EXTS.contains(&ext) || VIDEO_EXTS.contains(&ext) => media(
+            path,
+            ext,
+            max_chars,
+            ocr,
+            transcriber,
+            config.headroom_cores_cap(),
+        ),
         _ if ARCHIVE_EXTS.contains(&ext) && depth < 4 => {
             archive(path, config, ocr, transcriber, depth + 1, max_chars)
         }
@@ -437,6 +442,7 @@ fn media(
     max_chars: usize,
     ocr: &TesseractOcr,
     transcriber: &Transcriber,
+    ffmpeg_threads: Option<usize>,
 ) -> Result<Extracted> {
     if !transcriber.available() {
         return Err(
@@ -450,7 +456,14 @@ fn media(
         let temp = tempdir()?;
         let pattern = temp.path().join("frame-%06d.png");
         let output = Command::new("ffmpeg")
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"])
+            // Under headroom, `-threads <cores_cap>` on BOTH sides of `-i`:
+            // the flag is positional, so the input-side copy is the one that
+            // caps the video DECODER — the heavy half here — and the
+            // output-side copy caps the PNG encode/scale. Nothing at pct 0.
+            // See `headroom::ffmpeg_thread_args`.
+            .args(crate::headroom::ffmpeg_thread_args(ffmpeg_threads))
+            .arg("-i")
             .arg(path)
             .args([
                 "-vf",
@@ -458,6 +471,7 @@ fn media(
                 "-frames:v",
                 "1000",
             ])
+            .args(crate::headroom::ffmpeg_thread_args(ffmpeg_threads))
             .arg(&pattern)
             .output()?;
         if output.status.success() {
@@ -538,13 +552,26 @@ const HEIC_DECODE_TIMEOUT_SECS: u64 = 60;
 ///   `Decode`.
 ///
 /// [`FailureClass`]: crate::failure::FailureClass
-fn heic(path: &Path, max_chars: usize, ocr: &TesseractOcr) -> Result<Extracted> {
+fn heic(
+    path: &Path,
+    max_chars: usize,
+    ocr: &TesseractOcr,
+    ffmpeg_threads: Option<usize>,
+) -> Result<Extracted> {
     let temp = tempdir()?;
     let frame = temp.path().join("frame.jpg");
     let mut command = Command::new("ffmpeg");
-    command.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"]);
+    command.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"]);
+    // Under headroom, `-threads <cores_cap>` on BOTH sides of `-i`. The flag
+    // is positional and the INPUT-side copy is the one that bounds the
+    // tiled-HEVC decode — the one CPU-heavy step here; an output-side flag
+    // alone never reaches the decoder. The output-side copy bounds the JPEG
+    // encode. Nothing at pct 0. See `headroom::ffmpeg_thread_args`.
+    command.args(crate::headroom::ffmpeg_thread_args(ffmpeg_threads));
+    command.arg("-i");
     command.arg(path);
     command.args(["-frames:v", "1", "-q:v", "2"]);
+    command.args(crate::headroom::ffmpeg_thread_args(ffmpeg_threads));
     command.arg(&frame);
     // stdout/stderr dropped, matching `vision::video`'s bounded ffmpeg calls:
     // the frame lands on disk, so there is no pipe to drain, and draining one

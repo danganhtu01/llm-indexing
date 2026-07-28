@@ -232,19 +232,32 @@ fn aggregate(detections: &[(usize, f32)], num_classes: usize) -> Vec<ObjectDetec
 }
 
 /// Load the RF-DETR ONNX session from `<models_dir>/rf-detr-nano.onnx`.
-fn build_session(models_dir: &Path) -> Result<Mutex<Session>> {
+///
+/// `intra_cap` is the headroom core cap (`VisionConfig::headroom_cores_cap`):
+/// `Some` builds the session with `.with_intra_threads(cap)`, `None` keeps
+/// ONNX Runtime's own default of every core — byte-identical to before the
+/// knob existed. The builder's thread-config methods return
+/// `Error<SessionBuilder>` (the error carries the builder back for recovery),
+/// which is not `Send + Sync` and so not `anyhow`-compatible directly; mapping
+/// it through `ort::Error::from` drops the carried builder and yields the
+/// plain `Error<()>` that anyhow accepts — the recovery affordance is useless
+/// here anyway, since a session that cannot apply its thread cap should fail
+/// loudly rather than quietly run uncapped.
+fn build_session(models_dir: &Path, intra_cap: Option<usize>) -> Result<Mutex<Session>> {
     let path = models_dir.join(RFDETR_NANO_ONNX);
     anyhow::ensure!(
         path.is_file(),
         "object detector model not found at {} (run `llm-index fetch-data --vision`)",
         path.display()
     );
-    // ONNX Runtime defaults to all cores intra-op. We keep that default: its
-    // thread-config builder returns an error type that carries the builder for
-    // recovery and is not `anyhow`-compatible, and detector calls are already
-    // serialized by the shared `Mutex`.
-    let session = Session::builder()
-        .context("creating detector session builder")?
+    let mut builder = Session::builder().context("creating detector session builder")?;
+    if let Some(cap) = intra_cap {
+        builder = builder
+            .with_intra_threads(cap.max(1))
+            .map_err(ort::Error::<()>::from)
+            .context("capping detector intra-op threads")?;
+    }
+    let session = builder
         .commit_from_file(&path)
         .with_context(|| format!("loading detector model {}", path.display()))?;
     Ok(Mutex::new(session))
@@ -255,7 +268,15 @@ fn build_session(models_dir: &Path) -> Result<Mutex<Session>> {
 /// truncated during a re-fetch) caches nothing, so the next job retries rather
 /// than the resident `serve` process being poisoned until restart. A dedicated
 /// init lock serializes construction so the rayon workers don't all build at once.
-fn session(models_dir: &Path) -> Result<&'static Mutex<Session>> {
+///
+/// HEADROOM LIMITATION, by construction of this cache: `intra_cap` is baked
+/// into the session ort builds ONCE per process, so the cap of whichever job
+/// triggers the first build wins for the process lifetime — a later job with a
+/// different `headroom_pct` reuses the session as built (ort cannot rethread a
+/// live session). In practice the percent comes from the serve flag or the
+/// YAML config and is identical for every job of a process, so this only
+/// surfaces if the YAML is edited between jobs of a running server.
+fn session(models_dir: &Path, intra_cap: Option<usize>) -> Result<&'static Mutex<Session>> {
     static SESSION: OnceLock<Mutex<Session>> = OnceLock::new();
     static INIT: Mutex<()> = Mutex::new(());
     if let Some(session) = SESSION.get() {
@@ -265,7 +286,7 @@ fn session(models_dir: &Path) -> Result<&'static Mutex<Session>> {
     if let Some(session) = SESSION.get() {
         return Ok(session);
     }
-    let session = build_session(models_dir).context("detector init failed")?;
+    let session = build_session(models_dir, intra_cap).context("detector init failed")?;
     Ok(SESSION.get_or_init(|| session))
 }
 
@@ -276,7 +297,7 @@ pub(crate) fn fill(
     cfg: &VisionConfig,
     out: &mut VisionResult,
 ) -> Result<()> {
-    let session = session(models_dir)?;
+    let session = session(models_dir, cfg.headroom_cores_cap)?;
     let mut session = session
         .lock()
         .map_err(|_| anyhow::anyhow!("detector session mutex poisoned"))?;

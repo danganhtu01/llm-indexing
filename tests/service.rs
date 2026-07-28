@@ -31,6 +31,7 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
         submit_token: None,
+        headroom_pct: None,
     })
     .unwrap();
 
@@ -137,6 +138,7 @@ fn guard_router_with_config(
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
         submit_token: None,
+        headroom_pct: None,
     })
     .unwrap()
 }
@@ -651,6 +653,7 @@ async fn corpus_tree_rejects_an_unknown_root() {
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
         submit_token: None,
+        headroom_pct: None,
     })
     .unwrap();
 
@@ -680,6 +683,7 @@ async fn corpus_surface_degrades_to_empty_before_any_index_job() {
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
         submit_token: None,
+        headroom_pct: None,
     })
     .unwrap();
 
@@ -727,6 +731,7 @@ async fn corpus_tree_status_and_document_text_join_the_published_database() {
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
         submit_token: None,
+        headroom_pct: None,
     })
     .unwrap();
 
@@ -795,6 +800,7 @@ async fn corpus_status_reports_pending_files_from_meta_not_a_tree_walk() {
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
         submit_token: None,
+        headroom_pct: None,
     })
     .unwrap();
 
@@ -849,6 +855,7 @@ async fn corpus_status_reports_embedded_chunks_when_the_table_exists() {
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
         submit_token: None,
+        headroom_pct: None,
     })
     .unwrap();
 
@@ -897,6 +904,7 @@ async fn corpus_status_pending_files_never_goes_negative() {
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
         submit_token: None,
+        headroom_pct: None,
     })
     .unwrap();
 
@@ -938,6 +946,7 @@ fn vision_router(vision_max: VisionMode) -> axum::Router {
         max_body: 1024 * 1024,
         vision_max,
         submit_token: None,
+        headroom_pct: None,
     })
     .unwrap()
 }
@@ -1091,6 +1100,7 @@ async fn settings_route_serves_the_capability_contract() {
         // A high cap; with no models staged the endpoint still only offers `meta`.
         vision_max: VisionMode::Tags,
         submit_token: None,
+        headroom_pct: None,
     })
     .unwrap();
 
@@ -1129,6 +1139,7 @@ fn runtime_app(input: &std::path::Path, output: &std::path::Path) -> axum::Route
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
         submit_token: None,
+        headroom_pct: None,
     })
     .unwrap()
 }
@@ -1584,6 +1595,7 @@ fn gated_router(output: &std::path::Path, input: &std::path::Path) -> axum::Rout
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
         submit_token: Some(TOKEN.into()),
+        headroom_pct: None,
     })
     .unwrap()
 }
@@ -1814,6 +1826,7 @@ async fn an_empty_submit_token_refuses_to_serve() {
         max_body: 1024 * 1024,
         vision_max: VisionMode::Off,
         submit_token: Some(String::new()),
+        headroom_pct: None,
     })
     .unwrap_err();
     assert!(error.to_string().contains("submit-token"), "{error}");

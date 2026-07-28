@@ -46,6 +46,8 @@ const MAX_FRAMES_MIN: usize = 1;
 const MAX_FRAMES_MAX: usize = 64;
 const TIMEOUT_MIN: u64 = 5;
 const TIMEOUT_MAX: u64 = 1800;
+const HEADROOM_PCT_MIN: u8 = 0;
+const HEADROOM_PCT_MAX: u8 = 50;
 
 /// The v1 model selected by each vision sub-model toggle when it is not `off` —
 /// the SINGLE definition of these ids, referenced by both the accepted-value
@@ -92,6 +94,14 @@ pub const VISION_FACE_SCORE_RANGE: (f32, f32) = (FACE_SCORE_MIN, FACE_SCORE_MAX)
 pub const VISION_MAX_FACES_RANGE: (usize, usize) = (MAX_FACES_MIN, MAX_FACES_MAX);
 pub const VISION_MAX_FRAMES_RANGE: (usize, usize) = (MAX_FRAMES_MIN, MAX_FRAMES_MAX);
 pub const VISION_TIMEOUT_RANGE: (u64, u64) = (TIMEOUT_MIN, TIMEOUT_MAX);
+
+/// Bounds for the resource-headroom percent (`--headroom` / `headroom_pct`),
+/// the cross-engine contract shared with vlm-indexing: an integer percent of
+/// the machine left free, `0` meaning the feature is fully off. Defined here
+/// with the other knob ranges so `Config::finalize` clamps the YAML value and
+/// the clap `value_parser` validates the flag against this ONE definition (see
+/// the `headroom` module for what a non-zero percent does).
+pub const HEADROOM_PCT_RANGE: (u8, u8) = (HEADROOM_PCT_MIN, HEADROOM_PCT_MAX);
 
 /// Per-job OCR overrides. Absent (`None`) fields fall through to the service
 /// config, then the built-in default, via [`OcrSettings::merge`].
