@@ -1935,6 +1935,38 @@ async fn a_gated_submit_without_the_token_is_refused_with_nothing_created() {
 }
 
 #[tokio::test]
+async fn refusal_body_carries_the_shared_401_shape() {
+    // vlm-indexing's identical gate (its src/service.rs,
+    // `require_submit_token`) refuses with the same
+    // `{"status","error","header"}` shape. Pinning the exact key set here —
+    // not just that "header" is present — is what keeps the two engines'
+    // bodies from drifting apart again the next time either gate is touched.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = gated_router(&output, &input);
+
+    let (status, body) = post_with_token(
+        &app,
+        "/index",
+        json!({"id":"shape-check","paths":[input],"output":"corpus.sqlite","ocr":"off"}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["error", "header", "status"]);
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["header"], "X-Submit-Token");
+}
+
+#[tokio::test]
 async fn a_gated_submit_with_the_correct_token_is_accepted_and_runs() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("input");
@@ -2048,6 +2080,65 @@ async fn the_read_surface_stays_open_while_gated() {
         body["error"].as_str().unwrap().contains("q is required"),
         "{body}"
     );
+}
+
+#[tokio::test]
+async fn every_non_get_head_method_is_gated_while_get_and_head_ride_free() {
+    // The gate keys on GET/HEAD, not on a route list: PUT and DELETE — neither
+    // of which this service registers a handler for — must still be refused
+    // with 401 by the gate itself, before axum's own routing ever gets a
+    // chance to answer 405/404. That is what makes "a job-mutating route
+    // added later with a method other than POST is covered by default" true
+    // rather than aspirational.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = gated_router(&output, &input);
+
+    for method in ["PUT", "DELETE", "PATCH"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/index")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method}");
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["header"], "X-Submit-Token", "{method}: {body}");
+    }
+
+    // GET and HEAD stay open with no token at all — the read surface is not a
+    // write credential.
+    let get_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_response.status(), StatusCode::OK);
+
+    let head_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head_response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

@@ -295,10 +295,10 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         // review before the next binary swap found it unsafe to ship as-is:
         //
         //   1. Ungated even with a submit token configured. The gate below
-        //      (`require_submit_token`) keys on `request.method() != POST`,
-        //      so every GET passes unconditionally — including this one. That
-        //      is fine for read-only *mutation* safety, which is the gate's
-        //      job, but this route is a *confidentiality* leak, not a
+        //      (`require_submit_token`) passes every GET/HEAD unconditionally,
+        //      including this one. That is fine for read-only *mutation*
+        //      safety, which is the gate's job, but this route is a
+        //      *confidentiality* leak, not a
         //      mutation: it hands out the whole corpus (embeddings, every
         //      indexed path, vision/faces, meta) to anyone who can reach the
         //      port, token or not.
@@ -335,9 +335,10 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         //      stream's whole life (not dropped once the handler returns).
         //   c. A single-flight semaphore so concurrent exports cannot stack
         //      concurrent vacuums/allocations.
-        //   d. Gating behind the submit token — which first requires the gate
-        //      to stop keying on POST alone (see `require_submit_token`'s
-        //      docstring below).
+        //   d. Gating behind the submit token — this route is a GET, and the
+        //      gate leaves every GET/HEAD ungated by design (see
+        //      `require_submit_token`'s docstring below), so this first
+        //      requires the selected-GETs widening described there.
         .layer(DefaultBodyLimit::max(max_body))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -383,33 +384,35 @@ pub const SUBMIT_TOKEN_HEADER: &str = "X-Submit-Token";
 /// the engine and keeps it to itself, becoming the only caller whose
 /// mutations the engine accepts.
 ///
-/// The gate keys on the METHOD, not on a route list: in this service every
-/// mutation is a POST (`/index`, `/jobs/{id}/cancel`, `/runtime`,
-/// `/jobs/{id}/runtime`), so a job-mutating route added later is covered by
+/// The gate keys on the METHOD, not on a route list: GET and HEAD pass
+/// unconditionally — that is this service's whole read surface (`/health`,
+/// `/settings`, `/jobs/{id}`, `/runtime`, the `/corpus/*` reads), which is
+/// what makes the token an app-held WRITE credential rather than a service
+/// password — and every other method is gated. Today every mutation this
+/// service registers happens to be a POST (`/index`, `/jobs/{id}/cancel`,
+/// `/runtime`, `/jobs/{id}/runtime`), but the gate does not rely on that: a
+/// job-mutating route added later with PUT, PATCH or DELETE is covered by
 /// default (fail closed) instead of depending on someone remembering to
-/// enrol it. Read-only routes stay open on purpose — the app's search proxy,
-/// monitor panels and read tools keep working tokenless, which is what makes
-/// the token an app-held WRITE credential rather than a service password.
+/// enrol it. vlm-indexing's identical gate uses the same GET/HEAD-only rule.
 ///
-/// That "every GET is read-only by construction" was originally offered here
-/// as the reason passing all GETs unconditionally is safe. It is true for
-/// *mutation* safety, which is this gate's actual job, but it does NOT mean
-/// every GET is safe to leave ungated in general: a GET can still exfiltrate
-/// data it has no business handing out. `/export/corpus` (see the
-/// unregistered route above) is exactly that case — read-only, and yet a
-/// full download of the corpus database with no token check at all. This PR
-/// does not change this gate's behavior (POST-keying stays as-is); it only
-/// corrects the assumption in this comment so a future reader does not reuse
-/// it to justify shipping another read-that-leaks route ungated. Widening
-/// this gate to cover selected GETs is part of `/export/corpus`'s
-/// re-registration checklist, not done here.
+/// That "every GET is read-only by construction" is true for *mutation*
+/// safety, which is this gate's actual job, but it does NOT mean every GET is
+/// safe to leave ungated in general: a GET can still exfiltrate data it has
+/// no business handing out. `/export/corpus` (see the unregistered route
+/// above) is exactly that case — read-only, and yet a full download of the
+/// corpus database with no token check at all. The gate does not widen to
+/// cover GETs here; this comment only names the distinction so a future
+/// reader does not reuse "GET is gated open" to justify shipping another
+/// read-that-leaks route ungated. Widening this gate to cover selected GETs
+/// is part of `/export/corpus`'s re-registration checklist, not done here.
 ///
 /// A rejection happens before any handler runs, so it has no side effects: no
 /// job row, no cancellation flag, no persisted envelope. The body names the
 /// header so a refused integrator learns what to send, not just that they
 /// were refused.
 async fn require_submit_token(token: &str, request: Request, next: Next) -> Response {
-    if request.method() != Method::POST {
+    // HEAD rides along with GET: axum serves it from the same read handlers.
+    if request.method() == Method::GET || request.method() == Method::HEAD {
         return next.run(request).await;
     }
     let authorized = request
