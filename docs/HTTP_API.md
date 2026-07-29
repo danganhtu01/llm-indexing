@@ -89,7 +89,7 @@ apart.
       "timeout_secs": 60
     }
   },
-  "workers": {"default": 8, "max": 64}
+  "workers": {"default": 8, "max": 64, "effective": 8}
 }
 ```
 
@@ -126,6 +126,15 @@ apart.
 - `workers.max` is the fixed ceiling (`config::MAX_WORKERS`, 64) applied to
   `Config::finalize`'s clamp; `workers.default` is this server's configured
   worker count.
+- `workers.effective` is the **extract width jobs are actually seeded at** —
+  the live process-wide `extract` stage (`GET /runtime`), which is
+  `default` capped by `serve --headroom` (`RuntimeKnobs::from_config`) and then
+  by any later `POST /runtime`. `default` and `max` are advertised *static*
+  bounds and neither of them moves when headroom is on, so before this field a
+  box served with `--headroom 50` reported the full configured width while
+  running half of it. Equal to `default` whenever headroom is off and the
+  defaults have not been retuned, which is the common case; strictly below it
+  otherwise.
 - Runs the tessdata/hash probes on a blocking worker thread
   (`tokio::task::spawn_blocking`), never the async executor, since they exec
   `tesseract --list-langs` and hash up to ~100 MB of model files.

@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use llm_indexing::config::MAX_WORKERS;
+use llm_indexing::headroom::cores_cap;
 use llm_indexing::jobs_store::{JobsStore, INTERRUPTED_ERROR};
 use llm_indexing::service::{router, ServiceConfig};
 use llm_indexing::vision::VisionMode;
@@ -1172,6 +1174,97 @@ async fn settings_route_serves_the_capability_contract() {
     assert_eq!(settings["vision"]["tiers_available"], json!(["meta"]));
     assert_eq!(settings["vision"]["detectors"][0]["id"], "nano");
     assert_eq!(settings["vision"]["detectors"][0]["present"], false);
+}
+
+// ── `workers.effective` — the seed the engine actually runs (G2) ─────────────
+//
+// `default`/`max` are advertised STATIC bounds. `effective` is the third number
+// and the only one that describes this process: the headroom-capped extract
+// width every new job is snapshotted from. It must come from the live
+// `AppState::defaults` (built after `Config::override_headroom(--headroom)`),
+// never from `build_settings`' own `Config::load`, which cannot see the flag.
+
+fn headroom_router(workers: usize, headroom_pct: Option<u8>) -> axum::Router {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    router(ServiceConfig {
+        output_root: temp.path().join("output"),
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
+        submit_token: None,
+        headroom_pct,
+    })
+    .unwrap()
+}
+
+async fn workers_block(app: &axum::Router) -> Value {
+    let response = get(app, "/settings").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let settings: Value = serde_json::from_slice(&body).unwrap();
+    settings["workers"].clone()
+}
+
+#[tokio::test]
+async fn settings_reports_the_headroom_capped_effective_worker_seed() {
+    // `serve --workers 64 --headroom 50`: the advertised default stays 64
+    // (nothing rewrites the configured width), but the engine spawns jobs at
+    // the core cap. THIS is the case the field exists for — before it,
+    // `/settings` reported 64 on a box running 12.
+    let app = headroom_router(MAX_WORKERS, Some(50));
+    let workers = workers_block(&app).await;
+
+    let cap = cores_cap(50);
+    assert_eq!(workers["default"], MAX_WORKERS, "{workers}");
+    assert_eq!(workers["max"], MAX_WORKERS, "{workers}");
+    assert_eq!(
+        workers["effective"],
+        json!(MAX_WORKERS.min(cap)),
+        "effective must be the headroom-capped seed, not the advertised default: {workers}"
+    );
+    // On any box with fewer than 2 * MAX_WORKERS cores the cap genuinely bites,
+    // which is the half worth pinning: the number DROPS below `default`. A
+    // regression that recomputed `effective` from `build_settings`' own
+    // flag-blind `Config::load` would report `default` here.
+    if cap < MAX_WORKERS {
+        assert!(
+            workers["effective"].as_u64().unwrap() < workers["default"].as_u64().unwrap(),
+            "{workers}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn settings_effective_equals_the_default_when_headroom_is_off() {
+    // Feature off (the default on every box): nothing is capped, so the two
+    // numbers agree and a UI showing them side by side has nothing to explain.
+    let app = headroom_router(7, None);
+    let workers = workers_block(&app).await;
+    assert_eq!(workers["default"], 7, "{workers}");
+    assert_eq!(workers["effective"], 7, "{workers}");
+}
+
+#[tokio::test]
+async fn settings_effective_tracks_a_retune_of_the_process_defaults() {
+    // `effective` reads the LIVE process-wide defaults, so a `POST /runtime`
+    // that lowers `extract` is reflected: the answer stays "what the next job
+    // is seeded at", which is the only reading that can be acted on.
+    let app = headroom_router(8, None);
+    assert_eq!(workers_block(&app).await["effective"], 8);
+
+    let (status, _) = post_json(&app, "/runtime", json!({"extract": 3})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let workers = workers_block(&app).await;
+    assert_eq!(workers["default"], 8, "the advertised bound is unchanged");
+    assert_eq!(workers["effective"], 3, "{workers}");
 }
 
 // ── Live stage tuning (GET/POST /runtime, POST /jobs/{id}/runtime) ───────────
