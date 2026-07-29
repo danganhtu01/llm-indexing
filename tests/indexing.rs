@@ -1277,6 +1277,7 @@ fn a_backfill_pass_hashes_skipped_rows_and_touches_nothing_else() {
     assert_eq!(stats.errors, 0);
     // The rows left `skipped` for `hashed` — this run did touch them.
     assert_eq!(stats.hashed, 4);
+    assert_eq!(stats.hash_failed, 0, "every owed file was readable");
     assert_eq!(stats.skipped, 0, "hashed rows are not also skipped");
     assert_eq!(stats.capped, 0);
 
@@ -1427,6 +1428,128 @@ fn an_armed_backfill_grows_the_total_and_processed_reaches_it() {
         "the owed rows are in `total` from the first sample and `processed` reaches it"
     );
     assert_eq!(stats.hashed, 4);
+}
+
+/// A file the lane claims but cannot READ must be counted, not dropped.
+///
+/// This is the common case on a real drive, not an edge: locked mail stores, VM
+/// disks a hypervisor holds open, anything another process has exclusive,
+/// anything the account cannot read. Such a row is out of `skipped` (the lane
+/// claimed it), gets no `sha1`, writes no `error:` row and so lands in neither
+/// `files` nor `errors` — so without `hash_failed` its only trace would be an
+/// unexplained gap between the owed count the run announced and the hashes it
+/// produced, which is indistinguishable from a bug in the lane.
+///
+/// Unreadability is staged by DELETING the file after the walk has recorded it
+/// and before the lane reaches it, driven off the opening `progress(0, total)`
+/// sample. That is deterministic and identical on every platform, unlike a
+/// permissions bit (which root ignores) or a deny-read share mode (Windows
+/// only), and it reproduces exactly the shape that matters: a row whose file
+/// the walk saw and the hash read cannot get at.
+#[test]
+fn a_file_the_lane_cannot_read_is_counted_not_silently_dropped() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let destination = temp.path().join("corpus.sqlite");
+    let paths = sample_tree(&input, 2);
+
+    index_with(
+        &input,
+        &destination,
+        backfill_config(false, false),
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+    let before = file_rows(&destination);
+
+    // Removed after the walk that records it, before the lane reads it. The
+    // walk drives pruning off its own snapshot, so the row survives the run.
+    let doomed = paths[1].clone();
+    // Captured so the file can be put back byte-for-byte, mtime included, for
+    // the second armed run below — anything else would make the row look CHANGED
+    // and send it down the indexing path instead of the lane.
+    let doomed_bytes = fs::read(&doomed).unwrap();
+    let doomed_mtime = fs::metadata(&doomed).unwrap().modified().unwrap();
+    let samples: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = samples.clone();
+    let stats = index_with(
+        &input,
+        &destination,
+        backfill_config(true, true),
+        true,
+        None,
+        Some(Arc::new(move |processed, total| {
+            if processed == 0 {
+                fs::remove_file(&doomed).unwrap();
+            }
+            sink.lock().unwrap().push((processed, total))
+        })),
+    )
+    .unwrap();
+
+    assert_eq!(stats.hashed, 1, "the readable file is still hashed");
+    assert_eq!(stats.hash_failed, 1, "the unreadable one is COUNTED");
+    // The whole point: nothing is left unattributed. Both rows were owed, both
+    // were attempted, and the two counters add back up to the owed count.
+    assert_eq!(
+        stats.hashed + stats.hash_failed,
+        2,
+        "the lane's accounting must close — no unexplained remainder"
+    );
+    assert_eq!(stats.skipped, 0, "a claimed row is not also a skip");
+    assert_eq!(stats.files, 0, "nothing was indexed");
+    assert_eq!(stats.errors, 0, "a hash miss writes no error row");
+    assert_eq!(
+        samples.lock().unwrap().as_slice(),
+        [(0, 2), (1, 2), (2, 2)],
+        "an unreadable file still advances `processed` — the read was attempted"
+    );
+
+    // The row itself survives untouched, including its NULL sha1: a hash that
+    // could not be taken says nothing about an extraction that succeeded.
+    let after = file_rows(&destination);
+    assert_eq!(after.len(), 2, "the unreadable file keeps its row");
+    let missed = after
+        .iter()
+        .find(|row| row.0 == paths[1])
+        .expect("the row for the removed file is not pruned by its own run");
+    assert_eq!(missed.8, None, "no hash landed");
+    let original = before.iter().find(|row| row.0 == paths[1]).unwrap();
+    assert_eq!(missed, original, "the row is byte-for-byte as it was");
+
+    // And because no hash ever lands, `backfill_candidate` re-claims it on every
+    // armed run — the honest counterpart to the one-time-cost property that
+    // holds for rows the lane CAN read. Restored identically (same bytes, same
+    // mtime) so the resume predicate still calls it finished and unchanged, then
+    // removed again at the same point in the run.
+    fs::write(&paths[1], &doomed_bytes).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&paths[1])
+        .unwrap()
+        .set_modified(doomed_mtime)
+        .unwrap();
+    let doomed = paths[1].clone();
+    let again = index_with(
+        &input,
+        &destination,
+        backfill_config(true, true),
+        true,
+        None,
+        Some(Arc::new(move |processed, _| {
+            if processed == 0 {
+                fs::remove_file(&doomed).unwrap();
+            }
+        })),
+    )
+    .unwrap();
+    assert_eq!(
+        (again.hashed, again.hash_failed, again.skipped),
+        (0, 1, 1),
+        "the hashed row is now a plain skip; the unreadable one is owed again"
+    );
 }
 
 /// A killed backfill keeps what it hashed and the next run owes only the rest —

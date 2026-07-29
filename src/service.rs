@@ -1250,8 +1250,8 @@ fn run_job(
     Ok(json!({
         "id":id,"status":"complete","output":request.output,"database":destination,"files":stats.files,
         "ocr_files":stats.ocr_files,"errors":stats.errors,"encrypted":stats.encrypted,"skipped":stats.skipped,
-        "capped":stats.capped,"hashed":stats.hashed,"incomplete":stats.incomplete,
-        "embedded_chunks":stats.embedded_chunks,"removed":stats.removed,
+        "capped":stats.capped,"hashed":stats.hashed,"hash_failed":stats.hash_failed,
+        "incomplete":stats.incomplete,"embedded_chunks":stats.embedded_chunks,"removed":stats.removed,
         "vision_files":stats.vision_files,"vision":config.vision.max.as_str(),
         "elapsed_seconds":stats.elapsed_seconds,"ocr_langs":config.ocr_langs,"completed_at":now()
     }))

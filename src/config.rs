@@ -771,14 +771,16 @@ impl Config {
         // mis-set YAML value (200) caps at the contract ceiling instead of
         // starving the job. Idempotent like the rest of finalize.
         self.override_headroom(None);
-        // The sha1 backfill lane's second gate cannot stand without the first,
-        // so a config that asks for it with hashing off is normalised here
-        // rather than left to lie about itself in `GET /settings` and in every
-        // serialized copy of this struct. `Config::sha1_backfill` enforces the
-        // same conjunction at the decision point, so the lane is correct with or
-        // without this line; it exists so the VALUE an operator reads back
-        // matches the behaviour they will get. Idempotent, like the rest of
-        // finalize.
+        // The sha1 backfill lane's second gate cannot stand without the first, so
+        // a config that asks for it with hashing off is normalised to what it
+        // will actually do. `Config::sha1_backfill` enforces the same conjunction
+        // at the decision point, so the LANE is correct with or without this
+        // line — this is for whoever reads the FIELD: a debugger, a dump, or the
+        // next piece of code to consult it directly instead of the accessor.
+        // Deliberately not justified by any published surface, because there
+        // isn't one: `GET /settings` is a hand-rolled `json!` that never emits
+        // this key, and nothing in the crate serialises `Config` wholesale.
+        // Idempotent, like the rest of finalize.
         self.hash_backfill &= self.hash;
         self.workers = clamp_workers(self.workers);
         self.embed_workers = self

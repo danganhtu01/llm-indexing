@@ -331,7 +331,7 @@ all three tables — except when the walk found nothing at all, which is far mor
 often an unmounted or mistyped root than a tree whose every file was deleted,
 and pruning is no longer reversible now that it lands in the published corpus.
 Rebuilding from empty is what `overwrite` is for. Job metrics expose files, OCR files, errors, incomplete files,
-embedded chunks, removed files, capped files, hashed files and elapsed time. A cooperative cancellation flag
+embedded chunks, removed files, capped files, hashed and unhashable files, and elapsed time. A cooperative cancellation flag
 is checked around extraction and embedding; a cancelled job commits what it
 finished and leaves it in the destination corpus, so resubmitting with `resume`
 continues from there.
@@ -364,9 +364,22 @@ backfill keeps what it hashed and the next run owes only the rest.
 The lane runs before the indexing pass, sequentially, on the thread that owns the
 store, and observes the cancellation flag. A 1 GiB ceiling applies to it alone,
 mirroring `SHA1_MAX_BYTES` in the consuming drives-analytics app; the forward
-hash path is unchanged and has no ceiling, so the two agree below it only.
-Backfilled hashes reach SQLite only — `manifest.jsonl` and `catalog.csv` are
-per-indexed-file exports and a hash-only row produces no line in either.
+hash path is unchanged and has no ceiling, so the two agree below it only. In
+practice `max_bytes` binds first — a file over it extracts to `name-only`, an
+incomplete row the lane never claims — so the ceiling is only load-bearing where
+`max_bytes` has been raised past it or `ocr: exhaustive` bypasses the size
+cut-off. Backfilled hashes reach SQLite only — `manifest.jsonl` and `catalog.csv`
+are per-indexed-file exports and a hash-only row produces no line in either.
+
+A claimed file that will not open or read is counted in `hash_failed`, and named
+in the log up to a sample, rather than dropped. It writes no row: the stored row
+is a successful extraction that is still true, and a hash that could not be taken
+says nothing about it. Its own counter rather than `errors`, which counts rows
+written with an `error:` method and has a row behind every one of them. The
+accounting closes on it — for a lane that ran to completion,
+`hashed + hash_failed` is the owed count it announced — and because those rows
+never acquire a `sha1` the lane re-claims them on every armed run, which makes
+the counter the convergence signal for the whole exercise.
 
 ### Durability
 

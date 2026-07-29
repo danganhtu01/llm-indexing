@@ -61,6 +61,17 @@ pub const MAX_ATTEMPTS: u32 = 3;
 /// they are harmless (a hash the app simply declines to consult).
 const SHA1_MAX_BYTES: u64 = 1 << 30;
 
+/// How many individually unreadable files the sha1 backfill lane names in the
+/// log before it falls back to counting them.
+///
+/// The per-file line is the diagnosable one — "permission denied" across a whole
+/// subtree and "the file is open in another process" on scattered PSTs are
+/// different problems and do not look alike — but a corpus can have six figures
+/// of them, and a line each would make one run's log larger than the corpus
+/// listing. A sample plus [`IndexStats::hash_failed`] gives both the pattern and
+/// the magnitude.
+const HASH_MISS_SAMPLE: usize = 20;
+
 pub struct IndexRequest<'a> {
     pub paths: &'a [PathBuf],
     pub out: &'a Path,
@@ -397,19 +408,64 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
             backfill_cancelled = true;
             break;
         }
-        // An unreadable file leaves its row exactly as it was — `sha1` still
-        // NULL, owed again by the next run — rather than becoming an error row:
-        // the row describes a successful extraction that is still true, and a
-        // hash that could not be taken says nothing about it. It still advances
-        // `processed`, because the attempt cost what it cost.
-        if let Some(digest) = sha1(Path::new(path)) {
-            store.set_sha1(path, &digest)?;
-            stats.hashed += 1;
+        match sha1(Path::new(path)) {
+            Ok(digest) => {
+                store.set_sha1(path, &digest)?;
+                stats.hashed += 1;
+            }
+            // An unreadable file leaves its row exactly as it was — `sha1` still
+            // NULL — rather than becoming an `error:` row: the row describes a
+            // successful extraction that is still true, and a hash that could
+            // not be taken says nothing about it.
+            //
+            // It is COUNTED, though, and that is the point of `hash_failed`
+            // existing at all. This is not a rare case on a real drive: locked
+            // PST files, VM disks held open by a hypervisor, anything another
+            // process has exclusive, anything the service account cannot read.
+            // Without its own counter such a row would appear in NOTHING — out
+            // of `skipped` (the lane claimed it), out of `hashed` (no hash
+            // landed), never in `files` or `errors` (nothing was indexed) —
+            // leaving an unexplained gap between the owed count this run
+            // announced and the hashes it produced, indistinguishable from a bug
+            // in the lane. The run's accounting has to close: for a lane that
+            // ran to completion, `hashed + hash_failed` is exactly the owed
+            // count reported before it started.
+            //
+            // These rows are also the ones the lane re-attempts on every armed
+            // run, precisely because no hash ever lands on them — so the count
+            // is what tells an operator whether the backfill has converged or is
+            // going to keep costing this much forever.
+            Err(error) => {
+                stats.hash_failed += 1;
+                // Listed individually up to a sample, then counted only. The
+                // per-file line is what makes the failures diagnosable (a
+                // permissions pattern and a locked-file pattern do not look
+                // alike), and the cap is what stops a corpus with six figures of
+                // unreadable files turning one run into a six-figure log.
+                if stats.hash_failed <= HASH_MISS_SAMPLE {
+                    eprintln!("sha1 backfill: leaving {path} unhashed — {error:#}");
+                    if stats.hash_failed == HASH_MISS_SAMPLE {
+                        eprintln!(
+                            "sha1 backfill: further unreadable files are counted, not listed"
+                        );
+                    }
+                }
+            }
         }
+        // Advances on BOTH arms: the read was attempted and cost what it cost.
         processed += 1;
         if let Some(progress) = &request.progress {
             progress(processed, total);
         }
+    }
+    if backfill {
+        // The closing half of the lane's accounting, printed even when the run
+        // was cancelled part-way (the two counters then describe what it got
+        // through, and the difference from the owed count is the cancel).
+        eprintln!(
+            "sha1 backfill: {} row(s) hashed, {} unreadable",
+            stats.hashed, stats.hash_failed
+        );
     }
     // Seeded, not zero: the indexing pass continues the run's single processed
     // counter rather than restarting it, so a poller never sees it go backwards.
@@ -825,7 +881,11 @@ fn process(
             );
             let lang = normalizer.detect_lang(&content);
             let tokens = normalizer.enrich(&token_source, &lang);
-            let hash = config.hash.then(|| sha1(path)).flatten();
+            // `.ok()` keeps the forward path exactly as it was: a file this run
+            // is indexing and cannot hash has already failed, or is about to
+            // fail, on the same bytes elsewhere, and that failure is what the
+            // row records.
+            let hash = config.hash.then(|| sha1(path).ok()).flatten();
             ProcessedFile {
                 rec: record,
                 content,
@@ -1061,18 +1121,32 @@ fn nfc(text: String) -> String {
     }
 }
 
-fn sha1(path: &Path) -> Option<String> {
-    let mut file = fs::File::open(path).ok()?;
+/// Sha1 of a file's bytes.
+///
+/// Returns the FAILURE rather than swallowing it. The forward path throws it
+/// away (`.ok()`) exactly as it always did — a file whose hash could not be
+/// taken there has already produced an `error:` row from the extraction that
+/// failed on the same bytes, so the reason is recorded. The BACKFILL lane has no
+/// such row to lean on: its rows are finished and stay finished, so if this
+/// returned a bare `None` the lane could only report that a hash did not appear,
+/// not why. "Permission denied" versus "the file is open in another process" is
+/// the whole difference between a corpus an operator can finish hashing and one
+/// they cannot explain.
+fn sha1(path: &Path) -> Result<String> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("opening {} to hash it", path.display()))?;
     let mut hash = Sha1::new();
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
-        let n = file.read(&mut buffer).ok()?;
+        let n = file
+            .read(&mut buffer)
+            .with_context(|| format!("reading {} to hash it", path.display()))?;
         if n == 0 {
             break;
         }
         hash.update(&buffer[..n]);
     }
-    Some(format!("{:x}", hash.finalize()))
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn now() -> f64 {

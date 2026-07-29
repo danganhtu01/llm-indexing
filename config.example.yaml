@@ -27,8 +27,12 @@ hash: false                  # compute sha1 (slower); false = use size+mtime as 
 # ordinary index job into a full byte-read of every one of those files (the live
 # llm corpus has 538,913 of them), which is a run an operator should choose
 # deliberately rather than discover. Backfilled rows keep every other column
-# (method, chars, pages, indexed_at, attempts, elapsed_ms) exactly as stored, are
-# reported as `hashed` rather than `skipped`, and files >= 1 GiB are left alone.
+# (method, chars, pages, indexed_at, attempts, elapsed_ms) exactly as stored and
+# are reported as `hashed` rather than `skipped`. A file the lane cannot open or
+# read (locked, in use, no rights) is counted as `hash_failed`, left unhashed,
+# and claimed again on every armed run — that counter is how you tell whether the
+# backfill has converged. Files >= 1 GiB are skipped outright, though `max_bytes`
+# normally binds long before that ceiling is reachable.
 hash_backfill: false
 ocr_max_pages: 20            # max PDF pages to OCR per file
 

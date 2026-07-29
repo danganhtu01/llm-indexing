@@ -79,6 +79,30 @@ pub struct IndexStats {
     /// Zero on every run that did not turn `hash_backfill` on, which is every run
     /// by default.
     pub hashed: usize,
+    /// Rows the sha1 backfill lane claimed and could NOT hash, because their file
+    /// would not open or would not read: locked mail stores, VM disks a
+    /// hypervisor holds open, anything the account running the job cannot read.
+    ///
+    /// Its own counter rather than a fold into `errors`, on purpose. `errors`
+    /// counts rows this run WROTE with an `error:` method — `encrypted` and
+    /// `incomplete` are subsets of it, and a reader can go find every one of them
+    /// in the corpus. A hash miss writes no row at all: the stored row is a
+    /// successful extraction that is still true, and a hash that could not be
+    /// taken says nothing about it. Folding the two together would break the
+    /// "every `errors` has a row behind it" property for a case that has none.
+    ///
+    /// It exists because the alternative is a SILENT DROP. The lane's rows leave
+    /// `skipped` by construction, and a miss puts nothing in `hashed`, nothing in
+    /// `files` and nothing in `errors` — so without this the only trace would be
+    /// an unexplained gap between the owed count a run announces and the hashes
+    /// it produces, indistinguishable from a bug in the lane. **The accounting
+    /// closes here:** for a lane that ran to completion,
+    /// `hashed + hash_failed` is exactly the owed count.
+    ///
+    /// It is also the convergence signal. These are precisely the rows that never
+    /// acquire a `sha1`, so the lane re-claims every one of them on every armed
+    /// run; the backfill is done when this is all that is left.
+    pub hash_failed: usize,
     pub incomplete: usize,
     pub embedded_chunks: usize,
     pub removed: usize,
