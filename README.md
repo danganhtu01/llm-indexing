@@ -225,6 +225,49 @@ but extraction, OCR, transcription and embedding are restricted to exactly that
 list. This is how `ff-lc-app` guarantees that a button press processes only its
 database-derived new, changed or incomplete rows.
 
+### sha1 backfill (`hash_backfill`)
+
+`hash: true` computes a `sha1` for each file the job INDEXES. It says nothing
+about rows that are already finished — resume does not re-extract those, so a
+corpus indexed before `hash` was turned on keeps `sha1 IS NULL` on every one of
+those rows forever, however many times it is resumed. `hash_backfill: true`
+(default `false`) is the opt-in that repairs them: on a resume, and only with
+`hash: true` as well, each row the run would have SKIPPED and that carries no
+hash gets one.
+
+It is two gates and off by default deliberately. A corpus with a long unhashed
+history — the production llm corpus has 538,913 such rows — turns the next
+ordinary index job into a full byte-read of every one of those files. That is a
+run an operator should choose, not discover, so the capability ships inert.
+
+What a backfilled row gets is a `sha1` column and nothing else. `method`,
+`chars`, `pages`, `indexed_at`, `attempts`, `last_attempt_at` and `elapsed_ms`
+are exactly as they were: a hash pass is not an indexing attempt and must not
+look like one to the resume predicate or the attempt cap. Specifically:
+
+- Only FINISHED rows are claimed. A `capped` row — one resume declined because
+  it has failed too often — is left for the forward path to hash when
+  `retry_errors` or a moved extraction revision reopens it, which also keeps
+  `capped` a strict subset of `skipped`.
+- Files at or above 1 GiB are left unhashed. That mirrors the ceiling in the
+  consuming app, which does not compare hashes above it either. The FORWARD hash
+  path has no such ceiling and is unchanged, so the two agree only below it.
+- Backfilled hashes land in the SQLite corpus only. The `manifest.jsonl` and
+  `catalog.csv` artifacts are per-indexed-file exports written as files are
+  processed; a row this run did not process produces no line in them, and
+  rewriting either to interleave hash-only entries would change their meaning
+  from "what this run indexed" to something no consumer expects.
+- The counters: hash-only rows are counted in `processed`/`total` and in
+  `hashed`, and are NOT counted in `skipped` (this run does read every one of
+  those files end to end). `total` therefore GROWS on an armed resume; both
+  counters move together, so a rate derived from them stays honest.
+- The run's first progress line reports how many rows owe a hash, before any of
+  them is read.
+- It is interruptible. Hashes are committed on the same batch boundary as
+  indexed files, so a killed backfill keeps what it finished and the next run
+  owes only the remainder. It is also a one-time cost: a row that has a hash is
+  never re-read.
+
 ### Page anchors
 
 Chunks carry `page_start`/`page_end` — the 1-based page span the chunk's text

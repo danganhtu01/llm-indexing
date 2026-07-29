@@ -284,9 +284,16 @@ Unknown top-level fields anywhere in the job body remain permissively ignored
 Returns `queued`, `running`, `cancelling`, `cancelled`, `complete` or `error`.
 Running jobs include live `processed` and `total` file counters. A completed job includes the
 database path, file/OCR/error/incomplete counts, the `capped` count of rows resume
-declined because they have failed too often, embedded chunk count, the `faces`
-count of faces stored (0 unless the opt-in faces sub-tier ran), removed
-source count, elapsed time and OCR languages.
+declined because they have failed too often, the `hashed` count of rows the sha1
+backfill lane hashed without indexing (0 unless `hash_backfill` is on), embedded
+chunk count, the `faces` count of faces stored (0 unless the opt-in faces
+sub-tier ran), removed source count, elapsed time and OCR languages.
+
+`processed`/`total` include the backfill lane's rows, so an armed resume reports a
+LARGER `total` than the same resume unarmed — the run genuinely has that much more
+to do, and because both counters move together a rate or ETA derived from them
+stays honest. `hashed` rows count in `processed` and are NOT counted in `skipped`;
+`capped` remains a strict subset of `skipped`.
 
 ## `POST /jobs/{id}/cancel`
 

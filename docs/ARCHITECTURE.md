@@ -331,10 +331,42 @@ all three tables — except when the walk found nothing at all, which is far mor
 often an unmounted or mistyped root than a tree whose every file was deleted,
 and pruning is no longer reversible now that it lands in the published corpus.
 Rebuilding from empty is what `overwrite` is for. Job metrics expose files, OCR files, errors, incomplete files,
-embedded chunks, removed files, capped files and elapsed time. A cooperative cancellation flag
+embedded chunks, removed files, capped files, hashed files and elapsed time. A cooperative cancellation flag
 is checked around extraction and embedding; a cancelled job commits what it
 finished and leaves it in the destination corpus, so resubmitting with `resume`
 continues from there.
+
+### sha1 backfill lane
+
+`files.sha1` is written by the forward path, i.e. only for a file the job
+actually indexes, so rows finished before `hash` was enabled never acquire one:
+resume does not re-extract a finished row, and nothing else writes that column.
+The `hash_backfill` knob (default off, and requiring `hash` as well) adds a lane
+that hashes exactly the rows the resume predicate declined.
+
+Classification happens INSIDE the `records.retain` block that implements that
+predicate, because the lane's population is by definition "the rows that block
+declined"; deriving it separately would mean re-implementing the predicate and
+eventually disagreeing with it. That block runs only under
+`resume && !embed_model_changed`, which is the correct and complete condition:
+both other shapes send every walked file down the forward path, which hashes it.
+Capped rows are excluded — they may still be indexed once the cap lifts, and the
+exclusion is what keeps `capped` a strict subset of `skipped`.
+
+The writer is `IndexStore::set_sha1`, a bare `UPDATE files SET sha1 WHERE path`,
+NOT the `INSERT OR REPLACE` the indexing path uses: that would restate `method`,
+`chars`, `pages`, `indexed_at`, `attempts`, `last_attempt_at` and `elapsed_ms`
+from a `ProcessedFile` the lane never built, and those are precisely the columns
+the resume predicate and the attempt cap read. It rides the store's open
+transaction and the same `commit_batch` checkpoint indexed files use, so a killed
+backfill keeps what it hashed and the next run owes only the rest.
+
+The lane runs before the indexing pass, sequentially, on the thread that owns the
+store, and observes the cancellation flag. A 1 GiB ceiling applies to it alone,
+mirroring `SHA1_MAX_BYTES` in the consuming drives-analytics app; the forward
+hash path is unchanged and has no ceiling, so the two agree below it only.
+Backfilled hashes reach SQLite only — `manifest.jsonl` and `catalog.csv` are
+per-indexed-file exports and a hash-only row produces no line in either.
 
 ### Durability
 
