@@ -101,6 +101,74 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
         .contains("INDEX_ALLOWED_ROOTS"));
 }
 
+/// The running job body carries `worked` beside `processed`/`total`, from the
+/// very first observation a caller can make.
+///
+/// The field's absence is the shared DTO's "this engine predates the counter"
+/// signal, and a consumer latches the basis off the FIRST response carrying it —
+/// so a body that reported only `processed`/`total` for the opening seconds of a
+/// job would leave the app treating `processed` as the work basis for the whole
+/// run, which is exactly the front-loaded-hash-prefix ETA the counter exists to
+/// suppress. Seeding all three together at insert is what makes that
+/// unobservable.
+#[tokio::test]
+async fn a_running_job_reports_worked_beside_processed_and_total() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("hello.txt"), "compliance text for the index").unwrap();
+    let app = router(ServiceConfig {
+        output_root: output,
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input.clone()],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers: 1,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
+        submit_token: None,
+        headroom_pct: None,
+    })
+    .unwrap();
+
+    let (status, _) = post_json(
+        &app,
+        "/index",
+        json!({"id":"w-1","paths":[input],"output":"corpus.sqlite","ocr":"off","workers":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // Every non-terminal body seen while the job runs is checked, not just one:
+    // the seeded envelope AND the progress ticks that overwrite it must all
+    // carry the field. A job spends seconds loading the embedding model before
+    // its first tick, so a 20 ms poll cannot miss the running state.
+    let mut running = 0usize;
+    for _ in 0..1500 {
+        let job = get_json(&app, "/jobs/w-1").await;
+        match job["status"].as_str() {
+            Some("complete" | "error") => break,
+            Some("running") => {
+                running += 1;
+                let processed = job["processed"].as_u64().expect("processed");
+                let worked = job["worked"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("running body must carry `worked`: {job}"));
+                assert!(job["total"].as_u64().is_some(), "{job}");
+                assert!(
+                    worked <= processed,
+                    "the engine contract is `worked <= processed`: {job}"
+                );
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(running > 0, "the job never reported a running state");
+}
+
 // ── Destination guards ───────────────────────────────────────────────────────
 //
 // Jobs write straight into the published database, so the guards deciding

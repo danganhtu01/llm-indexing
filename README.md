@@ -266,6 +266,13 @@ look like one to the resume predicate or the attempt cap. Specifically:
   `hashed` or `hash_failed`, and are NOT counted in `skipped` (this run does read
   every one of those files end to end). `total` therefore GROWS on an armed
   resume; both counters move together, so a rate derived from them stays honest.
+- They are NOT counted in `worked`, the third job counter. The lane runs before
+  the indexing pass, so an armed resume spends its first stretch advancing
+  `processed` at disk speed over work that predicts nothing about the pass that
+  follows. `worked` counts indexed files only, so during the hash prefix the work
+  fraction `Δworked/Δprocessed` is 0 and a consumer withholds its ETA; during the
+  indexing pass it is 1 and the ETA is published. With the lane off, `worked`
+  equals `processed` throughout.
 - Files the lane cannot READ — a locked mail store, a VM disk a hypervisor holds
   open, anything the account has no rights to — are counted in `hash_failed`, and
   the first twenty are named in the log with the reason. Their rows are left

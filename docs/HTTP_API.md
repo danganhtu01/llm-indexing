@@ -291,7 +291,7 @@ Unknown top-level fields anywhere in the job body remain permissively ignored
 ## `GET /jobs/{id}`
 
 Returns `queued`, `running`, `cancelling`, `cancelled`, `complete` or `error`.
-Running jobs include live `processed` and `total` file counters. A completed job includes the
+Running jobs include live `processed`, `worked` and `total` file counters. A completed job includes the
 database path, file/OCR/error/incomplete counts, the `capped` count of rows resume
 declined because they have failed too often, the `hashed` and `hash_failed`
 counts from the sha1 backfill lane (both 0 unless `hash_backfill` is on),
@@ -300,9 +300,28 @@ faces sub-tier ran), removed source count, elapsed time and OCR languages.
 
 `processed`/`total` include the backfill lane's rows, so an armed resume reports a
 LARGER `total` than the same resume unarmed — the run genuinely has that much more
-to do, and because both counters move together a rate or ETA derived from them
-stays honest. Lane rows count in `processed` and are NOT counted in `skipped`;
+to do, and because both counters move together a rate derived from them stays
+honest. Lane rows count in `processed` and are NOT counted in `skipped`;
 `capped` remains a strict subset of `skipped`.
+
+`worked` counts the files this run INDEXED — put through the extract/embed/write
+pipeline — and is seeded with the other two, so a running job carries it from the
+first observation a caller can make. `worked <= processed` always holds.
+
+Backfill rows do NOT count in `worked`, and that is the point. The lane runs
+BEFORE the indexing pass by design, so an armed resume streams `processed`
+through every owed hash at disk speed and only then reaches the pass that
+dominates the run's remaining cost. A consumer projecting `(total - processed) /
+rate` across that prefix advertises a multi-hour job as minutes away. The
+contract is that `worked` is a GATE, not a denominator: publish an ETA only while
+the recent `Δworked/Δprocessed` says the window just measured was mostly real
+indexing, and compute the value from `processed`/`total` as before. During a
+hash prefix the fraction is 0 and no ETA is published; during the indexing pass
+it is 1 and the ETA is honest. With the lane off — the default — `worked` equals
+`processed` at every observation and the fraction is 1 throughout.
+
+An engine that omits the field entirely predates it; consumers fall back to
+`processed`, which is byte-for-byte the pre-`worked` behaviour.
 
 `hash_failed` counts rows the lane claimed whose file would not open or read
 (locked, in use, or unreadable by the account running the job). Those rows are

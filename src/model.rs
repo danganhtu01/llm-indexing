@@ -98,8 +98,15 @@ pub struct IndexStats {
     /// extraction that is still true — a hash that could not be taken says
     /// nothing about it. Folding the two would put "could not open a file to hash
     /// it" inside a counter that otherwise means "tried to index a file and
-    /// failed", and would cost F-C the trivial `worked = processed` composition
-    /// for nothing.
+    /// failed", for nothing.
+    ///
+    /// (An earlier revision of this comment justified the split by a
+    /// `worked = processed` identity it said F-C would compose. That identity
+    /// does not hold and must not: `worked` counts INDEXED files only, so the
+    /// whole backfill lane — hits and misses alike — is deliberately excluded
+    /// from it. See [`crate::pipeline::Progress::worked`]. Nothing about this
+    /// counter's existence rests on that; the SILENT DROP argument below is the
+    /// reason, and it stands on its own.)
     ///
     /// It exists because the alternative is a SILENT DROP. The lane's rows leave
     /// `skipped` by construction, and a miss puts nothing in `hashed`, nothing in

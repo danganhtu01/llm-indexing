@@ -25,7 +25,7 @@ use crate::embedding::{
     rank_chunks, rank_chunks_fast, Embedder, VectorScan, EMBEDDING_MODEL, MAX_HITS,
 };
 use crate::jobs_store::{JobsStore, MAX_PERSISTED_HISTORY, RESERVED_OUTPUT_NAME};
-use crate::pipeline::{run_index, IndexRequest};
+use crate::pipeline::{run_index, IndexRequest, Progress};
 use crate::runtime::RuntimeKnobs;
 use crate::settings::{
     installed_tessdata_langs, tessdata_sources, OcrSettings, VisionSettings, CAPTIONERS, DETECTORS,
@@ -1141,7 +1141,15 @@ async fn worker(
             continue;
         }
         let output = request.output.clone();
-        let running = json!({"id":id,"status":"running","output":output,"processed":0,"total":0,
+        // `worked` is seeded here with the other two, not first written by the
+        // opening progress tick: a `GET /jobs/{id}` that lands between the
+        // insert and that tick must see a job with all three counters at zero,
+        // not one whose `worked` is missing — an absent field is the shared DTO's
+        // "this engine predates the counter" signal, and a consumer that latched
+        // it from a single early poll would spend the run treating `processed`
+        // as the work basis and publish exactly the ETA this counter prevents.
+        let running = json!({"id":id,"status":"running","output":output,
+                   "processed":0,"worked":0,"total":0,
                    "started_at":now()});
         jobs.write().await.insert(id.clone(), running.clone());
         persist_job(&jobs_store, &id, &running).await;
@@ -1334,11 +1342,19 @@ fn run_job(
         include_paths,
         cancellation: Some(cancellation),
         runtime: Some(runtime),
-        progress: Some(Arc::new(move |processed, total| {
+        // All THREE counters are written together, every tick. `worked` is what
+        // lets a polling app tell the sha1 backfill prefix — which streams
+        // `processed` through owed rows at disk speed — from the indexing pass
+        // that follows it, and gate its ETA on the difference. Writing it
+        // alongside the other two means a poll can never land between a
+        // `processed` from one observation and a `worked` from another, which
+        // would hand the app a work fraction no run ever had.
+        progress: Some(Arc::new(move |update: Progress| {
             let mut jobs = jobs.blocking_write();
             if let Some(job) = jobs.get_mut(&progress_id) {
-                job["processed"] = json!(processed);
-                job["total"] = json!(total);
+                job["processed"] = json!(update.processed);
+                job["worked"] = json!(update.worked);
+                job["total"] = json!(update.total);
             }
         })),
     })?;

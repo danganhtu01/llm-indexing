@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use llm_indexing::config::Config;
 use llm_indexing::model::IndexStats;
 use llm_indexing::normalize::Normalizer;
-use llm_indexing::pipeline::{run_index, IndexRequest};
+use llm_indexing::pipeline::{run_index, IndexRequest, Progress};
 use llm_indexing::store::{connect, search, top_folders};
 
 /// Every test here loads the embedding model, and fastembed's HuggingFace cache
@@ -146,7 +146,7 @@ fn index(
     resume: bool,
     include_paths: Option<HashSet<String>>,
     cancellation: Option<Arc<AtomicBool>>,
-    progress: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
+    progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
 ) -> anyhow::Result<IndexStats> {
     let _serialized = model_lock();
     run_index(IndexRequest {
@@ -371,8 +371,8 @@ fn cancellation_keeps_committed_work_and_resume_finishes_it() {
         false,
         None,
         Some(cancellation),
-        Some(Arc::new(move |processed, _| {
-            if processed >= CANCEL_AFTER {
+        Some(Arc::new(move |update: Progress| {
+            if update.processed >= CANCEL_AFTER {
                 flag.store(true, Ordering::Relaxed);
             }
         })),
@@ -1197,13 +1197,31 @@ fn backfill_config(hash: bool, hash_backfill: bool) -> Config {
     config
 }
 
+/// A shared `(processed, worked, total)` log for the progress assertions.
+type ProgressSink = Arc<Mutex<Vec<(usize, usize, usize)>>>;
+
+fn progress_sink() -> ProgressSink {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+/// A progress callback that appends every observation to `sink` verbatim — all
+/// three counters, so an assertion can read the work fraction the consuming app
+/// computes rather than only the pair the engine used to report.
+fn record_progress(sink: ProgressSink) -> Arc<dyn Fn(Progress) + Send + Sync> {
+    Arc::new(move |update: Progress| {
+        sink.lock()
+            .unwrap()
+            .push((update.processed, update.worked, update.total))
+    })
+}
+
 fn index_with(
     input: &Path,
     destination: &Path,
     config: Config,
     resume: bool,
     cancellation: Option<Arc<AtomicBool>>,
-    progress: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
+    progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
 ) -> anyhow::Result<IndexStats> {
     let _serialized = model_lock();
     run_index(IndexRequest {
@@ -1388,7 +1406,7 @@ fn an_armed_backfill_grows_the_total_and_processed_reaches_it() {
     .unwrap();
 
     // A plain resume of a finished corpus: nothing to do, and `total` says so.
-    let plain: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let plain = progress_sink();
     let sink = plain.clone();
     index_with(
         &input,
@@ -1396,18 +1414,16 @@ fn an_armed_backfill_grows_the_total_and_processed_reaches_it() {
         backfill_config(true, false),
         true,
         None,
-        Some(Arc::new(move |processed, total| {
-            sink.lock().unwrap().push((processed, total))
-        })),
+        Some(record_progress(sink)),
     )
     .unwrap();
     assert_eq!(
         plain.lock().unwrap().as_slice(),
-        [(0, 0)],
+        [(0, 0, 0)],
         "an unarmed resume of a finished corpus has nothing to report"
     );
 
-    let armed: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let armed = progress_sink();
     let sink = armed.clone();
     let stats = index_with(
         &input,
@@ -1415,19 +1431,127 @@ fn an_armed_backfill_grows_the_total_and_processed_reaches_it() {
         backfill_config(true, true),
         true,
         None,
-        Some(Arc::new(move |processed, total| {
-            sink.lock().unwrap().push((processed, total))
-        })),
+        Some(record_progress(sink)),
     )
     .unwrap();
 
     let samples = armed.lock().unwrap().clone();
     assert_eq!(
         samples,
-        vec![(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)],
-        "the owed rows are in `total` from the first sample and `processed` reaches it"
+        vec![(0, 0, 4), (1, 0, 4), (2, 0, 4), (3, 0, 4), (4, 0, 4)],
+        "the owed rows are in `total` from the first sample and `processed` reaches it — \
+         and `worked` stays FLAT at zero the whole way, because a hash is not indexing"
     );
     assert_eq!(stats.hashed, 4);
+}
+
+/// **The gate signal.** A pure-hash prefix must advance `processed` while
+/// `worked` stays flat, and the indexing pass that follows must advance both
+/// together — because the consumer's ETA gate is `Δworked/Δprocessed` over a
+/// recent window, and the two stretches run at wildly different speeds off the
+/// same `(processed, total)` pair.
+///
+/// The run below is the real shape: an armed resume over a corpus with rows
+/// owing a hash AND a new file to index, in that order (the lane runs first by
+/// design). Without `worked` the app sees one undifferentiated counter and
+/// projects the hash rate across the indexing pass.
+#[test]
+fn the_hash_prefix_advances_processed_while_worked_stays_flat() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let destination = temp.path().join("corpus.sqlite");
+    sample_tree(&input, 3);
+
+    // Seed unhashed: these three rows are what the lane will owe.
+    index_with(
+        &input,
+        &destination,
+        backfill_config(false, false),
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+    // One genuinely new file, so the run has an indexing pass after the lane.
+    fs::write(input.join("fresh.txt"), "a new file to index this run").unwrap();
+
+    let samples = progress_sink();
+    let sink = samples.clone();
+    let stats = index_with(
+        &input,
+        &destination,
+        backfill_config(true, true),
+        true,
+        None,
+        Some(record_progress(sink)),
+    )
+    .unwrap();
+    assert_eq!(stats.hashed, 3, "the three seeded rows were owed a hash");
+    assert_eq!(stats.files, 1, "and one new file was indexed");
+
+    let samples = samples.lock().unwrap().clone();
+    // total = 3 owed hashes + 1 file to index.
+    assert_eq!(
+        samples,
+        vec![(0, 0, 4), (1, 0, 4), (2, 0, 4), (3, 0, 4), (4, 1, 4)],
+        "worked is FLAT across the hash prefix and advances only on the indexed file"
+    );
+
+    // Stated as the two fractions a consumer actually computes, so a change to
+    // the counters that broke the gate would fail here and not only above.
+    let prefix = &samples[..4];
+    let (p0, w0, _) = prefix[0];
+    let (p1, w1, _) = *prefix.last().unwrap();
+    assert!(p1 > p0, "the prefix moved `processed`");
+    assert_eq!(
+        w1 - w0,
+        0,
+        "f = 0 across the hash prefix: the consumer's ETA gate is shut"
+    );
+    let (p2, w2, _) = *samples.last().unwrap();
+    assert_eq!(
+        (p2 - p1, w2 - w1),
+        (1, 1),
+        "f = 1 across the indexing pass: the gate opens and the ETA is honest"
+    );
+}
+
+/// With the lane off — every run by default — `worked` is identical to
+/// `processed` at every observation. The counter is additive: it cannot change
+/// what an unarmed run reports, and the consumer's f is 1 throughout exactly as
+/// it was before the field existed.
+#[test]
+fn worked_tracks_processed_exactly_when_the_backfill_lane_is_off() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let destination = temp.path().join("corpus.sqlite");
+    sample_tree(&input, 3);
+
+    let samples = progress_sink();
+    let sink = samples.clone();
+    index_with(
+        &input,
+        &destination,
+        backfill_config(true, false),
+        false,
+        None,
+        Some(record_progress(sink)),
+    )
+    .unwrap();
+
+    let samples = samples.lock().unwrap().clone();
+    assert_eq!(
+        samples.len(),
+        4,
+        "one seed tick plus one per file: {samples:?}"
+    );
+    for (processed, worked, total) in samples {
+        assert_eq!(
+            processed, worked,
+            "no hash lane means every processed file was indexed"
+        );
+        assert_eq!(total, 3);
+    }
 }
 
 /// A file the lane claims but cannot READ must be counted, not dropped.
@@ -1472,7 +1596,7 @@ fn a_file_the_lane_cannot_read_is_counted_not_silently_dropped() {
     // and send it down the indexing path instead of the lane.
     let doomed_bytes = fs::read(&doomed).unwrap();
     let doomed_mtime = fs::metadata(&doomed).unwrap().modified().unwrap();
-    let samples: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let samples = progress_sink();
     let sink = samples.clone();
     let stats = index_with(
         &input,
@@ -1480,11 +1604,13 @@ fn a_file_the_lane_cannot_read_is_counted_not_silently_dropped() {
         backfill_config(true, true),
         true,
         None,
-        Some(Arc::new(move |processed, total| {
-            if processed == 0 {
+        Some(Arc::new(move |update: Progress| {
+            if update.processed == 0 {
                 fs::remove_file(&doomed).unwrap();
             }
-            sink.lock().unwrap().push((processed, total))
+            sink.lock()
+                .unwrap()
+                .push((update.processed, update.worked, update.total))
         })),
     )
     .unwrap();
@@ -1503,8 +1629,9 @@ fn a_file_the_lane_cannot_read_is_counted_not_silently_dropped() {
     assert_eq!(stats.errors, 0, "a hash miss writes no error row");
     assert_eq!(
         samples.lock().unwrap().as_slice(),
-        [(0, 2), (1, 2), (2, 2)],
-        "an unreadable file still advances `processed` — the read was attempted"
+        [(0, 0, 2), (1, 0, 2), (2, 0, 2)],
+        "an unreadable file still advances `processed` — the read was attempted — \
+         and neither arm of the lane advances `worked`"
     );
 
     // The row itself survives untouched, including its NULL sha1: a hash that
@@ -1538,8 +1665,8 @@ fn a_file_the_lane_cannot_read_is_counted_not_silently_dropped() {
         backfill_config(true, true),
         true,
         None,
-        Some(Arc::new(move |processed, _| {
-            if processed == 0 {
+        Some(Arc::new(move |update: Progress| {
+            if update.processed == 0 {
                 fs::remove_file(&doomed).unwrap();
             }
         })),
@@ -1580,8 +1707,8 @@ fn a_cancelled_backfill_keeps_its_hashes_and_the_next_run_owes_the_rest() {
         armed.clone(),
         true,
         Some(cancellation),
-        Some(Arc::new(move |processed, _| {
-            if processed >= 2 {
+        Some(Arc::new(move |update: Progress| {
+            if update.processed >= 2 {
                 flag.store(true, Ordering::Relaxed);
             }
         })),
