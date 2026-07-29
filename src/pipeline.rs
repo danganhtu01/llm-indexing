@@ -72,6 +72,66 @@ const SHA1_MAX_BYTES: u64 = 1 << 30;
 /// the magnitude.
 const HASH_MISS_SAMPLE: usize = 20;
 
+/// One progress observation, as reported to [`IndexRequest::progress`].
+///
+/// Three counters rather than two, because `processed/total` alone cannot tell
+/// a run that is INDEXING from one that is merely HASHING. Both populations are
+/// in `total` by design (see the `total` binding in [`run_index`]) and the sha1
+/// backfill lane runs FIRST, so an armed resume streams `processed` through up
+/// to six figures of hash-only rows at disk speed and only then reaches the
+/// slow indexing pass. A rate measured across that prefix describes nothing the
+/// run is about to do.
+///
+/// `worked` separates the two stretches, and for the consumer it is a GATE,
+/// never a denominator: an app publishes an ETA only while the recent fraction
+/// `Δworked/Δprocessed` says the stream it just measured was mostly real
+/// indexing, and computes the value itself from `processed/total` as before.
+/// Same shape and same contract as `vlm-indexing`'s `orchestrator::Progress`
+/// and the shared `portal-directories` `EngineJob.worked` field.
+///
+/// **What is promised is per-observation consistency, not a monotone stream.**
+/// Each emitted triple is internally coherent — `worked <= processed <= total`,
+/// both derived from the SAME `completed` reading — and that is the only
+/// guarantee the counters can make. During the indexing pass the counter is
+/// bumped with `fetch_add` and the callback invoked as two separate steps on
+/// many rayon workers, so a thread preempted between them can deliver its
+/// triple after a later one and step the observed numbers back. The lane's own
+/// stretch is single-threaded and cannot. Consumers are built for this: the
+/// app's `RateWindow` treats a shrinking counter as a lost timebase and restarts
+/// its window rather than averaging across it, which is also what it must do for
+/// the real case of an engine restarting its counting mid-run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    /// How many units of the run's work list have been REACHED, counting every
+    /// one of them however little it cost — the number `total` is the
+    /// denominator of. Hash-only rows and indexed files share this counter and
+    /// it never restarts between the two passes.
+    pub processed: usize,
+    /// Of those, how many were INDEXED — put through the extract/embed/write
+    /// pipeline. **At most one per file**, so `worked <= processed` holds at
+    /// every observation (see the type's own note on why that is an
+    /// observation-local promise and not a monotone one).
+    ///
+    /// A sha1 backfill row does NOT count, and that is the whole point rather
+    /// than an omission. The lane reads file bytes off the disk and writes one
+    /// column; it is bounded by I/O and runs an order of magnitude faster per
+    /// row than an extract-plus-embed pass. Counting it as work would publish a
+    /// hash-rate ETA for a run whose remaining cost is the indexing pass — the
+    /// front-loaded-prefix case the consumer's gate exists to suppress, and the
+    /// one it could not see because the engine reported no signal.
+    ///
+    /// **A run can honestly report no work at all.** A resume whose whole cost
+    /// is a backfill over an already-indexed corpus walks at hash speed and
+    /// counts none of it. That is the correct answer rather than a gap: nothing
+    /// about the rate the lane hashed a directory predicts an indexing pass,
+    /// and a plausible-looking ETA computed from it would read minutes for a
+    /// job with hours left.
+    pub worked: usize,
+    /// The size of the run's work list: the rows to index PLUS the rows the
+    /// backfill lane owes a hash.
+    pub total: usize,
+}
+
 pub struct IndexRequest<'a> {
     pub paths: &'a [PathBuf],
     pub out: &'a Path,
@@ -103,7 +163,7 @@ pub struct IndexRequest<'a> {
     /// that must land on work already running. `None` derives fixed settings
     /// from the config, which is what the CLI does.
     pub runtime: Option<Arc<RuntimeKnobs>>,
-    pub progress: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
+    pub progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
 }
 
 pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
@@ -373,12 +433,18 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     // denominator. A resume that would have reported `total: 40` now reports
     // `total: 40 + owed` — TOTAL GROWS when the lane is armed, and that is the
     // intended reading: the run genuinely has that much more to do. Consumers
-    // deriving a rate or an ETA from (processed, total) stay honest precisely
-    // because both counters move together; hiding the hashes from `total` while
-    // still spending the time on them is what would skew them.
+    // deriving a rate from (processed, total) stay honest precisely because both
+    // counters move together; hiding the hashes from `total` while still
+    // spending the time on them is what would skew them. What the shared
+    // denominator CANNOT do on its own is tell the two populations apart while
+    // the run is in the cheap one — that is [`Progress::worked`]'s job.
     let total = records.len() + hash_only.len();
     if let Some(progress) = &request.progress {
-        progress(0, total);
+        progress(Progress {
+            processed: 0,
+            worked: 0,
+            total,
+        });
     }
     let mut stats = IndexStats {
         skipped,
@@ -455,7 +521,15 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         // Advances on BOTH arms: the read was attempted and cost what it cost.
         processed += 1;
         if let Some(progress) = &request.progress {
-            progress(processed, total);
+            // `worked: 0` for the whole lane — see [`Progress::worked`]. Every
+            // observation a consumer takes while the prefix is running has
+            // Δworked == 0, so its work fraction is 0, its ETA gate is shut, and
+            // it publishes the hash rate as a rate and nothing as a projection.
+            progress(Progress {
+                processed,
+                worked: 0,
+                total,
+            });
         }
     }
     if backfill {
@@ -470,6 +544,13 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     // Seeded, not zero: the indexing pass continues the run's single processed
     // counter rather than restarting it, so a poller never sees it go backwards.
     let completed = Arc::new(AtomicUsize::new(processed));
+    // The length of the hash prefix `completed` was seeded with, and therefore
+    // the offset that turns a `processed` reading back into a `worked` one:
+    // every increment from here on IS an indexed file. Captured before the
+    // scope so the extract closure can subtract it without re-reading anything
+    // that moves. Zero on every run with the lane off, where `worked` is then
+    // identical to `processed` — the byte-for-byte legacy shape.
+    let hash_prefix = processed;
     let cancellation = request.cancellation.clone();
     let progress = request.progress.clone();
     // Old rows KEPT by keep-on-failure — the file's reprocess errored but the
@@ -567,7 +648,19 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
                     };
                     let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     if let Some(progress) = &progress {
-                        progress(count, total);
+                        // This file WAS indexed, so it counts as worked. Netting
+                        // off the hash prefix is what makes the two counters
+                        // comparable: `completed` was seeded with the lane's
+                        // rows, which are not work. `saturating_sub` because a
+                        // logic slip must surface as an under-reported fraction
+                        // (a closed gate, nothing published) and never as a
+                        // wrapped `usize` that would make the fraction huge and
+                        // publish a far-too-short ETA.
+                        progress(Progress {
+                            processed: count,
+                            worked: count.saturating_sub(hash_prefix),
+                            total,
+                        });
                     }
                     // The embed stage hangs up (error or cancellation) by
                     // dropping the receiver, which also unblocks a full channel;

@@ -25,7 +25,7 @@ use crate::embedding::{
     rank_chunks, rank_chunks_fast, Embedder, VectorScan, EMBEDDING_MODEL, MAX_HITS,
 };
 use crate::jobs_store::{JobsStore, MAX_PERSISTED_HISTORY, RESERVED_OUTPUT_NAME};
-use crate::pipeline::{run_index, IndexRequest};
+use crate::pipeline::{run_index, IndexRequest, Progress};
 use crate::runtime::RuntimeKnobs;
 use crate::settings::{
     installed_tessdata_langs, tessdata_sources, OcrSettings, VisionSettings, CAPTIONERS, DETECTORS,
@@ -477,8 +477,24 @@ async fn settings(State(state): State<AppState>) -> Response {
     let config_path = state.config_path.clone();
     let vision_max = state.vision_max;
     let workers = state.workers;
+    // Read the EFFECTIVE extract width off the live process-wide knobs, not out
+    // of `build_settings`' own `Config::load`. This is the whole point of the
+    // field: `state.defaults` was built (router(), above) from a config that had
+    // already been through `override_headroom(--headroom)`, so it carries the
+    // headroom ceiling this process actually spawns jobs under. A fresh
+    // `Config::load` inside `build_settings` is flag-BLIND — on a box served
+    // with `--headroom 10` it would report the uncapped YAML width while every
+    // job runs capped, which is precisely the dishonesty `effective` exists to
+    // end. It also tracks a `POST /runtime` retune of the defaults, which is the
+    // honest reading: this is the width the NEXT job would be seeded at.
+    let effective_workers = state.defaults.extract();
     match tokio::task::spawn_blocking(move || {
-        build_settings(config_path.as_deref(), vision_max, workers)
+        build_settings(
+            config_path.as_deref(),
+            vision_max,
+            workers,
+            effective_workers,
+        )
     })
     .await
     {
@@ -504,10 +520,17 @@ async fn settings(State(state): State<AppState>) -> Response {
 /// Build the `GET /settings` body. Ranges come from the single `settings.rs`
 /// bound consts and defaults from the loaded [`Config`] (the same fields the W1
 /// `OcrSettings`/`VisionSettings` bases read), so nothing here re-defines a knob.
+///
+/// `effective_workers` is passed IN rather than derived here, and that is
+/// load-bearing: this function's `Config::load` cannot see `serve --headroom`
+/// (or `--workers`), so anything it computed itself would be the advertised
+/// static width, never the width the engine runs. The caller reads it off the
+/// live `AppState::defaults` — see [`settings`].
 fn build_settings(
     config_path: Option<&Path>,
     vision_max: VisionMode,
     workers: usize,
+    effective_workers: usize,
 ) -> Result<Value> {
     let config = Config::load(config_path)?;
     let models_dir = config.vision_models_dir();
@@ -560,7 +583,19 @@ fn build_settings(
         },
         // Route the advertised default through the SAME clamp `run_job` applies, so
         // /settings never reports a default outside its own `max` (or below 1).
-        "workers": {"default": clamp_workers(workers), "max": MAX_WORKERS},
+        //
+        // `effective` is the third number and the only one that describes what
+        // this process DOES: `default`/`max` are advertised static bounds, while
+        // `effective` is the headroom-capped extract seed every new job is
+        // snapshotted from. Equal to `default` whenever headroom is off (the
+        // default), strictly below it when `--headroom` is holding the box back
+        // — which is exactly the state an operator could not previously tell
+        // apart from a full-width run by reading `/settings`.
+        "workers": {
+            "default": clamp_workers(workers),
+            "max": MAX_WORKERS,
+            "effective": effective_workers,
+        },
     }))
 }
 
@@ -1106,7 +1141,15 @@ async fn worker(
             continue;
         }
         let output = request.output.clone();
-        let running = json!({"id":id,"status":"running","output":output,"processed":0,"total":0,
+        // `worked` is seeded here with the other two, not first written by the
+        // opening progress tick: a `GET /jobs/{id}` that lands between the
+        // insert and that tick must see a job with all three counters at zero,
+        // not one whose `worked` is missing — an absent field is the shared DTO's
+        // "this engine predates the counter" signal, and a consumer that latched
+        // it from a single early poll would spend the run treating `processed`
+        // as the work basis and publish exactly the ETA this counter prevents.
+        let running = json!({"id":id,"status":"running","output":output,
+                   "processed":0,"worked":0,"total":0,
                    "started_at":now()});
         jobs.write().await.insert(id.clone(), running.clone());
         persist_job(&jobs_store, &id, &running).await;
@@ -1299,11 +1342,19 @@ fn run_job(
         include_paths,
         cancellation: Some(cancellation),
         runtime: Some(runtime),
-        progress: Some(Arc::new(move |processed, total| {
+        // All THREE counters are written together, every tick. `worked` is what
+        // lets a polling app tell the sha1 backfill prefix — which streams
+        // `processed` through owed rows at disk speed — from the indexing pass
+        // that follows it, and gate its ETA on the difference. Writing it
+        // alongside the other two means a poll can never land between a
+        // `processed` from one observation and a `worked` from another, which
+        // would hand the app a work fraction no run ever had.
+        progress: Some(Arc::new(move |update: Progress| {
             let mut jobs = jobs.blocking_write();
             if let Some(job) = jobs.get_mut(&progress_id) {
-                job["processed"] = json!(processed);
-                job["total"] = json!(total);
+                job["processed"] = json!(update.processed);
+                job["worked"] = json!(update.worked);
+                job["total"] = json!(update.total);
             }
         })),
     })?;
@@ -2618,7 +2669,7 @@ mod tests {
 
     #[test]
     fn settings_reports_the_spec_shape() {
-        let value = build_settings(None, VisionMode::Off, 4).unwrap();
+        let value = build_settings(None, VisionMode::Off, 4, 4).unwrap();
         // Top-level blocks.
         assert_eq!(value["version"], crate::VERSION);
         assert_eq!(value["workers"]["default"], 4);
@@ -2660,17 +2711,17 @@ mod tests {
         let vision_dir = temp.path().join("vision");
         std::fs::create_dir_all(&vision_dir).unwrap();
 
-        let value = build_settings(Some(&config), VisionMode::Captions, 4).unwrap();
+        let value = build_settings(Some(&config), VisionMode::Captions, 4, 4).unwrap();
         assert_eq!(value["vision"]["faces"][0]["present"], false);
         let tiers = value["vision"]["tiers_available"].clone();
 
         // Half a pair is not a capability.
         std::fs::write(vision_dir.join("yunet.onnx"), b"bogus").unwrap();
-        let value = build_settings(Some(&config), VisionMode::Captions, 4).unwrap();
+        let value = build_settings(Some(&config), VisionMode::Captions, 4, 4).unwrap();
         assert_eq!(value["vision"]["faces"][0]["present"], false);
         // Both halves present but unpinned-hash bogus: still absent.
         std::fs::write(vision_dir.join("sface.onnx"), b"bogus").unwrap();
-        let value = build_settings(Some(&config), VisionMode::Captions, 4).unwrap();
+        let value = build_settings(Some(&config), VisionMode::Captions, 4, 4).unwrap();
         assert_eq!(value["vision"]["faces"][0]["present"], false);
         assert_eq!(
             value["vision"]["tiers_available"], tiers,
@@ -2688,7 +2739,7 @@ mod tests {
         }
         let config = config_pointing_at(temp.path());
 
-        let value = build_settings(Some(&config), VisionMode::Off, 4).unwrap();
+        let value = build_settings(Some(&config), VisionMode::Off, 4, 4).unwrap();
         let langs: Vec<String> = value["ocr"]["langs_installed"]
             .as_array()
             .unwrap()
@@ -2710,7 +2761,7 @@ mod tests {
         // A high cap but no staged vision models: only the pure-code `meta` tier
         // is offered; `tags`/`captions` are gated out and every sub-model reads
         // not-present.
-        let value = build_settings(Some(&config), VisionMode::Captions, 4).unwrap();
+        let value = build_settings(Some(&config), VisionMode::Captions, 4, 4).unwrap();
         assert_eq!(value["vision"]["max_tier"], "captions");
         assert_eq!(
             value["vision"]["tiers_available"],
@@ -2724,7 +2775,7 @@ mod tests {
         let vision_dir = temp.path().join("vision");
         std::fs::create_dir_all(&vision_dir).unwrap();
         std::fs::write(vision_dir.join("rf-detr-nano.onnx"), b"bogus").unwrap();
-        let value = build_settings(Some(&config), VisionMode::Captions, 4).unwrap();
+        let value = build_settings(Some(&config), VisionMode::Captions, 4, 4).unwrap();
         assert_eq!(
             value["vision"]["tiers_available"],
             serde_json::json!(["meta"])
@@ -2732,7 +2783,7 @@ mod tests {
         assert_eq!(value["vision"]["detectors"][0]["present"], false);
 
         // The cap itself gates the list: at `off` nothing is offered.
-        let capped = build_settings(Some(&config), VisionMode::Off, 4).unwrap();
+        let capped = build_settings(Some(&config), VisionMode::Off, 4, 4).unwrap();
         assert_eq!(capped["vision"]["tiers_available"], serde_json::json!([]));
     }
 
@@ -2741,7 +2792,7 @@ mod tests {
         // Ranges come from the single settings.rs bound consts; defaults from the
         // same Config fields the W1 OcrSettings/VisionSettings bases read — no
         // knob is redefined in the /settings builder.
-        let value = build_settings(None, VisionMode::Off, 4).unwrap();
+        let value = build_settings(None, VisionMode::Off, 4, 4).unwrap();
         let config = Config::default();
         let ocr = OcrSettings::from_config(&config);
         let vision = VisionSettings::from_config(&config);

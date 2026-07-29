@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use llm_indexing::config::MAX_WORKERS;
+use llm_indexing::headroom::cores_cap;
 use llm_indexing::jobs_store::{JobsStore, INTERRUPTED_ERROR};
 use llm_indexing::service::{router, ServiceConfig};
 use llm_indexing::vision::VisionMode;
@@ -97,6 +99,74 @@ async fn http_job_publishes_only_sqlite_and_confines_paths() {
         .as_str()
         .unwrap()
         .contains("INDEX_ALLOWED_ROOTS"));
+}
+
+/// The running job body carries `worked` beside `processed`/`total`, from the
+/// very first observation a caller can make.
+///
+/// The field's absence is the shared DTO's "this engine predates the counter"
+/// signal, and a consumer latches the basis off the FIRST response carrying it —
+/// so a body that reported only `processed`/`total` for the opening seconds of a
+/// job would leave the app treating `processed` as the work basis for the whole
+/// run, which is exactly the front-loaded-hash-prefix ETA the counter exists to
+/// suppress. Seeding all three together at insert is what makes that
+/// unobservable.
+#[tokio::test]
+async fn a_running_job_reports_worked_beside_processed_and_total() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("hello.txt"), "compliance text for the index").unwrap();
+    let app = router(ServiceConfig {
+        output_root: output,
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input.clone()],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers: 1,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
+        submit_token: None,
+        headroom_pct: None,
+    })
+    .unwrap();
+
+    let (status, _) = post_json(
+        &app,
+        "/index",
+        json!({"id":"w-1","paths":[input],"output":"corpus.sqlite","ocr":"off","workers":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // Every non-terminal body seen while the job runs is checked, not just one:
+    // the seeded envelope AND the progress ticks that overwrite it must all
+    // carry the field. A job spends seconds loading the embedding model before
+    // its first tick, so a 20 ms poll cannot miss the running state.
+    let mut running = 0usize;
+    for _ in 0..1500 {
+        let job = get_json(&app, "/jobs/w-1").await;
+        match job["status"].as_str() {
+            Some("complete" | "error") => break,
+            Some("running") => {
+                running += 1;
+                let processed = job["processed"].as_u64().expect("processed");
+                let worked = job["worked"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("running body must carry `worked`: {job}"));
+                assert!(job["total"].as_u64().is_some(), "{job}");
+                assert!(
+                    worked <= processed,
+                    "the engine contract is `worked <= processed`: {job}"
+                );
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(running > 0, "the job never reported a running state");
 }
 
 // ── Destination guards ───────────────────────────────────────────────────────
@@ -1172,6 +1242,104 @@ async fn settings_route_serves_the_capability_contract() {
     assert_eq!(settings["vision"]["tiers_available"], json!(["meta"]));
     assert_eq!(settings["vision"]["detectors"][0]["id"], "nano");
     assert_eq!(settings["vision"]["detectors"][0]["present"], false);
+}
+
+// ── `workers.effective` — the seed the engine actually runs (G2) ─────────────
+//
+// `default`/`max` are advertised STATIC bounds. `effective` is the third number
+// and the only one that describes this process: the headroom-capped extract
+// width every new job is snapshotted from. It must come from the live
+// `AppState::defaults` (built after `Config::override_headroom(--headroom)`),
+// never from `build_settings`' own `Config::load`, which cannot see the flag.
+
+/// Returns the `TempDir` alongside the router, and the caller must HOLD it:
+/// dropping it deletes `output_root` and the input tree out from under a live
+/// service. The three tests below only read `/settings` and `/runtime`, so they
+/// would survive the deletion — but a later test that submitted a job would
+/// fail for a reason nothing about the test says, so the lifetime is the
+/// caller's business here rather than a trap discovered there.
+fn headroom_router(workers: usize, headroom_pct: Option<u8>) -> (axum::Router, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    let app = router(ServiceConfig {
+        output_root: temp.path().join("output"),
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
+        submit_token: None,
+        headroom_pct,
+    })
+    .unwrap();
+    (app, temp)
+}
+
+async fn workers_block(app: &axum::Router) -> Value {
+    let response = get(app, "/settings").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let settings: Value = serde_json::from_slice(&body).unwrap();
+    settings["workers"].clone()
+}
+
+#[tokio::test]
+async fn settings_reports_the_headroom_capped_effective_worker_seed() {
+    // `serve --workers 64 --headroom 50`: the advertised default stays 64
+    // (nothing rewrites the configured width), but the engine spawns jobs at
+    // the core cap. THIS is the case the field exists for — before it,
+    // `/settings` reported 64 on a box running 12.
+    let (app, _temp) = headroom_router(MAX_WORKERS, Some(50));
+    let workers = workers_block(&app).await;
+
+    let cap = cores_cap(50);
+    assert_eq!(workers["default"], MAX_WORKERS, "{workers}");
+    assert_eq!(workers["max"], MAX_WORKERS, "{workers}");
+    assert_eq!(
+        workers["effective"],
+        json!(MAX_WORKERS.min(cap)),
+        "effective must be the headroom-capped seed, not the advertised default: {workers}"
+    );
+    // On any box with fewer than 2 * MAX_WORKERS cores the cap genuinely bites,
+    // which is the half worth pinning: the number DROPS below `default`. A
+    // regression that recomputed `effective` from `build_settings`' own
+    // flag-blind `Config::load` would report `default` here.
+    if cap < MAX_WORKERS {
+        assert!(
+            workers["effective"].as_u64().unwrap() < workers["default"].as_u64().unwrap(),
+            "{workers}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn settings_effective_equals_the_default_when_headroom_is_off() {
+    // Feature off (the default on every box): nothing is capped, so the two
+    // numbers agree and a UI showing them side by side has nothing to explain.
+    let (app, _temp) = headroom_router(7, None);
+    let workers = workers_block(&app).await;
+    assert_eq!(workers["default"], 7, "{workers}");
+    assert_eq!(workers["effective"], 7, "{workers}");
+}
+
+#[tokio::test]
+async fn settings_effective_tracks_a_retune_of_the_process_defaults() {
+    // `effective` reads the LIVE process-wide defaults, so a `POST /runtime`
+    // that lowers `extract` is reflected: the answer stays "what the next job
+    // is seeded at", which is the only reading that can be acted on.
+    let (app, _temp) = headroom_router(8, None);
+    assert_eq!(workers_block(&app).await["effective"], 8);
+
+    let (status, _) = post_json(&app, "/runtime", json!({"extract": 3})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let workers = workers_block(&app).await;
+    assert_eq!(workers["default"], 8, "the advertised bound is unchanged");
+    assert_eq!(workers["effective"], 3, "{workers}");
 }
 
 // ── Live stage tuning (GET/POST /runtime, POST /jobs/{id}/runtime) ───────────

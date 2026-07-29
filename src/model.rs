@@ -68,10 +68,18 @@ pub struct IndexStats {
     /// `sha1`, given one without their content being touched.
     ///
     /// Not a subset of anything else here. The lane's rows count in the run's
-    /// `total`/`processed` (a hash pass is real, rate-predictive work, and an ETA
+    /// `total`/`processed` (the run genuinely spends that time, and a RATE
     /// derived from those counters is only honest if it can see it) and are
     /// deliberately EXCLUDED from `skipped`, which means "this run will not touch
-    /// this row". They are also disjoint from `files`, which counts rows this run
+    /// this row".
+    ///
+    /// They are just as deliberately excluded from
+    /// [`crate::pipeline::Progress::worked`], and the distinction is the point:
+    /// a hash pass is real work, but it is not work that PREDICTS the indexing
+    /// pass queued behind it. So it belongs in the counters a rate is measured
+    /// from, and not in the one an ETA is gated on.
+    ///
+    /// They are also disjoint from `files`, which counts rows this run
     /// WROTE from a `ProcessedFile`: a backfilled row was never extracted, never
     /// embedded and never re-written, so a pure backfill pass reports
     /// `files: 0`, `embedded_chunks: 0` and `hashed: N`.
@@ -98,8 +106,15 @@ pub struct IndexStats {
     /// extraction that is still true — a hash that could not be taken says
     /// nothing about it. Folding the two would put "could not open a file to hash
     /// it" inside a counter that otherwise means "tried to index a file and
-    /// failed", and would cost F-C the trivial `worked = processed` composition
-    /// for nothing.
+    /// failed", for nothing.
+    ///
+    /// (An earlier revision of this comment justified the split by a
+    /// `worked = processed` identity it said F-C would compose. That identity
+    /// does not hold and must not: `worked` counts INDEXED files only, so the
+    /// whole backfill lane — hits and misses alike — is deliberately excluded
+    /// from it. See [`crate::pipeline::Progress::worked`]. Nothing about this
+    /// counter's existence rests on that; the SILENT DROP argument below is the
+    /// reason, and it stands on its own.)
     ///
     /// It exists because the alternative is a SILENT DROP. The lane's rows leave
     /// `skipped` by construction, and a miss puts nothing in `hashed`, nothing in
