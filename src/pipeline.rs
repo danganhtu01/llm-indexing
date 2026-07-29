@@ -1251,6 +1251,52 @@ mod tests {
         }
     }
 
+    /// The sha1 backfill lane's per-row selector. Its whole job is to be
+    /// NARROW: it runs against rows the run has already decided to skip, so
+    /// every `true` here is a file read end to end for a column, and on a corpus
+    /// with a long unhashed history there are hundreds of thousands of them.
+    mod backfill {
+        use super::super::{backfill_candidate, SHA1_MAX_BYTES};
+        use super::stored;
+        use crate::store::ExistingRow;
+
+        fn unhashed() -> ExistingRow {
+            stored("text", true, 0)
+        }
+
+        fn hashed() -> ExistingRow {
+            ExistingRow {
+                has_sha1: true,
+                ..stored("text", true, 0)
+            }
+        }
+
+        #[test]
+        fn an_unhashed_row_under_the_ceiling_is_claimed() {
+            assert!(backfill_candidate(&unhashed(), 12));
+            assert!(backfill_candidate(&unhashed(), SHA1_MAX_BYTES - 1));
+        }
+
+        /// The idempotence that stops the lane costing anything twice: once a
+        /// row has a hash it is never re-read, so an armed corpus pays the
+        /// backfill exactly once and every resume after it is an ordinary one.
+        #[test]
+        fn a_row_that_already_has_a_hash_is_never_re_read() {
+            assert!(!backfill_candidate(&hashed(), 12));
+            assert!(!backfill_candidate(&hashed(), SHA1_MAX_BYTES + 1));
+        }
+
+        /// At the ceiling, not merely above it — the app's own `SHA1_MAX_BYTES`
+        /// comparison is `size >= SHA1_MAX_BYTES`, and a boundary that
+        /// disagreed by one file would be a hash written for a size the
+        /// consumer refuses to hash back.
+        #[test]
+        fn a_file_at_or_over_the_ceiling_is_left_alone() {
+            assert!(!backfill_candidate(&unhashed(), SHA1_MAX_BYTES));
+            assert!(!backfill_candidate(&unhashed(), SHA1_MAX_BYTES * 4));
+        }
+    }
+
     /// The keep-old-on-error truth table, over the same [`ExistingRow`]
     /// `store.existing_keys()` yields.
     mod keep_old {

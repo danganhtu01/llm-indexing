@@ -1132,3 +1132,444 @@ fn anchored_chunks(destination: &Path) -> i64 {
         )
         .unwrap()
 }
+
+// ── sha1 backfill lane (`hash_backfill`) ─────────────────────────────────────
+//
+// A corpus indexed before `hash: true` was set carries `sha1 IS NULL` on every
+// row, and resume never repairs that on its own: those rows are FINISHED, so the
+// forward hash path — which only runs on a file the job is actually indexing —
+// never sees them again, however many times the corpus is resumed. The backfill
+// lane is the only route from that corpus to a hashed one, and these tests pin
+// what it may and may not do on the way.
+//
+// The load-bearing invariant is the negative one. The lane's writer is a bare
+// `UPDATE files SET sha1`, deliberately NOT the `INSERT OR REPLACE` the indexing
+// path uses, because that would restate `method`, `chars`, `pages`,
+// `indexed_at`, `attempts`, `last_attempt_at` and `elapsed_ms` — the exact
+// columns the resume predicate and the attempt cap read — from a `ProcessedFile`
+// the lane never built.
+
+/// One stored row, every column a backfill must not disturb plus the one it
+/// must set. Compared whole, so "changed nothing else" is asserted against the
+/// row rather than against a list of columns someone remembered to check.
+type StoredRow = (String, String, i64, i64, f64, i64, f64, i64, Option<String>);
+
+fn file_rows(destination: &Path) -> Vec<StoredRow> {
+    let connection = connect(destination).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT path,method,chars,pages,indexed_at,attempts,last_attempt_at,elapsed_ms,sha1 \
+             FROM files ORDER BY path",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        })
+        .unwrap();
+    rows.map(|row| row.unwrap()).collect()
+}
+
+/// The hash the lane must produce, computed the way anything else would.
+fn expected_sha1(path: &Path) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hash = Sha1::new();
+    hash.update(fs::read(path).unwrap());
+    format!("{:x}", hash.finalize())
+}
+
+/// `durability_config` plus the two gates, so a test can arm exactly one of
+/// them and prove the other still holds the lane shut.
+fn backfill_config(hash: bool, hash_backfill: bool) -> Config {
+    let mut config = durability_config();
+    config.hash = hash;
+    config.hash_backfill = hash_backfill;
+    config
+}
+
+fn index_with(
+    input: &Path,
+    destination: &Path,
+    config: Config,
+    resume: bool,
+    cancellation: Option<Arc<AtomicBool>>,
+    progress: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
+) -> anyhow::Result<IndexStats> {
+    let _serialized = model_lock();
+    run_index(IndexRequest {
+        paths: std::slice::from_ref(&input.to_path_buf()),
+        out: destination,
+        config,
+        resume,
+        overwrite: false,
+        artifacts: false,
+        retry_errors: false,
+        include_paths: None,
+        cancellation,
+        runtime: None,
+        progress,
+    })
+}
+
+fn hashed_rows(destination: &Path) -> i64 {
+    connect(destination)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE sha1 IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// The whole acceptance in one pass: a resume with both gates armed hashes the
+/// rows it would otherwise have skipped, writes the RIGHT hash, and leaves
+/// everything else about those rows exactly as it found it.
+#[test]
+fn a_backfill_pass_hashes_skipped_rows_and_touches_nothing_else() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let destination = temp.path().join("corpus.sqlite");
+    let paths = sample_tree(&input, 4);
+
+    // The corpus as it exists on the live box: fully indexed, and every row
+    // written by a build that was not hashing.
+    let first = index_with(
+        &input,
+        &destination,
+        backfill_config(false, false),
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(first.files, 4);
+    assert_eq!(first.hashed, 0, "the lane cannot run on a non-resume");
+    let before = file_rows(&destination);
+    assert!(
+        before.iter().all(|row| row.8.is_none()),
+        "the fixture must start unhashed or it proves nothing"
+    );
+
+    let stats = index_with(
+        &input,
+        &destination,
+        backfill_config(true, true),
+        true,
+        None,
+        None,
+    )
+    .unwrap();
+
+    // Nothing was indexed: no file was extracted, embedded or re-written.
+    assert_eq!(stats.files, 0, "a backfill pass writes no file rows");
+    assert_eq!(stats.embedded_chunks, 0, "a backfill pass embeds nothing");
+    assert_eq!(stats.errors, 0);
+    // The rows left `skipped` for `hashed` — this run did touch them.
+    assert_eq!(stats.hashed, 4);
+    assert_eq!(stats.skipped, 0, "hashed rows are not also skipped");
+    assert_eq!(stats.capped, 0);
+
+    let after = file_rows(&destination);
+    assert_eq!(after.len(), before.len(), "no row was added or removed");
+    for (old, new) in before.iter().zip(after.iter()) {
+        assert_eq!(old.0, new.0, "path");
+        assert_eq!(old.1, new.1, "method must survive a backfill");
+        assert_eq!(old.2, new.2, "chars must survive a backfill");
+        assert_eq!(old.3, new.3, "pages must survive a backfill");
+        assert_eq!(old.4, new.4, "indexed_at must survive a backfill");
+        assert_eq!(old.5, new.5, "attempts must survive a backfill");
+        assert_eq!(old.6, new.6, "last_attempt_at must survive a backfill");
+        assert_eq!(old.7, new.7, "elapsed_ms must survive a backfill");
+    }
+    for path in &paths {
+        let stored = after
+            .iter()
+            .find(|row| &row.0 == path)
+            .unwrap_or_else(|| panic!("{path} must still have a row"));
+        assert_eq!(
+            stored.8.as_deref(),
+            Some(expected_sha1(Path::new(path)).as_str()),
+            "the backfilled hash must be the file's actual sha1"
+        );
+    }
+
+    // And it is a ONE-TIME cost: the rows now carry hashes, so the next armed
+    // resume owes nothing and reports them as ordinary skips again.
+    let settled = index_with(
+        &input,
+        &destination,
+        backfill_config(true, true),
+        true,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(settled.hashed, 0, "a hashed row must not be re-hashed");
+    assert_eq!(settled.skipped, 4);
+}
+
+/// Both gates, independently. Either one off and the resume is the resume this
+/// build shipped before the lane existed — same counters, and not one byte
+/// written to `sha1`. This is what makes the feature safe to deploy inert.
+#[test]
+fn either_gate_off_leaves_the_resume_exactly_as_it_was() {
+    for (hash, hash_backfill) in [(false, false), (true, false), (false, true)] {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        let destination = temp.path().join("corpus.sqlite");
+        sample_tree(&input, 3);
+
+        index_with(
+            &input,
+            &destination,
+            backfill_config(false, false),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let before = file_rows(&destination);
+
+        let stats = index_with(
+            &input,
+            &destination,
+            backfill_config(hash, hash_backfill),
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            stats.skipped, 3,
+            "hash={hash} hash_backfill={hash_backfill}: every row stays a plain skip"
+        );
+        assert_eq!(stats.hashed, 0, "hash={hash} hash_backfill={hash_backfill}");
+        assert_eq!(stats.files, 0, "hash={hash} hash_backfill={hash_backfill}");
+        assert_eq!(
+            file_rows(&destination),
+            before,
+            "hash={hash} hash_backfill={hash_backfill}: the corpus must be untouched"
+        );
+    }
+}
+
+/// Total GROWS when the lane is armed, and that is the intended reading: the run
+/// genuinely has the owed rows to do. What must not happen is the two counters
+/// disagreeing — a `processed` that outruns `total`, or a `total` that hides
+/// work the run is spending time on and skews every rate derived from it.
+#[test]
+fn an_armed_backfill_grows_the_total_and_processed_reaches_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let destination = temp.path().join("corpus.sqlite");
+    sample_tree(&input, 4);
+
+    index_with(
+        &input,
+        &destination,
+        backfill_config(false, false),
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+
+    // A plain resume of a finished corpus: nothing to do, and `total` says so.
+    let plain: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = plain.clone();
+    index_with(
+        &input,
+        &destination,
+        backfill_config(true, false),
+        true,
+        None,
+        Some(Arc::new(move |processed, total| {
+            sink.lock().unwrap().push((processed, total))
+        })),
+    )
+    .unwrap();
+    assert_eq!(
+        plain.lock().unwrap().as_slice(),
+        [(0, 0)],
+        "an unarmed resume of a finished corpus has nothing to report"
+    );
+
+    let armed: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = armed.clone();
+    let stats = index_with(
+        &input,
+        &destination,
+        backfill_config(true, true),
+        true,
+        None,
+        Some(Arc::new(move |processed, total| {
+            sink.lock().unwrap().push((processed, total))
+        })),
+    )
+    .unwrap();
+
+    let samples = armed.lock().unwrap().clone();
+    assert_eq!(
+        samples,
+        vec![(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)],
+        "the owed rows are in `total` from the first sample and `processed` reaches it"
+    );
+    assert_eq!(stats.hashed, 4);
+}
+
+/// A killed backfill keeps what it hashed and the next run owes only the rest —
+/// the same durability contract the indexing pass has, reached through the same
+/// batched commit. Cancellation is driven from the progress callback, which the
+/// lane calls once per row, so the kill lands at an exact known row.
+#[test]
+fn a_cancelled_backfill_keeps_its_hashes_and_the_next_run_owes_the_rest() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let destination = temp.path().join("corpus.sqlite");
+    sample_tree(&input, 4);
+
+    let mut seed = backfill_config(false, false);
+    // One row per commit, so the assertion below is about the checkpoint the
+    // lane shares with `add` rather than about `finish` saving it at the end.
+    seed.commit_batch = 1;
+    index_with(&input, &destination, seed.clone(), false, None, None).unwrap();
+
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let flag = cancellation.clone();
+    let mut armed = seed.clone();
+    armed.hash = true;
+    armed.hash_backfill = true;
+    let error = index_with(
+        &input,
+        &destination,
+        armed.clone(),
+        true,
+        Some(cancellation),
+        Some(Arc::new(move |processed, _| {
+            if processed >= 2 {
+                flag.store(true, Ordering::Relaxed);
+            }
+        })),
+    )
+    .expect_err("a cancelled run reports itself cancelled");
+    assert!(
+        error.to_string().contains("cancelled"),
+        "a backfill cancel must take the run's ordinary cancelled path: {error}"
+    );
+    assert_eq!(
+        hashed_rows(&destination),
+        2,
+        "the hashes taken before the cancel are committed, and no more were taken"
+    );
+
+    // The resume owes exactly the remainder — not all four, and not none.
+    let finished = index_with(&input, &destination, armed, true, None, None).unwrap();
+    assert_eq!(
+        finished.hashed, 2,
+        "a resumed backfill owes only what is left"
+    );
+    assert_eq!(
+        finished.skipped, 2,
+        "the already-hashed rows are plain skips"
+    );
+    assert_eq!(hashed_rows(&destination), 4);
+}
+
+/// The lane's 1 GiB ceiling, on a file that reports its size without occupying
+/// it. Above the ceiling the drives-analytics app does not compare hashes
+/// either, so reading a multi-gigabyte file end to end would buy a value nothing
+/// consults — the row is left unhashed and stays an ordinary skip.
+///
+/// Note what this does NOT assert: the forward path has no such ceiling and does
+/// not gain one here. That is live behaviour on a running deployment, so the
+/// engine/app agreement is partial by design.
+#[test]
+fn a_file_over_the_backfill_ceiling_is_left_unhashed() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let destination = temp.path().join("corpus.sqlite");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(
+        input.join("small.txt"),
+        "A small report the lane will hash.",
+    )
+    .unwrap();
+    // `.bin` is an extension no extractor in this build handles, which lands the
+    // row on the terminal `excluded:unsupported` method — a COMPLETE row, so
+    // resume skips it and the lane is the only thing that could ever hash it.
+    // That is the case the ceiling has to stop; an INCOMPLETE row would be
+    // re-indexed instead and never reach the lane at all.
+    let huge = input.join("huge.bin");
+    sparse_file(&huge, (1 << 30) + 1);
+
+    let mut config = backfill_config(false, false);
+    // Above the oversize cut-off, or `extract` short-circuits to `name-only`
+    // (an incomplete row) before the unsupported-extension verdict is reached.
+    config.max_bytes = 4 << 30;
+    index_with(&input, &destination, config.clone(), false, None, None).unwrap();
+
+    let mut armed = config;
+    armed.hash = true;
+    armed.hash_backfill = true;
+    let stats = index_with(&input, &destination, armed, true, None, None).unwrap();
+
+    assert_eq!(stats.hashed, 1, "only the small file is under the ceiling");
+    assert_eq!(
+        stats.skipped, 1,
+        "the oversized row is not claimed by the lane, so it stays a plain skip"
+    );
+    let rows = file_rows(&destination);
+    let huge_row = rows
+        .iter()
+        .find(|row| row.0.ends_with("huge.bin"))
+        .expect("the oversized file is still indexed, just not hashed");
+    assert_eq!(huge_row.1, "excluded:unsupported");
+    assert_eq!(
+        huge_row.8, None,
+        "a file at or above the ceiling must be left unhashed"
+    );
+    let small_row = rows
+        .iter()
+        .find(|row| row.0.ends_with("small.txt"))
+        .expect("the small file still has a row");
+    assert_eq!(
+        small_row.8.as_deref(),
+        Some(expected_sha1(&input.join("small.txt")).as_str())
+    );
+}
+
+/// A file that REPORTS `len` bytes without occupying them. The lane's ceiling
+/// reads `FileRec::size`, i.e. the walker's `metadata().len()`, so a sparse file
+/// exercises it exactly as a real one would at no cost in disk or time.
+fn sparse_file(path: &Path, len: u64) {
+    fs::File::create(path).unwrap();
+    // NTFS needs the attribute set BEFORE the extension or it allocates the
+    // whole range; POSIX filesystems make a hole out of `set_len` on their own.
+    // A failure here is not fatal — the file is simply allocated, and nothing in
+    // this test ever reads it.
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("fsutil")
+            .args(["sparse", "setflag"])
+            .arg(path)
+            .status();
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(len)
+        .unwrap();
+}

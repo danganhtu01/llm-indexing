@@ -944,6 +944,73 @@ mod tests {
         assert_eq!(config.ocr_langs, "vie+eng+rus+deu");
     }
 
+    /// The sha1 backfill lane's two gates. The knob ships INERT — an operator
+    /// who does nothing must get the behaviour they had — and it takes BOTH
+    /// gates to arm, because a backfill without `hash` would stripe hashes
+    /// across a corpus that has none of its own.
+    #[test]
+    fn the_sha1_backfill_lane_needs_both_gates() {
+        assert!(
+            !Config::default().hash_backfill,
+            "the knob must default off or the next index job on a long-unhashed \
+             corpus silently byte-reads all of it"
+        );
+        assert!(!Config::default().sha1_backfill());
+        for (hash, hash_backfill, armed) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            let config = Config {
+                hash,
+                hash_backfill,
+                ..Config::default()
+            };
+            assert_eq!(
+                config.sha1_backfill(),
+                armed,
+                "hash={hash} hash_backfill={hash_backfill}"
+            );
+        }
+    }
+
+    /// A config that asks for the backfill with hashing off is normalised rather
+    /// than left to read back as something it will never do. Idempotent, like
+    /// every other clamp in `finalize`.
+    #[test]
+    fn finalize_drops_a_backfill_that_has_no_hashing_to_ride_on() {
+        let mut config = Config {
+            hash: false,
+            hash_backfill: true,
+            ..Config::default()
+        };
+        config.finalize();
+        assert!(!config.hash_backfill);
+        config.finalize();
+        assert!(!config.hash_backfill);
+
+        // With hashing on it survives untouched.
+        let mut armed = Config {
+            hash: true,
+            hash_backfill: true,
+            ..Config::default()
+        };
+        armed.finalize();
+        assert!(armed.hash_backfill);
+        assert!(armed.sha1_backfill());
+    }
+
+    /// Absent from the YAML means off — the rollback-safe reading, and the one
+    /// the live config file relies on: it carries no `hash_backfill` key at all.
+    #[test]
+    fn an_absent_hash_backfill_key_is_off() {
+        let config: Config = serde_yaml::from_str("hash: true").unwrap();
+        assert!(config.hash);
+        assert!(!config.hash_backfill);
+        assert!(!config.sha1_backfill());
+    }
+
     #[test]
     fn finalize_clamps_out_of_range_config_knobs() {
         // A mis-set config base is corrected to the settings-surface bounds so it
