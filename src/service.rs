@@ -289,7 +289,55 @@ pub fn router(config: ServiceConfig) -> Result<Router> {
         .route("/corpus/documents/{id}/text", get(corpus_document_text))
         .route("/corpus/status", get(corpus_status_handler))
         .route("/corpus/search", get(corpus_search))
-        .route("/export/corpus", get(export_corpus))
+        // `/export/corpus` (`export_corpus`/`vacuum_export` below) is
+        // deliberately NOT registered. A W13-council-less commit (dde0cd3)
+        // added it wired to serve the entire corpus database, and a targeted
+        // review before the next binary swap found it unsafe to ship as-is:
+        //
+        //   1. Ungated even with a submit token configured. The gate below
+        //      (`require_submit_token`) keys on `request.method() != POST`,
+        //      so every GET passes unconditionally — including this one. That
+        //      is fine for read-only *mutation* safety, which is the gate's
+        //      job, but this route is a *confidentiality* leak, not a
+        //      mutation: it hands out the whole corpus (embeddings, every
+        //      indexed path, vision/faces, meta) to anyone who can reach the
+        //      port, token or not.
+        //   2. Not actually streamed despite the docstring/commit title:
+        //      `vacuum_export` reads the whole vacuumed copy into one
+        //      `Vec<u8>` (`fs::read`) before `Body::from(bytes)`. The live
+        //      corpora are 20.9 GB and 7.2 GB against ~21.8 GB free physical
+        //      RAM on the target box — one export can OOM the process.
+        //   3. Writer starvation: the read-only `VACUUM INTO` holds a SHARED
+        //      lock on a DELETE-journal corpus for the vacuum's duration
+        //      (projected ~44s on the 20.9 GB corpus), which exceeds the
+        //      writer's 30s `BUSY_TIMEOUT` and fails an active index job's
+        //      batch commit.
+        //   4. No concurrency cap: `spawn_blocking`'s pool lets N concurrent
+        //      requests become N concurrent vacuums, each a multi-GB
+        //      allocation, and none of it is cancellable on client
+        //      disconnect.
+        //   5. Nothing in drives-analytics calls this route (grep-confirmed)
+        //      — it is pure added attack/failure surface for this deploy.
+        //      The app's own equivalent (`copy_db_projected` in
+        //      drives-analytics' api/src/analysis.rs:760) gates the same
+        //      operation at `MAX_SCRATCH_BYTES` = 4 GiB and deliberately
+        //      skips the live corpus rather than risk the disk — this route
+        //      had no analogous ceiling at all.
+        //
+        // The handler and its helpers are left in place (dead but compiling,
+        // `#[allow(dead_code)]`'d where clippy insists) so the work is not
+        // lost. Re-registration checklist — ALL FOUR must be true first:
+        //   a. A size ceiling that refuses to export the live corpora (a
+        //      `MAX_SCRATCH_BYTES`-style cap, checked before or during the
+        //      vacuum, not after the read).
+        //   b. Real streaming: `tokio::fs::File` + `ReaderStream` +
+        //      `Body::from_stream`, with the `TempDir` kept alive for the
+        //      stream's whole life (not dropped once the handler returns).
+        //   c. A single-flight semaphore so concurrent exports cannot stack
+        //      concurrent vacuums/allocations.
+        //   d. Gating behind the submit token — which first requires the gate
+        //      to stop keying on POST alone (see `require_submit_token`'s
+        //      docstring below).
         .layer(DefaultBodyLimit::max(max_body))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -337,12 +385,24 @@ pub const SUBMIT_TOKEN_HEADER: &str = "X-Submit-Token";
 ///
 /// The gate keys on the METHOD, not on a route list: in this service every
 /// mutation is a POST (`/index`, `/jobs/{id}/cancel`, `/runtime`,
-/// `/jobs/{id}/runtime`) and every GET is read-only by construction, so a
-/// job-mutating route added later is covered by default (fail closed) instead
-/// of depending on someone remembering to enrol it. Read-only routes stay
-/// open on purpose — the app's search proxy, monitor panels and read tools
-/// keep working tokenless, which is what makes the token an app-held WRITE
-/// credential rather than a service password.
+/// `/jobs/{id}/runtime`), so a job-mutating route added later is covered by
+/// default (fail closed) instead of depending on someone remembering to
+/// enrol it. Read-only routes stay open on purpose — the app's search proxy,
+/// monitor panels and read tools keep working tokenless, which is what makes
+/// the token an app-held WRITE credential rather than a service password.
+///
+/// That "every GET is read-only by construction" was originally offered here
+/// as the reason passing all GETs unconditionally is safe. It is true for
+/// *mutation* safety, which is this gate's actual job, but it does NOT mean
+/// every GET is safe to leave ungated in general: a GET can still exfiltrate
+/// data it has no business handing out. `/export/corpus` (see the
+/// unregistered route above) is exactly that case — read-only, and yet a
+/// full download of the corpus database with no token check at all. This PR
+/// does not change this gate's behavior (POST-keying stays as-is); it only
+/// corrects the assumption in this comment so a future reader does not reuse
+/// it to justify shipping another read-that-leaks route ungated. Widening
+/// this gate to cover selected GETs is part of `/export/corpus`'s
+/// re-registration checklist, not done here.
 ///
 /// A rejection happens before any handler runs, so it has no side effects: no
 /// job row, no cancellation flag, no persisted envelope. The body names the
@@ -1689,17 +1749,32 @@ fn document_text(corpus_db: &Path, id: i64) -> Result<Option<String>, ReadError>
 
 /// GET /export/corpus?output=<artifact>
 ///
-/// A consistent point-in-time copy of the published corpus database, streamed
-/// back whole as `application/vnd.sqlite3`. A raw `fs::copy` of a database that
-/// jobs write to in place can capture a torn page mid-write; `VACUUM INTO`
-/// rebuilds the entire file from a single read transaction, which is the only
-/// primitive that is safe to run against a live rollback-journal SQLite file —
-/// the same guarantee the backup API gives, without needing one. `output` goes
-/// through the exact same confinement as every other corpus route
-/// (`resolve_output`/`valid_output_name`): a plain filename under
-/// `output_root`, never a path. The vacuum target is a scratch temp directory
-/// that is removed — file included — the moment this call returns, win or
-/// lose, so a crashed or slow export never leaves a copy behind.
+/// NOT REGISTERED — see the re-registration checklist where the route used to
+/// be wired in [`router`], above `.layer(DefaultBodyLimit::max(max_body))`.
+/// Kept compiling so the work is not lost.
+///
+/// A consistent point-in-time copy of the published corpus database, handed
+/// back whole as `application/vnd.sqlite3`. A raw `fs::copy` of a database
+/// that jobs write to in place can capture a torn page mid-write; `VACUUM
+/// INTO` rebuilds the entire file from a single read transaction, which is
+/// the only primitive that is safe to run against a live rollback-journal
+/// SQLite file — the same guarantee the backup API gives, without needing
+/// one. `output` goes through the exact same confinement as every other
+/// corpus route (`resolve_output`/`valid_output_name`): a plain filename
+/// under `output_root`, never a path. The vacuum target is a scratch temp
+/// directory that is removed — file included — the moment this call returns,
+/// win or lose, so a crashed or slow export never leaves a copy behind.
+///
+/// Despite an earlier version of this doc comment claiming otherwise, the
+/// response body is NOT streamed: `vacuum_export` below reads the whole
+/// vacuumed copy into one `Vec<u8>` and this handler hands that to
+/// `Body::from(bytes)` in one shot. Against the live corpora (20.9 GB / 7.2
+/// GB) that is an unbounded, multi-GB in-memory allocation per request —
+/// exactly the gap re-registration condition (b) closes.
+#[allow(
+    dead_code,
+    reason = "unregistered pending gating/streaming/size-ceiling fixes; kept compiling, see router()'s /export/corpus comment"
+)]
 async fn export_corpus(
     State(state): State<AppState>,
     Query(query): Query<OutputQuery>,
@@ -1744,6 +1819,10 @@ async fn export_corpus(
 /// "no corpus has been published yet" is a real, expected outcome here (unlike
 /// every other corpus route, there is no zeroed/empty value to hand back for
 /// an export) and must 404, not join `Unreadable`'s 503.
+///
+/// Only used by the unregistered `export_corpus`/`vacuum_export` pair below;
+/// see the router's `/export/corpus` comment for why it isn't wired in.
+#[allow(dead_code, reason = "part of the unregistered /export/corpus handler")]
 enum ExportError {
     /// No job has ever written this output; nothing exists to export.
     Absent,
@@ -1758,6 +1837,16 @@ enum ExportError {
 /// every return path out of this function, including the two error returns
 /// below, so a failed vacuum or a failed read is never the reason a scratch
 /// copy is left on disk.
+///
+/// NOT streaming (the whole point condition (b) of the re-registration
+/// checklist exists to fix): the `fs::read` at the bottom pulls the entire
+/// vacuumed copy into memory before it is ever handed to a response body.
+/// Unregistered along with `export_corpus`; see the router's `/export/corpus`
+/// comment.
+#[allow(
+    dead_code,
+    reason = "unregistered pending gating/streaming/size-ceiling fixes"
+)]
 fn vacuum_export(path: &Path) -> Result<Vec<u8>, ExportError> {
     let connection = match open_ro(path) {
         Corpus::Absent => return Err(ExportError::Absent),
