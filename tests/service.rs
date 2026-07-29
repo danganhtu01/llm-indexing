@@ -2051,6 +2051,65 @@ async fn the_read_surface_stays_open_while_gated() {
 }
 
 #[tokio::test]
+async fn every_non_get_head_method_is_gated_while_get_and_head_ride_free() {
+    // The gate keys on GET/HEAD, not on a route list: PUT and DELETE — neither
+    // of which this service registers a handler for — must still be refused
+    // with 401 by the gate itself, before axum's own routing ever gets a
+    // chance to answer 405/404. That is what makes "a job-mutating route
+    // added later with a method other than POST is covered by default" true
+    // rather than aspirational.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = gated_router(&output, &input);
+
+    for method in ["PUT", "DELETE", "PATCH"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/index")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method}");
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["header"], "X-Submit-Token", "{method}: {body}");
+    }
+
+    // GET and HEAD stay open with no token at all — the read surface is not a
+    // write credential.
+    let get_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_response.status(), StatusCode::OK);
+
+    let head_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn an_ungated_serve_accepts_tokenless_submits_exactly_as_before() {
     // Back-compat is the contract: without --submit-token the gate is not even
     // installed, so a bare submit — and one carrying a stray token header —
