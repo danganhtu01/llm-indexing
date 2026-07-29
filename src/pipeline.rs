@@ -258,9 +258,11 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     // re-implementing the skip predicate and eventually disagreeing with it.
     let backfill = request.resume && !embed_model_changed && request.config.sha1_backfill();
     // Rows the lane will hash WITHOUT indexing: finished, unhashed, under the
-    // ceiling. Held as records rather than paths because the hash reads the file
-    // the walk just found, at the size the walk just measured.
-    let mut hash_only: Vec<FileRec> = Vec::new();
+    // ceiling. Paths only, not whole `FileRec`s — the size is consumed by the
+    // selector right here and never wanted again, and on a corpus with 538k owed
+    // rows the difference between holding one String per row and five is
+    // hundreds of megabytes carried for the length of the run.
+    let mut hash_only: Vec<String> = Vec::new();
     if request.resume && !embed_model_changed {
         // A single un-capped retry for the whole run: `retry_errors` is the
         // operator asking, `extractor_changed` is the build having something new
@@ -307,7 +309,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
                 if !row_complete(&row.method, row.has_chunks) {
                     capped += 1;
                 } else if backfill && backfill_candidate(row, record.size) {
-                    hash_only.push(record.clone());
+                    hash_only.push(record.path.clone());
                 }
             }
             selected
@@ -386,7 +388,7 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     // left of it.
     let mut processed = 0_usize;
     let mut backfill_cancelled = false;
-    for record in &hash_only {
+    for path in &hash_only {
         if request
             .cancellation
             .as_ref()
@@ -400,8 +402,8 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
         // the row describes a successful extraction that is still true, and a
         // hash that could not be taken says nothing about it. It still advances
         // `processed`, because the attempt cost what it cost.
-        if let Some(digest) = sha1(Path::new(&record.path)) {
-            store.set_sha1(&record.path, &digest)?;
+        if let Some(digest) = sha1(Path::new(path)) {
+            store.set_sha1(path, &digest)?;
             stats.hashed += 1;
         }
         processed += 1;
@@ -654,6 +656,19 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     revised?;
     recorded?;
     if cancelled {
+        // The hash count is named only when there IS one, so the message a
+        // cancel produces on every run that did not arm the backfill lane —
+        // i.e. every run today — is the one it has always produced. A cancel
+        // during a pure backfill would otherwise report "0 file(s) committed"
+        // while its hashes were on disk, which is exactly the kind of quiet
+        // misreport the counters here exist to avoid.
+        if stats.hashed > 0 {
+            anyhow::bail!(
+                "indexing cancelled; {} file(s) and {} sha1 backfill(s) committed",
+                stats.files,
+                stats.hashed
+            )
+        }
         anyhow::bail!("indexing cancelled; {} file(s) committed", stats.files)
     }
     stats.elapsed_seconds = started.elapsed().as_secs_f64();

@@ -1464,9 +1464,11 @@ fn a_cancelled_backfill_keeps_its_hashes_and_the_next_run_owes_the_rest() {
         })),
     )
     .expect_err("a cancelled run reports itself cancelled");
-    assert!(
-        error.to_string().contains("cancelled"),
-        "a backfill cancel must take the run's ordinary cancelled path: {error}"
+    assert_eq!(
+        error.to_string(),
+        "indexing cancelled; 0 file(s) and 2 sha1 backfill(s) committed",
+        "a backfill cancel takes the run's ordinary cancelled path, and says what \
+         it actually committed rather than reporting the zero files it indexed"
     );
     assert_eq!(
         hashed_rows(&destination),
