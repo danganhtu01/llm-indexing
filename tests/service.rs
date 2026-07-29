@@ -177,13 +177,70 @@ async fn a_running_job_reports_worked_beside_processed_and_total() {
 /// Sorted top-level filenames under `output_root` — used to assert nothing
 /// stray was left behind (P0-11 makes `jobs.sqlite` a permanent, expected
 /// sibling of the published corpora).
+///
+/// SQLite sidecars (`-journal`, `-wal`, `-shm`) are filtered out. They are a
+/// transient implementation detail of a writer's in-flight transaction, not
+/// published output: `jobs.sqlite` gets touched throughout a test run by the
+/// job store, so a listing that lands mid-transaction can catch e.g.
+/// `jobs.sqlite-journal` beside it. Without this filter, the assertion is a
+/// race — the SAME commit has been seen to pass this check in one CI run and
+/// fail it in another (and on `main`, with none of this file's changes,
+/// against a *different* caller of this helper), purely on whether the
+/// listing happened to land while a transaction was open. Do not remove this
+/// filter to "simplify" the helper; that reintroduces the flake.
 fn output_dir_names(output: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(output)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            !(name.ends_with("-journal") || name.ends_with("-wal") || name.ends_with("-shm"))
+        })
         .collect();
     names.sort();
     names
+}
+
+/// Forces the exact race `output_dir_names` exists to tolerate: a listing
+/// that lands while a writer holds an open transaction on `jobs.sqlite`.
+/// SQLite's default rollback-journal mode materializes `<db>-journal` beside
+/// the database as soon as a page is modified inside an uncommitted
+/// transaction — this test holds one open on purpose, proves the sidecar is
+/// really there with a raw (unfiltered) listing, and then asserts the helper
+/// still reports only the two published files.
+#[test]
+fn output_dir_names_ignores_an_open_transactions_journal_sibling() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("output");
+    fs::create_dir_all(&output).unwrap();
+    fs::write(output.join("corpus.sqlite"), b"").unwrap();
+
+    let mut connection = rusqlite::Connection::open(output.join("jobs.sqlite")).unwrap();
+    connection
+        .execute_batch("CREATE TABLE t (x INTEGER)")
+        .unwrap();
+    let txn = connection.transaction().unwrap();
+    txn.execute("INSERT INTO t (x) VALUES (1)", []).unwrap();
+
+    // Raw listing, no filtering: the journal sidecar must actually be
+    // present, or this test would be proving nothing.
+    let raw_names: Vec<String> = fs::read_dir(&output)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        raw_names.iter().any(|name| name == "jobs.sqlite-journal"),
+        "expected the open transaction to produce a rollback-journal \
+         sidecar, got {raw_names:?} — the race this test forces didn't \
+         happen, so it isn't exercising the helper"
+    );
+
+    // The helper under test sees the same directory and tolerates it.
+    assert_eq!(
+        output_dir_names(&output),
+        vec!["corpus.sqlite", "jobs.sqlite"]
+    );
+
+    txn.rollback().unwrap();
 }
 
 fn guard_router(output: &std::path::Path, input: &std::path::Path) -> axum::Router {
