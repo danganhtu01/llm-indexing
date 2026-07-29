@@ -22,6 +22,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # poppler-utils (pdfinfo/pdftotext) ONLY. Two tests do real PDF
+      # extraction through the actual pipeline with no availability guard:
+      # tests/indexing.rs page_boundaries_survive_from_pdf_extraction_into_stored_chunks
+      # (:642) and an_unanchored_corpus_regains_its_page_anchors_on_an_ordinary_resume
+      # (:1077) both call extract::pdf on a handcrafted PDF and assert on the
+      # result, so without pdfinfo/pdftotext on PATH they fail outright rather
+      # than skip. The other PDF tests in this file (the encrypted-PDF ones)
+      # self-skip via a local `pdfinfo_available()` check (tests/indexing.rs:958),
+      # which is why this job was ever green at all despite having no apt step.
+      # The `container` job below is unaffected by this gap: it builds and
+      # runs the Dockerfile image, whose runtime stage installs poppler-utils
+      # (Dockerfile:32) along with everything else the shipped binary needs.
+      #
+      # Deliberately NOT installing tesseract/ffmpeg/antiword/imagemagick here:
+      # this job runs `cargo test`, not the Dockerfile image, and several
+      # tests key their behavior off runtime tool detection rather than a
+      # fixed fixture set — e.g. extract.rs's `ffmpeg_available()` (~:1229)
+      # gates two HEIC tests (~:1203, ~:1257) that currently skip because
+      # ffmpeg is absent. transcriber.available() (~:447) is a separate,
+      # unrelated gate — a Whisper model-presence check, not an ffmpeg
+      # check. Those tests currently pass by cleanly hitting the "tool
+      # absent" branch; installing ffmpeg would silently switch them onto a
+      # different, unreviewed code path. Broadening this step is a separate
+      # change.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends poppler-utils
       - run: cargo test --locked
 
   container:
