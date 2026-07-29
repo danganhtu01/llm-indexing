@@ -42,6 +42,36 @@ use crate::walker::walk;
 /// no matter how many attempts it has burned.
 pub const MAX_ATTEMPTS: u32 = 3;
 
+/// Size ceiling for the sha1 BACKFILL lane: a file at or above this is left
+/// unhashed rather than read end to end.
+///
+/// Mirrors `SHA1_MAX_BYTES` in the drives-analytics app (`api/src/coherence.rs`
+/// and its move executor), which is the consumer these hashes exist for. Above
+/// this size the app does not hash either — it falls back to the whole-second
+/// mtime rule the engines themselves use — so a hash produced here would have
+/// nothing on the other side to be compared against, and would have cost a
+/// multi-gigabyte read to produce.
+///
+/// Deliberately scoped to the BACKFILL lane. The FORWARD path (`config.hash` on
+/// a file this run is indexing anyway, in [`process`]) has no ceiling and does
+/// not gain one here: that is live behaviour on a running deployment and
+/// changing it is not in this change's remit. The engine/app agreement is
+/// therefore PARTIAL by design — backfilled hashes respect the app's ceiling,
+/// forward hashes above it keep being written exactly as they are today, where
+/// they are harmless (a hash the app simply declines to consult).
+const SHA1_MAX_BYTES: u64 = 1 << 30;
+
+/// How many individually unreadable files the sha1 backfill lane names in the
+/// log before it falls back to counting them.
+///
+/// The per-file line is the diagnosable one — "permission denied" across a whole
+/// subtree and "the file is open in another process" on scattered PSTs are
+/// different problems and do not look alike — but a corpus can have six figures
+/// of them, and a line each would make one run's log larger than the corpus
+/// listing. A sample plus [`IndexStats::hash_failed`] gives both the pattern and
+/// the magnitude.
+const HASH_MISS_SAMPLE: usize = 20;
+
 pub struct IndexRequest<'a> {
     pub paths: &'a [PathBuf],
     pub out: &'a Path,
@@ -221,6 +251,29 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     // subset rather than the whole corpus — an intentional trade for staying
     // out of the poll path entirely.
     store.set_meta("last_discovered_files", &before.to_string())?;
+    // The sha1 BACKFILL lane's arming condition, resolved once.
+    //
+    // Both config gates (`Config::sha1_backfill`) AND the same two run-shape
+    // conditions the retain block below runs under, because those are exactly
+    // the conditions under which the lane can have anything to do:
+    //
+    //  - NOT a resume: every walked file goes down the forward path, which
+    //    already hashes it when `hash` is on. There is no "skipped row" to owe
+    //    a hash — a backfill lane would be a second, redundant reader.
+    //  - `embed_model_changed`: the retain block is bypassed and the WHOLE
+    //    corpus is reprocessed, so again every row gets a forward hash.
+    //
+    // Which is why the classification below lives inside that block rather than
+    // in a pass of its own: the lane's population is by definition "the rows
+    // that block declined", and deriving it anywhere else would mean
+    // re-implementing the skip predicate and eventually disagreeing with it.
+    let backfill = request.resume && !embed_model_changed && request.config.sha1_backfill();
+    // Rows the lane will hash WITHOUT indexing: finished, unhashed, under the
+    // ceiling. Paths only, not whole `FileRec`s — the size is consumed by the
+    // selector right here and never wanted again, and on a corpus with 538k owed
+    // rows the difference between holding one String per row and five is
+    // hundreds of megabytes carried for the length of the run.
+    let mut hash_only: Vec<String> = Vec::new();
     if request.resume && !embed_model_changed {
         // A single un-capped retry for the whole run: `retry_errors` is the
         // operator asking, `extractor_changed` is the build having something new
@@ -258,13 +311,39 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
                 );
             let selected =
                 needs_reprocess(row, record.size, record.mtime as i64, upgrade, uncapped);
-            if !selected && !row_complete(&row.method, row.has_chunks) {
-                capped += 1;
+            if !selected {
+                // A row this run declines is one of exactly two things, and the
+                // split is total: `needs_reprocess` returns true for any
+                // incomplete row unless the cap suppressed it, so `!selected`
+                // with an incomplete row IS the capped case and everything else
+                // is a finished row.
+                if !row_complete(&row.method, row.has_chunks) {
+                    capped += 1;
+                } else if backfill && backfill_candidate(row, record.size) {
+                    hash_only.push(record.path.clone());
+                }
             }
             selected
         });
     }
-    let skipped = before - records.len();
+    // Hash-only rows are NOT skipped: this run reads every one of their files
+    // end to end. They leave `skipped` for `hashed`, which keeps `skipped`
+    // meaning "walked, and this run will not touch it" — the thing an operator
+    // reads it as. `capped` stays a strict subset of `skipped` because the lane
+    // never claims a capped row (see above): a capped row is one the engine may
+    // yet index once `retry_errors` or a moved extractor revision lifts the cap,
+    // and its hash should arrive by that forward path rather than be spent here.
+    let skipped = before - records.len() - hash_only.len();
+    if backfill {
+        // The run's FIRST progress message, before a byte is read: a backfill
+        // pass over a long-unhashed corpus can be hours of pure I/O, and an
+        // operator who has just flipped the knob is owed the size of what they
+        // asked for at the moment they can still stop it.
+        eprintln!(
+            "sha1 backfill: {} finished row(s) owe a hash — hashing before indexing",
+            hash_only.len()
+        );
+    }
     eprintln!(
         "llm-index {} -> {} file(s), OCR {}, workers {}",
         env!("CARGO_PKG_VERSION"),
@@ -290,18 +369,109 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     let admission = Admission::new(runtime.clone());
     let embedders = EmbedderPool::seeded(&request.config, runtime.clone(), first_embedder);
     let config = Arc::new(request.config.clone());
-    let total = records.len();
+    // Hash-only rows are part of the run's work, so they are part of its
+    // denominator. A resume that would have reported `total: 40` now reports
+    // `total: 40 + owed` — TOTAL GROWS when the lane is armed, and that is the
+    // intended reading: the run genuinely has that much more to do. Consumers
+    // deriving a rate or an ETA from (processed, total) stay honest precisely
+    // because both counters move together; hiding the hashes from `total` while
+    // still spending the time on them is what would skew them.
+    let total = records.len() + hash_only.len();
     if let Some(progress) = &request.progress {
         progress(0, total);
     }
-    let completed = Arc::new(AtomicUsize::new(0));
-    let cancellation = request.cancellation.clone();
-    let progress = request.progress.clone();
     let mut stats = IndexStats {
         skipped,
         capped,
         ..Default::default()
     };
+    // ── sha1 backfill lane ──────────────────────────────────────────────────
+    //
+    // Here, and not inside the three-stage pipeline below: this thread still
+    // owns `store` exclusively, and the lane's unit of work is one `UPDATE` of
+    // one column — there is nothing to extract, nothing to embed, and nothing
+    // for a writer hand-off to serialise. Sequential on purpose too: the whole
+    // cost is reading file bytes off the same disks the extract stage is about
+    // to read, so fanning it out would buy contention, not throughput.
+    //
+    // Before the indexing pass rather than after, so an interrupted run has
+    // spent its time on the cheap work first and a resume owes only what is
+    // left of it.
+    let mut processed = 0_usize;
+    let mut backfill_cancelled = false;
+    for path in &hash_only {
+        if request
+            .cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            backfill_cancelled = true;
+            break;
+        }
+        match sha1(Path::new(path)) {
+            Ok(digest) => {
+                store.set_sha1(path, &digest)?;
+                stats.hashed += 1;
+            }
+            // An unreadable file leaves its row exactly as it was — `sha1` still
+            // NULL — rather than becoming an `error:` row: the row describes a
+            // successful extraction that is still true, and a hash that could
+            // not be taken says nothing about it.
+            //
+            // It is COUNTED, though, and that is the point of `hash_failed`
+            // existing at all. This is not a rare case on a real drive: locked
+            // PST files, VM disks held open by a hypervisor, anything another
+            // process has exclusive, anything the service account cannot read.
+            // Without its own counter such a row would appear in NOTHING — out
+            // of `skipped` (the lane claimed it), out of `hashed` (no hash
+            // landed), never in `files` or `errors` (nothing was indexed) —
+            // leaving an unexplained gap between the owed count this run
+            // announced and the hashes it produced, indistinguishable from a bug
+            // in the lane. The run's accounting has to close: for a lane that
+            // ran to completion, `hashed + hash_failed` is exactly the owed
+            // count reported before it started.
+            //
+            // These rows are also the ones the lane re-attempts on every armed
+            // run, precisely because no hash ever lands on them — so the count
+            // is what tells an operator whether the backfill has converged or is
+            // going to keep costing this much forever.
+            Err(error) => {
+                stats.hash_failed += 1;
+                // Listed individually up to a sample, then counted only. The
+                // per-file line is what makes the failures diagnosable (a
+                // permissions pattern and a locked-file pattern do not look
+                // alike), and the cap is what stops a corpus with six figures of
+                // unreadable files turning one run into a six-figure log.
+                if stats.hash_failed <= HASH_MISS_SAMPLE {
+                    eprintln!("sha1 backfill: leaving {path} unhashed — {error:#}");
+                    if stats.hash_failed == HASH_MISS_SAMPLE {
+                        eprintln!(
+                            "sha1 backfill: further unreadable files are counted, not listed"
+                        );
+                    }
+                }
+            }
+        }
+        // Advances on BOTH arms: the read was attempted and cost what it cost.
+        processed += 1;
+        if let Some(progress) = &request.progress {
+            progress(processed, total);
+        }
+    }
+    if backfill {
+        // The closing half of the lane's accounting, printed even when the run
+        // was cancelled part-way (the two counters then describe what it got
+        // through, and the difference from the owed count is the cancel).
+        eprintln!(
+            "sha1 backfill: {} row(s) hashed, {} unreadable",
+            stats.hashed, stats.hash_failed
+        );
+    }
+    // Seeded, not zero: the indexing pass continues the run's single processed
+    // counter rather than restarting it, so a poller never sees it go backwards.
+    let completed = Arc::new(AtomicUsize::new(processed));
+    let cancellation = request.cancellation.clone();
+    let progress = request.progress.clone();
     // Old rows KEPT by keep-on-failure — the file's reprocess errored but the
     // byte-for-byte-unchanged file already had a complete row, so the error was
     // dropped. Deliberately NOT part of `IndexStats` (a kept row counts nowhere
@@ -350,6 +520,16 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     };
     let job_cancelled: &(dyn Fn() -> bool + Sync) = &job_cancelled;
     let outcome = std::thread::scope(|scope| -> Result<bool> {
+        // A cancel the backfill lane observed ends the run HERE, before a single
+        // thread is spawned. The operator asked the job to stop; starting a full
+        // extract/embed pipeline after that would be the opposite of stopping.
+        // Returning from inside the scope rather than skipping it keeps ONE
+        // cancelled path: `finish`, the meta gates and the `indexing cancelled`
+        // error below are reached by the same route either way. Nothing has been
+        // spawned yet, so the channels this closure captured simply drop.
+        if backfill_cancelled {
+            return Ok(true);
+        }
         scope.spawn(move || {
             let stopped = AtomicBool::new(false);
             let halted = || {
@@ -532,6 +712,19 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     revised?;
     recorded?;
     if cancelled {
+        // The hash count is named only when there IS one, so the message a
+        // cancel produces on every run that did not arm the backfill lane —
+        // i.e. every run today — is the one it has always produced. A cancel
+        // during a pure backfill would otherwise report "0 file(s) committed"
+        // while its hashes were on disk, which is exactly the kind of quiet
+        // misreport the counters here exist to avoid.
+        if stats.hashed > 0 {
+            anyhow::bail!(
+                "indexing cancelled; {} file(s) and {} sha1 backfill(s) committed",
+                stats.files,
+                stats.hashed
+            )
+        }
         anyhow::bail!("indexing cancelled; {} file(s) committed", stats.files)
     }
     stats.elapsed_seconds = started.elapsed().as_secs_f64();
@@ -688,7 +881,11 @@ fn process(
             );
             let lang = normalizer.detect_lang(&content);
             let tokens = normalizer.enrich(&token_source, &lang);
-            let hash = config.hash.then(|| sha1(path)).flatten();
+            // `.ok()` keeps the forward path exactly as it was: a file this run
+            // is indexing and cannot hash has already failed, or is about to
+            // fail, on the same bytes elsewhere, and that failure is what the
+            // row records.
+            let hash = config.hash.then(|| sha1(path).ok()).flatten();
             ProcessedFile {
                 rec: record,
                 content,
@@ -787,6 +984,24 @@ fn needs_reprocess(
         || row.mtime != mtime
         || upgrade
         || (!row_complete(&row.method, row.has_chunks) && (uncapped || row.attempts < MAX_ATTEMPTS))
+}
+
+/// Whether a row this run has decided to SKIP should instead be handed to the
+/// sha1 backfill lane.
+///
+/// Two conditions and nothing else. The row carries no hash — and never will
+/// from the forward path, because a finished row is not re-extracted, so this is
+/// the only way a corpus that predates `hash: true` ever becomes hashable. And
+/// the file is under [`SHA1_MAX_BYTES`], above which the app this hash exists for
+/// does not compare hashes anyway, so reading a multi-gigabyte file end to end
+/// would buy a value nothing consults.
+///
+/// Everything about WHICH rows reach this — resume only, both config gates,
+/// finished rows only, never a capped one — is the caller's decision, kept there
+/// because it belongs with the skip predicate it partitions. This is the per-row
+/// half, split out so it can be tested without building a corpus.
+fn backfill_candidate(row: &ExistingRow, size: u64) -> bool {
+    !row.has_sha1 && size < SHA1_MAX_BYTES
 }
 
 /// Whether an incoming `error:` row must be DROPPED to keep a still-valid stored
@@ -906,18 +1121,32 @@ fn nfc(text: String) -> String {
     }
 }
 
-fn sha1(path: &Path) -> Option<String> {
-    let mut file = fs::File::open(path).ok()?;
+/// Sha1 of a file's bytes.
+///
+/// Returns the FAILURE rather than swallowing it. The forward path throws it
+/// away (`.ok()`) exactly as it always did — a file whose hash could not be
+/// taken there has already produced an `error:` row from the extraction that
+/// failed on the same bytes, so the reason is recorded. The BACKFILL lane has no
+/// such row to lean on: its rows are finished and stay finished, so if this
+/// returned a bare `None` the lane could only report that a hash did not appear,
+/// not why. "Permission denied" versus "the file is open in another process" is
+/// the whole difference between a corpus an operator can finish hashing and one
+/// they cannot explain.
+fn sha1(path: &Path) -> Result<String> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("opening {} to hash it", path.display()))?;
     let mut hash = Sha1::new();
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
-        let n = file.read(&mut buffer).ok()?;
+        let n = file
+            .read(&mut buffer)
+            .with_context(|| format!("reading {} to hash it", path.display()))?;
         if n == 0 {
             break;
         }
         hash.update(&buffer[..n]);
     }
-    Some(format!("{:x}", hash.finalize()))
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn now() -> f64 {
@@ -1039,6 +1268,10 @@ mod tests {
             method: method.to_string(),
             has_chunks,
             attempts,
+            // The predicates below never read it: a stored hash neither
+            // schedules a file nor spares it. Only the backfill lane's own
+            // selector cares, and it is tested on its own terms.
+            has_sha1: false,
         }
     }
 
@@ -1104,6 +1337,52 @@ mod tests {
                     "{method} must not be scheduled for page backfill"
                 );
             }
+        }
+    }
+
+    /// The sha1 backfill lane's per-row selector. Its whole job is to be
+    /// NARROW: it runs against rows the run has already decided to skip, so
+    /// every `true` here is a file read end to end for a column, and on a corpus
+    /// with a long unhashed history there are hundreds of thousands of them.
+    mod backfill {
+        use super::super::{backfill_candidate, SHA1_MAX_BYTES};
+        use super::stored;
+        use crate::store::ExistingRow;
+
+        fn unhashed() -> ExistingRow {
+            stored("text", true, 0)
+        }
+
+        fn hashed() -> ExistingRow {
+            ExistingRow {
+                has_sha1: true,
+                ..stored("text", true, 0)
+            }
+        }
+
+        #[test]
+        fn an_unhashed_row_under_the_ceiling_is_claimed() {
+            assert!(backfill_candidate(&unhashed(), 12));
+            assert!(backfill_candidate(&unhashed(), SHA1_MAX_BYTES - 1));
+        }
+
+        /// The idempotence that stops the lane costing anything twice: once a
+        /// row has a hash it is never re-read, so an armed corpus pays the
+        /// backfill exactly once and every resume after it is an ordinary one.
+        #[test]
+        fn a_row_that_already_has_a_hash_is_never_re_read() {
+            assert!(!backfill_candidate(&hashed(), 12));
+            assert!(!backfill_candidate(&hashed(), SHA1_MAX_BYTES + 1));
+        }
+
+        /// At the ceiling, not merely above it — the app's own `SHA1_MAX_BYTES`
+        /// comparison is `size >= SHA1_MAX_BYTES`, and a boundary that
+        /// disagreed by one file would be a hash written for a size the
+        /// consumer refuses to hash back.
+        #[test]
+        fn a_file_at_or_over_the_ceiling_is_left_alone() {
+            assert!(!backfill_candidate(&unhashed(), SHA1_MAX_BYTES));
+            assert!(!backfill_candidate(&unhashed(), SHA1_MAX_BYTES * 4));
         }
     }
 

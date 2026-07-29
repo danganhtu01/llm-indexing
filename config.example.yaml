@@ -18,6 +18,22 @@ sync_normal: false
 max_bytes: 104857600         # 100 MB: files larger than this are indexed by name only
 max_chars: 1000000           # cap extracted characters per file
 hash: false                  # compute sha1 (slower); false = use size+mtime as change key
+# Backfill sha1 onto the rows a RESUME would otherwise skip: rows that are
+# already finished but were indexed before `hash` was turned on, so they carry no
+# sha1 and never will, because a finished row is never re-extracted. Needs
+# `hash: true` as well — both gates, or the lane does not run.
+#
+# OFF by default on purpose. A corpus with a long unhashed history turns the next
+# ordinary index job into a full byte-read of every one of those files (the live
+# llm corpus has 538,913 of them), which is a run an operator should choose
+# deliberately rather than discover. Backfilled rows keep every other column
+# (method, chars, pages, indexed_at, attempts, elapsed_ms) exactly as stored and
+# are reported as `hashed` rather than `skipped`. A file the lane cannot open or
+# read (locked, in use, no rights) is counted as `hash_failed`, left unhashed,
+# and claimed again on every armed run — that counter is how you tell whether the
+# backfill has converged. Files >= 1 GiB are skipped outright, though `max_bytes`
+# normally binds long before that ceiling is reachable.
+hash_backfill: false
 ocr_max_pages: 20            # max PDF pages to OCR per file
 
 # Tesseract

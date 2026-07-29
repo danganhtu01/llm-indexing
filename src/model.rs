@@ -54,13 +54,65 @@ pub struct IndexStats {
     /// encrypted PDFs skipped" without a SQL query, same motivation as
     /// `capped` being split out from `skipped` below.
     pub encrypted: usize,
+    /// Walked files this run will not touch at all. Rows the sha1 backfill lane
+    /// claimed are NOT here — the lane does touch them (see `hashed`).
     pub skipped: usize,
     /// The subset of `skipped` that resume declined because the row has already
     /// burned its attempt budget rather than because it is finished. Reported
     /// separately because the two are opposite outcomes wearing the same number:
     /// a large `skipped` is a resume working, a large `capped` is a corpus with
-    /// work it has given up on.
+    /// work it has given up on. Still a strict subset: the backfill lane never
+    /// claims a capped row, precisely so this stays true.
     pub capped: usize,
+    /// Rows the sha1 BACKFILL lane hashed: already-finished rows that carried no
+    /// `sha1`, given one without their content being touched.
+    ///
+    /// Not a subset of anything else here. The lane's rows count in the run's
+    /// `total`/`processed` (a hash pass is real, rate-predictive work, and an ETA
+    /// derived from those counters is only honest if it can see it) and are
+    /// deliberately EXCLUDED from `skipped`, which means "this run will not touch
+    /// this row". They are also disjoint from `files`, which counts rows this run
+    /// WROTE from a `ProcessedFile`: a backfilled row was never extracted, never
+    /// embedded and never re-written, so a pure backfill pass reports
+    /// `files: 0`, `embedded_chunks: 0` and `hashed: N`.
+    ///
+    /// Zero on every run that did not turn `hash_backfill` on, which is every run
+    /// by default.
+    pub hashed: usize,
+    /// Rows the sha1 backfill lane claimed and could NOT hash, because their file
+    /// would not open or would not read: locked mail stores, VM disks a
+    /// hypervisor holds open, anything the account running the job cannot read.
+    ///
+    /// Its own counter rather than a fold into `errors`, on purpose. What `errors`
+    /// means is "this run PROCESSED a file and the processing failed" — it is
+    /// incremented for every incoming `error:` method, and most of those do land
+    /// as `error:` rows a reader can go find. Not all of them, and the exception
+    /// is worth stating rather than glossing: the keep-on-failure branch counts
+    /// the failure and then deliberately keeps the old complete row instead of
+    /// replacing it, so that one has no `error:` row behind it. (`encrypted` is a
+    /// strict subset of `errors`. `incomplete` is NOT — it also counts
+    /// `name-only` and `-partial` rows, which are not errors.)
+    ///
+    /// A hash miss is not that. Nothing was processed: no extraction was
+    /// attempted, no method was produced, and the stored row is a successful
+    /// extraction that is still true — a hash that could not be taken says
+    /// nothing about it. Folding the two would put "could not open a file to hash
+    /// it" inside a counter that otherwise means "tried to index a file and
+    /// failed", and would cost F-C the trivial `worked = processed` composition
+    /// for nothing.
+    ///
+    /// It exists because the alternative is a SILENT DROP. The lane's rows leave
+    /// `skipped` by construction, and a miss puts nothing in `hashed`, nothing in
+    /// `files` and nothing in `errors` — so without this the only trace would be
+    /// an unexplained gap between the owed count a run announces and the hashes
+    /// it produces, indistinguishable from a bug in the lane. **The accounting
+    /// closes here:** for a lane that ran to completion,
+    /// `hashed + hash_failed` is exactly the owed count.
+    ///
+    /// It is also the convergence signal. These are precisely the rows that never
+    /// acquire a `sha1`, so the lane re-claims every one of them on every armed
+    /// run; the backfill is done when this is all that is left.
+    pub hash_failed: usize,
     pub incomplete: usize,
     pub embedded_chunks: usize,
     pub removed: usize,

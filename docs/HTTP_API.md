@@ -284,9 +284,32 @@ Unknown top-level fields anywhere in the job body remain permissively ignored
 Returns `queued`, `running`, `cancelling`, `cancelled`, `complete` or `error`.
 Running jobs include live `processed` and `total` file counters. A completed job includes the
 database path, file/OCR/error/incomplete counts, the `capped` count of rows resume
-declined because they have failed too often, embedded chunk count, the `faces`
-count of faces stored (0 unless the opt-in faces sub-tier ran), removed
-source count, elapsed time and OCR languages.
+declined because they have failed too often, the `hashed` and `hash_failed`
+counts from the sha1 backfill lane (both 0 unless `hash_backfill` is on),
+embedded chunk count, the `faces` count of faces stored (0 unless the opt-in
+faces sub-tier ran), removed source count, elapsed time and OCR languages.
+
+`processed`/`total` include the backfill lane's rows, so an armed resume reports a
+LARGER `total` than the same resume unarmed — the run genuinely has that much more
+to do, and because both counters move together a rate or ETA derived from them
+stays honest. Lane rows count in `processed` and are NOT counted in `skipped`;
+`capped` remains a strict subset of `skipped`.
+
+`hash_failed` counts rows the lane claimed whose file would not open or read
+(locked, in use, or unreadable by the account running the job). Those rows are
+left unchanged and still carry no `sha1`, so the lane claims them again on every
+armed run — the counter is how an operator sees whether the backfill has
+converged. It is deliberately NOT folded into `errors`, which counts files this
+run processed and failed to process (most, not all, of them findable afterwards
+as `error:` rows — the keep-on-failure path counts the failure but keeps the old
+complete row). A hash miss is neither: nothing was processed. For a run that
+completed the lane, `hashed + hash_failed` equals the owed count the run
+announced, so nothing the lane touched is left unattributed.
+
+`hash_failed: 0` does NOT mean every row now carries a hash. It means every row
+the lane CLAIMED was hashed. Rows declined before the lane — over the 1 GiB
+ceiling, or not finished — are counted in `skipped` and never reach
+`hash_failed` at all.
 
 ## `POST /jobs/{id}/cancel`
 

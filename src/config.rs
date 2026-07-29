@@ -589,6 +589,27 @@ pub struct Config {
     #[serde(default = "default_max_chars")]
     pub max_chars: usize,
     pub hash: bool,
+    /// Opt into the sha1 BACKFILL lane: hash the rows a resume is going to skip
+    /// because they are already finished but that carry no `sha1` yet.
+    ///
+    /// The second of two gates — the lane runs only when `hash && hash_backfill`
+    /// (see [`Config::sha1_backfill`]) — and it exists because `hash` alone is
+    /// the wrong switch to hang this on. `hash: true` has been set on live
+    /// corpora for a long time; every row indexed BEFORE it was set still reads
+    /// `sha1 IS NULL`, and there are 538,913 of them on the production llm
+    /// corpus. Keying the backfill off `hash` alone would therefore make the
+    /// next ordinary INDEX job silently byte-read every one of those files —
+    /// hours of unbudgeted I/O that nobody asked for, on a run the operator
+    /// submitted to index what is new. Default false: the feature ships INERT
+    /// and an operator turns it on for the run they mean to spend on it.
+    ///
+    /// Turning it on changes WHICH rows are touched, never HOW a file is
+    /// indexed: a backfilled row gets its `sha1` column and nothing else (see
+    /// [`crate::store::IndexStore::set_sha1`]). The forward hash path — the
+    /// `sha1` computed for a file this run actually indexes — is not affected by
+    /// this knob at all.
+    #[serde(default)]
+    pub hash_backfill: bool,
     #[serde(default = "default_ocr_pages")]
     pub ocr_max_pages: usize,
     #[serde(default = "default_tesseract")]
@@ -651,6 +672,7 @@ impl Default for Config {
             max_bytes: default_max_bytes(),
             max_chars: default_max_chars(),
             hash: false,
+            hash_backfill: false,
             ocr_max_pages: default_ocr_pages(),
             tesseract_cmd: default_tesseract(),
             ocr_langs: default_ocr_langs(),
@@ -717,6 +739,19 @@ impl Config {
         (self.headroom_pct > 0).then(|| crate::headroom::cores_cap(self.headroom_pct))
     }
 
+    /// Whether the sha1 BACKFILL lane runs — the ONE accessor every call site
+    /// consults, so "both gates or nothing" is decided in a single place.
+    ///
+    /// `hash_backfill` on its own is meaningless: the lane writes a `sha1`
+    /// column that a corpus indexed with `hash: false` has no other rows for, and
+    /// the backfilled hashes would then be a stripe of coverage across an
+    /// otherwise unhashed corpus. Requiring `hash` too means the operator is
+    /// asking for the SAME hash the forward path would have written, applied to
+    /// the rows that predate the decision.
+    pub fn sha1_backfill(&self) -> bool {
+        self.hash && self.hash_backfill
+    }
+
     /// Apply the `--headroom` CLI flag: the flag WINS over the YAML
     /// `headroom_pct` when provided, and an absent flag leaves the YAML value
     /// standing — the same flag-over-config precedence `--vision-max` and
@@ -736,6 +771,17 @@ impl Config {
         // mis-set YAML value (200) caps at the contract ceiling instead of
         // starving the job. Idempotent like the rest of finalize.
         self.override_headroom(None);
+        // The sha1 backfill lane's second gate cannot stand without the first, so
+        // a config that asks for it with hashing off is normalised to what it
+        // will actually do. `Config::sha1_backfill` enforces the same conjunction
+        // at the decision point, so the LANE is correct with or without this
+        // line — this is for whoever reads the FIELD: a debugger, a dump, or the
+        // next piece of code to consult it directly instead of the accessor.
+        // Deliberately not justified by any published surface, because there
+        // isn't one: `GET /settings` is a hand-rolled `json!` that never emits
+        // this key, and nothing in the crate serialises `Config` wholesale.
+        // Idempotent, like the rest of finalize.
+        self.hash_backfill &= self.hash;
         self.workers = clamp_workers(self.workers);
         self.embed_workers = self
             .embed_workers
@@ -898,6 +944,73 @@ mod tests {
     fn yaml_overrides_ocr_langs_multilingual() {
         let config: Config = serde_yaml::from_str("ocr_langs: vie+eng+rus+deu").unwrap();
         assert_eq!(config.ocr_langs, "vie+eng+rus+deu");
+    }
+
+    /// The sha1 backfill lane's two gates. The knob ships INERT — an operator
+    /// who does nothing must get the behaviour they had — and it takes BOTH
+    /// gates to arm, because a backfill without `hash` would stripe hashes
+    /// across a corpus that has none of its own.
+    #[test]
+    fn the_sha1_backfill_lane_needs_both_gates() {
+        assert!(
+            !Config::default().hash_backfill,
+            "the knob must default off or the next index job on a long-unhashed \
+             corpus silently byte-reads all of it"
+        );
+        assert!(!Config::default().sha1_backfill());
+        for (hash, hash_backfill, armed) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            let config = Config {
+                hash,
+                hash_backfill,
+                ..Config::default()
+            };
+            assert_eq!(
+                config.sha1_backfill(),
+                armed,
+                "hash={hash} hash_backfill={hash_backfill}"
+            );
+        }
+    }
+
+    /// A config that asks for the backfill with hashing off is normalised rather
+    /// than left to read back as something it will never do. Idempotent, like
+    /// every other clamp in `finalize`.
+    #[test]
+    fn finalize_drops_a_backfill_that_has_no_hashing_to_ride_on() {
+        let mut config = Config {
+            hash: false,
+            hash_backfill: true,
+            ..Config::default()
+        };
+        config.finalize();
+        assert!(!config.hash_backfill);
+        config.finalize();
+        assert!(!config.hash_backfill);
+
+        // With hashing on it survives untouched.
+        let mut armed = Config {
+            hash: true,
+            hash_backfill: true,
+            ..Config::default()
+        };
+        armed.finalize();
+        assert!(armed.hash_backfill);
+        assert!(armed.sha1_backfill());
+    }
+
+    /// Absent from the YAML means off — the rollback-safe reading, and the one
+    /// the live config file relies on: it carries no `hash_backfill` key at all.
+    #[test]
+    fn an_absent_hash_backfill_key_is_off() {
+        let config: Config = serde_yaml::from_str("hash: true").unwrap();
+        assert!(config.hash);
+        assert!(!config.hash_backfill);
+        assert!(!config.sha1_backfill());
     }
 
     #[test]
