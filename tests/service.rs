@@ -1935,6 +1935,38 @@ async fn a_gated_submit_without_the_token_is_refused_with_nothing_created() {
 }
 
 #[tokio::test]
+async fn refusal_body_carries_the_shared_401_shape() {
+    // vlm-indexing's identical gate (its src/service.rs,
+    // `require_submit_token`) refuses with the same
+    // `{"status","error","header"}` shape. Pinning the exact key set here —
+    // not just that "header" is present — is what keeps the two engines'
+    // bodies from drifting apart again the next time either gate is touched.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    let app = gated_router(&output, &input);
+
+    let (status, body) = post_with_token(
+        &app,
+        "/index",
+        json!({"id":"shape-check","paths":[input],"output":"corpus.sqlite","ocr":"off"}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["error", "header", "status"]);
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["header"], "X-Submit-Token");
+}
+
+#[tokio::test]
 async fn a_gated_submit_with_the_correct_token_is_accepted_and_runs() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("input");
