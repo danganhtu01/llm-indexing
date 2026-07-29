@@ -83,13 +83,23 @@ pub struct IndexStats {
     /// would not open or would not read: locked mail stores, VM disks a
     /// hypervisor holds open, anything the account running the job cannot read.
     ///
-    /// Its own counter rather than a fold into `errors`, on purpose. `errors`
-    /// counts rows this run WROTE with an `error:` method — `encrypted` and
-    /// `incomplete` are subsets of it, and a reader can go find every one of them
-    /// in the corpus. A hash miss writes no row at all: the stored row is a
-    /// successful extraction that is still true, and a hash that could not be
-    /// taken says nothing about it. Folding the two together would break the
-    /// "every `errors` has a row behind it" property for a case that has none.
+    /// Its own counter rather than a fold into `errors`, on purpose. What `errors`
+    /// means is "this run PROCESSED a file and the processing failed" — it is
+    /// incremented for every incoming `error:` method, and most of those do land
+    /// as `error:` rows a reader can go find. Not all of them, and the exception
+    /// is worth stating rather than glossing: the keep-on-failure branch counts
+    /// the failure and then deliberately keeps the old complete row instead of
+    /// replacing it, so that one has no `error:` row behind it. (`encrypted` is a
+    /// strict subset of `errors`. `incomplete` is NOT — it also counts
+    /// `name-only` and `-partial` rows, which are not errors.)
+    ///
+    /// A hash miss is not that. Nothing was processed: no extraction was
+    /// attempted, no method was produced, and the stored row is a successful
+    /// extraction that is still true — a hash that could not be taken says
+    /// nothing about it. Folding the two would put "could not open a file to hash
+    /// it" inside a counter that otherwise means "tried to index a file and
+    /// failed", and would cost F-C the trivial `worked = processed` composition
+    /// for nothing.
     ///
     /// It exists because the alternative is a SILENT DROP. The lane's rows leave
     /// `skipped` by construction, and a miss puts nothing in `hashed`, nothing in

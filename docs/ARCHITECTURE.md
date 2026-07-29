@@ -374,8 +374,11 @@ are per-indexed-file exports and a hash-only row produces no line in either.
 A claimed file that will not open or read is counted in `hash_failed`, and named
 in the log up to a sample, rather than dropped. It writes no row: the stored row
 is a successful extraction that is still true, and a hash that could not be taken
-says nothing about it. Its own counter rather than `errors`, which counts rows
-written with an `error:` method and has a row behind every one of them. The
+says nothing about it. Its own counter rather than `errors`, which means "this run
+processed a file and the processing failed" — most of those are findable as
+`error:` rows, though not all (the keep-on-failure branch counts the failure and
+keeps the old complete row rather than replacing it, so that one has no `error:`
+row behind it). A hash miss is neither: nothing was processed at all. The
 accounting closes on it — for a lane that ran to completion,
 `hashed + hash_failed` is the owed count it announced — and because those rows
 never acquire a `sha1` the lane re-claims them on every armed run, which makes

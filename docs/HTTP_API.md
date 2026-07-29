@@ -299,10 +299,17 @@ stays honest. Lane rows count in `processed` and are NOT counted in `skipped`;
 (locked, in use, or unreadable by the account running the job). Those rows are
 left unchanged and still carry no `sha1`, so the lane claims them again on every
 armed run — the counter is how an operator sees whether the backfill has
-converged. It is deliberately NOT folded into `errors`, which counts rows written
-with an `error:` method; a hash miss writes no row at all. For a run that
+converged. It is deliberately NOT folded into `errors`, which counts files this
+run processed and failed to process (most, not all, of them findable afterwards
+as `error:` rows — the keep-on-failure path counts the failure but keeps the old
+complete row). A hash miss is neither: nothing was processed. For a run that
 completed the lane, `hashed + hash_failed` equals the owed count the run
 announced, so nothing the lane touched is left unattributed.
+
+`hash_failed: 0` does NOT mean every row now carries a hash. It means every row
+the lane CLAIMED was hashed. Rows declined before the lane — over the 1 GiB
+ceiling, or not finished — are counted in `skipped` and never reach
+`hash_failed` at all.
 
 ## `POST /jobs/{id}/cancel`
 

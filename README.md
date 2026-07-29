@@ -273,6 +273,11 @@ look like one to the resume predicate or the attempt cap. Specifically:
   extraction that is still true, and a hash that could not be taken says nothing
   about it. Nothing is dropped silently — for a run that completes the lane,
   `hashed + hash_failed` is exactly the owed count it announced.
+- `hash_failed: 0` does NOT mean the corpus is fully hashed. It means everything
+  the lane CLAIMED got a hash. Rows declined before the lane ever saw them — over
+  the ceiling, or not finished — are in `skipped`, and no lane counter reports
+  them. Ask the corpus (`SELECT COUNT(*) FROM files WHERE sha1 IS NULL`) if what
+  you want is coverage.
 - The run's first progress line reports how many rows owe a hash, before any of
   them is read; a closing line reports how many were hashed and how many were not.
 - It is interruptible. Hashes are committed on the same batch boundary as indexed
