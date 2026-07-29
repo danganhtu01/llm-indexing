@@ -39,11 +39,14 @@ jobs:
       # this job runs `cargo test`, not the Dockerfile image, and several
       # tests key their behavior off runtime tool detection rather than a
       # fixed fixture set — e.g. extract.rs's `ffmpeg_available()` (~:1229)
-      # and the `transcriber.available()` capability gate it feeds (~:447).
-      # Those currently pass by cleanly hitting the "tool absent" branch;
-      # installing the tool would silently switch them onto a different,
-      # unreviewed code path. Broadening this step is a separate change.
-      - run: sudo apt-get update && sudo apt-get install -y poppler-utils
+      # gates two HEIC tests (~:1203, ~:1257) that currently skip because
+      # ffmpeg is absent. transcriber.available() (~:447) is a separate,
+      # unrelated gate — a Whisper model-presence check, not an ffmpeg
+      # check. Those tests currently pass by cleanly hitting the "tool
+      # absent" branch; installing ffmpeg would silently switch them onto a
+      # different, unreviewed code path. Broadening this step is a separate
+      # change.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends poppler-utils
       - run: cargo test --locked
 
   container:
