@@ -68,10 +68,18 @@ pub struct IndexStats {
     /// `sha1`, given one without their content being touched.
     ///
     /// Not a subset of anything else here. The lane's rows count in the run's
-    /// `total`/`processed` (a hash pass is real, rate-predictive work, and an ETA
+    /// `total`/`processed` (the run genuinely spends that time, and a RATE
     /// derived from those counters is only honest if it can see it) and are
     /// deliberately EXCLUDED from `skipped`, which means "this run will not touch
-    /// this row". They are also disjoint from `files`, which counts rows this run
+    /// this row".
+    ///
+    /// They are just as deliberately excluded from
+    /// [`crate::pipeline::Progress::worked`], and the distinction is the point:
+    /// a hash pass is real work, but it is not work that PREDICTS the indexing
+    /// pass queued behind it. So it belongs in the counters a rate is measured
+    /// from, and not in the one an ETA is gated on.
+    ///
+    /// They are also disjoint from `files`, which counts rows this run
     /// WROTE from a `ProcessedFile`: a backfilled row was never extracted, never
     /// embedded and never re-written, so a pure backfill pass reports
     /// `files: 0`, `embedded_chunks: 0` and `hashed: N`.

@@ -1252,11 +1252,17 @@ async fn settings_route_serves_the_capability_contract() {
 // `AppState::defaults` (built after `Config::override_headroom(--headroom)`),
 // never from `build_settings`' own `Config::load`, which cannot see the flag.
 
-fn headroom_router(workers: usize, headroom_pct: Option<u8>) -> axum::Router {
+/// Returns the `TempDir` alongside the router, and the caller must HOLD it:
+/// dropping it deletes `output_root` and the input tree out from under a live
+/// service. The three tests below only read `/settings` and `/runtime`, so they
+/// would survive the deletion — but a later test that submitted a job would
+/// fail for a reason nothing about the test says, so the lifetime is the
+/// caller's business here rather than a trap discovered there.
+fn headroom_router(workers: usize, headroom_pct: Option<u8>) -> (axum::Router, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("input");
     fs::create_dir_all(&input).unwrap();
-    router(ServiceConfig {
+    let app = router(ServiceConfig {
         output_root: temp.path().join("output"),
         allowed_roots: vec![input.clone()],
         default_paths: vec![input],
@@ -1269,7 +1275,8 @@ fn headroom_router(workers: usize, headroom_pct: Option<u8>) -> axum::Router {
         submit_token: None,
         headroom_pct,
     })
-    .unwrap()
+    .unwrap();
+    (app, temp)
 }
 
 async fn workers_block(app: &axum::Router) -> Value {
@@ -1286,7 +1293,7 @@ async fn settings_reports_the_headroom_capped_effective_worker_seed() {
     // (nothing rewrites the configured width), but the engine spawns jobs at
     // the core cap. THIS is the case the field exists for — before it,
     // `/settings` reported 64 on a box running 12.
-    let app = headroom_router(MAX_WORKERS, Some(50));
+    let (app, _temp) = headroom_router(MAX_WORKERS, Some(50));
     let workers = workers_block(&app).await;
 
     let cap = cores_cap(50);
@@ -1313,7 +1320,7 @@ async fn settings_reports_the_headroom_capped_effective_worker_seed() {
 async fn settings_effective_equals_the_default_when_headroom_is_off() {
     // Feature off (the default on every box): nothing is capped, so the two
     // numbers agree and a UI showing them side by side has nothing to explain.
-    let app = headroom_router(7, None);
+    let (app, _temp) = headroom_router(7, None);
     let workers = workers_block(&app).await;
     assert_eq!(workers["default"], 7, "{workers}");
     assert_eq!(workers["effective"], 7, "{workers}");
@@ -1324,7 +1331,7 @@ async fn settings_effective_tracks_a_retune_of_the_process_defaults() {
     // `effective` reads the LIVE process-wide defaults, so a `POST /runtime`
     // that lowers `extract` is reflected: the answer stays "what the next job
     // is seeded at", which is the only reading that can be acted on.
-    let app = headroom_router(8, None);
+    let (app, _temp) = headroom_router(8, None);
     assert_eq!(workers_block(&app).await["effective"], 8);
 
     let (status, _) = post_json(&app, "/runtime", json!({"extract": 3})).await;

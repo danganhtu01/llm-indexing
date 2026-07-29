@@ -126,15 +126,23 @@ apart.
 - `workers.max` is the fixed ceiling (`config::MAX_WORKERS`, 64) applied to
   `Config::finalize`'s clamp; `workers.default` is this server's configured
   worker count.
-- `workers.effective` is the **extract width jobs are actually seeded at** —
-  the live process-wide `extract` stage (`GET /runtime`), which is
-  `default` capped by `serve --headroom` (`RuntimeKnobs::from_config`) and then
-  by any later `POST /runtime`. `default` and `max` are advertised *static*
-  bounds and neither of them moves when headroom is on, so before this field a
-  box served with `--headroom 50` reported the full configured width while
-  running half of it. Equal to `default` whenever headroom is off and the
-  defaults have not been retuned, which is the common case; strictly below it
-  otherwise.
+- `workers.effective` is the **extract width the next job will be seeded at** —
+  the live process-wide `extract` stage, the same number `GET /runtime` reports.
+  It starts as `default` capped by `serve --headroom`
+  (`RuntimeKnobs::from_config`) and thereafter tracks any `POST /runtime` retune
+  of the defaults, itself held under the headroom ceiling. `default` and `max`
+  are advertised *static* bounds that never move at runtime, so before this
+  field a box served with `--headroom 50` reported the full configured width
+  while running half of it.
+
+  It is **not** a cap on `default` and must not be rendered as one. It is
+  below `default` under headroom (`--workers 64 --headroom 50` on a 24-core box
+  → `{default: 64, effective: 12}`), equal to it on a box with headroom off and
+  no retune (the common case), and **above** it after an upward retune
+  (`--workers 4`, then `POST /runtime {"extract": 16}` →
+  `{default: 4, max: 64, effective: 16}`). The only invariant is
+  `1 <= effective <= max`. Read it as "what this process will do next", never
+  as "`default`, reduced".
 - Runs the tessdata/hash probes on a blocking worker thread
   (`tokio::task::spawn_blocking`), never the async executor, since they exec
   `tesseract --list-langs` and hash up to ~100 MB of model files.

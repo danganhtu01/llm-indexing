@@ -88,6 +88,18 @@ const HASH_MISS_SAMPLE: usize = 20;
 /// indexing, and computes the value itself from `processed/total` as before.
 /// Same shape and same contract as `vlm-indexing`'s `orchestrator::Progress`
 /// and the shared `portal-directories` `EngineJob.worked` field.
+///
+/// **What is promised is per-observation consistency, not a monotone stream.**
+/// Each emitted triple is internally coherent — `worked <= processed <= total`,
+/// both derived from the SAME `completed` reading — and that is the only
+/// guarantee the counters can make. During the indexing pass the counter is
+/// bumped with `fetch_add` and the callback invoked as two separate steps on
+/// many rayon workers, so a thread preempted between them can deliver its
+/// triple after a later one and step the observed numbers back. The lane's own
+/// stretch is single-threaded and cannot. Consumers are built for this: the
+/// app's `RateWindow` treats a shrinking counter as a lost timebase and restarts
+/// its window rather than averaging across it, which is also what it must do for
+/// the real case of an engine restarting its counting mid-run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Progress {
     /// How many units of the run's work list have been REACHED, counting every
@@ -97,7 +109,8 @@ pub struct Progress {
     pub processed: usize,
     /// Of those, how many were INDEXED — put through the extract/embed/write
     /// pipeline. **At most one per file**, so `worked <= processed` holds at
-    /// every observation and neither counter ever goes backwards within a run.
+    /// every observation (see the type's own note on why that is an
+    /// observation-local promise and not a monotone one).
     ///
     /// A sha1 backfill row does NOT count, and that is the whole point rather
     /// than an omission. The lane reads file bytes off the disk and writes one
