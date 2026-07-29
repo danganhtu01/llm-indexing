@@ -54,13 +54,31 @@ pub struct IndexStats {
     /// encrypted PDFs skipped" without a SQL query, same motivation as
     /// `capped` being split out from `skipped` below.
     pub encrypted: usize,
+    /// Walked files this run will not touch at all. Rows the sha1 backfill lane
+    /// claimed are NOT here — the lane does touch them (see `hashed`).
     pub skipped: usize,
     /// The subset of `skipped` that resume declined because the row has already
     /// burned its attempt budget rather than because it is finished. Reported
     /// separately because the two are opposite outcomes wearing the same number:
     /// a large `skipped` is a resume working, a large `capped` is a corpus with
-    /// work it has given up on.
+    /// work it has given up on. Still a strict subset: the backfill lane never
+    /// claims a capped row, precisely so this stays true.
     pub capped: usize,
+    /// Rows the sha1 BACKFILL lane hashed: already-finished rows that carried no
+    /// `sha1`, given one without their content being touched.
+    ///
+    /// Not a subset of anything else here. The lane's rows count in the run's
+    /// `total`/`processed` (a hash pass is real, rate-predictive work, and an ETA
+    /// derived from those counters is only honest if it can see it) and are
+    /// deliberately EXCLUDED from `skipped`, which means "this run will not touch
+    /// this row". They are also disjoint from `files`, which counts rows this run
+    /// WROTE from a `ProcessedFile`: a backfilled row was never extracted, never
+    /// embedded and never re-written, so a pure backfill pass reports
+    /// `files: 0`, `embedded_chunks: 0` and `hashed: N`.
+    ///
+    /// Zero on every run that did not turn `hash_backfill` on, which is every run
+    /// by default.
+    pub hashed: usize,
     pub incomplete: usize,
     pub embedded_chunks: usize,
     pub removed: usize,

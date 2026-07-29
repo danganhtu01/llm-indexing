@@ -42,6 +42,25 @@ use crate::walker::walk;
 /// no matter how many attempts it has burned.
 pub const MAX_ATTEMPTS: u32 = 3;
 
+/// Size ceiling for the sha1 BACKFILL lane: a file at or above this is left
+/// unhashed rather than read end to end.
+///
+/// Mirrors `SHA1_MAX_BYTES` in the drives-analytics app (`api/src/coherence.rs`
+/// and its move executor), which is the consumer these hashes exist for. Above
+/// this size the app does not hash either — it falls back to the whole-second
+/// mtime rule the engines themselves use — so a hash produced here would have
+/// nothing on the other side to be compared against, and would have cost a
+/// multi-gigabyte read to produce.
+///
+/// Deliberately scoped to the BACKFILL lane. The FORWARD path (`config.hash` on
+/// a file this run is indexing anyway, in [`process`]) has no ceiling and does
+/// not gain one here: that is live behaviour on a running deployment and
+/// changing it is not in this change's remit. The engine/app agreement is
+/// therefore PARTIAL by design — backfilled hashes respect the app's ceiling,
+/// forward hashes above it keep being written exactly as they are today, where
+/// they are harmless (a hash the app simply declines to consult).
+const SHA1_MAX_BYTES: u64 = 1 << 30;
+
 pub struct IndexRequest<'a> {
     pub paths: &'a [PathBuf],
     pub out: &'a Path,
@@ -1039,6 +1058,10 @@ mod tests {
             method: method.to_string(),
             has_chunks,
             attempts,
+            // The predicates below never read it: a stored hash neither
+            // schedules a file nor spares it. Only the backfill lane's own
+            // selector cares, and it is tested on its own terms.
+            has_sha1: false,
         }
     }
 

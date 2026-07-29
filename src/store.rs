@@ -408,6 +408,12 @@ pub struct ExistingRow {
     /// finished outcome and by a change to the file's bytes, so it counts
     /// CONSECUTIVE failures on the file as it stands rather than lifetime ones.
     pub attempts: u32,
+    /// Whether the row already carries a content hash. NOT part of the skip
+    /// predicate — a stored `sha1` neither schedules a file nor spares it — this
+    /// is the sha1 BACKFILL lane's only selector: a row that resume is going to
+    /// skip and that has no hash is a row whose hash will never arrive by the
+    /// forward path, because a finished row is never re-extracted.
+    pub has_sha1: bool,
 }
 
 pub struct IndexStore {
@@ -551,8 +557,13 @@ impl IndexStore {
         let mut statement = self
             .connection
             .prepare(
+                // `f.sha1 IS NOT NULL` rather than `f.sha1`: the lane only ever
+                // asks whether a hash is there, and reading the digest itself
+                // would pull a 40-byte string per row into a map held for the
+                // whole run — on the live corpus, 538,913 of them — for a
+                // question a boolean answers.
                 "SELECT f.path,f.size,f.mtime,f.method,EXISTS(SELECT 1 FROM chunks c WHERE c.file_id=f.id),\
-                 f.attempts \
+                 f.attempts,f.sha1 IS NOT NULL \
                  FROM files f",
             )?;
         let rows = statement.query_map([], |row| {
@@ -564,6 +575,7 @@ impl IndexStore {
                     method: row.get::<_, String>(3)?,
                     has_chunks: row.get::<_, i64>(4)? != 0,
                     attempts: row.get::<_, i64>(5)?.clamp(0, i64::from(u32::MAX)) as u32,
+                    has_sha1: row.get::<_, i64>(6)? != 0,
                 },
             ))
         })?;
@@ -718,11 +730,50 @@ impl IndexStore {
         // are derived views of the database rather than part of it, so a failure
         // here stops the run without invalidating what was stored.
         self.write_artifacts(file)?;
+        self.checkpoint()
+    }
+
+    /// Count one unit of written work and publish the batch when it is full.
+    ///
+    /// Extracted from [`IndexStore::add`] so the sha1 backfill lane shares the
+    /// SAME durability checkpoint rather than inventing a second one: a lane
+    /// that rode the open transaction without ever counting against
+    /// `commit_batch` would hold every one of its updates until `finish`, and a
+    /// killed backfill would then resume owing every row it had already hashed.
+    fn checkpoint(&mut self) -> Result<()> {
         self.pending += 1;
         if self.pending >= self.commit_batch || self.committed.elapsed() >= COMMIT_INTERVAL {
             self.commit()?;
         }
         Ok(())
+    }
+
+    /// Write a content hash onto an EXISTING row and change nothing else.
+    ///
+    /// The sha1 backfill lane's only writer. Deliberately not `add`: that path
+    /// is an `INSERT OR REPLACE` over the whole `files` row, so routing a
+    /// hash-only pass through it would restate `method`, `chars`, `pages`,
+    /// `indexed_at`, `attempts`, `last_attempt_at` and `elapsed_ms` from a
+    /// `ProcessedFile` this lane never built — and those columns are exactly
+    /// what the resume skip predicate and the attempt cap read. A backfill that
+    /// reset `attempts` would hand every capped row on the corpus a fresh budget
+    /// and re-open ~181k dead rows for full re-extraction on the next resume;
+    /// one that rewrote `method` or `indexed_at` would relabel finished rows as
+    /// the product of a run that never touched their content. So: one column,
+    /// keyed by path, and no row is created if the path is gone.
+    ///
+    /// Rides the store's open transaction like every other write here — a single
+    /// `UPDATE` is atomic in SQLite, so unlike `add`'s multi-statement row set it
+    /// needs no savepoint of its own to be all-or-nothing (the same reasoning
+    /// [`IndexStore::record_failed_attempt`] runs on). It does take the shared
+    /// [`IndexStore::checkpoint`], which is what makes a killed backfill resume
+    /// owing only the rows it had not reached.
+    pub fn set_sha1(&mut self, path: &str, sha1: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE files SET sha1=?2 WHERE path=?1",
+            params![path, sha1],
+        )?;
+        self.checkpoint()
     }
 
     /// Count an attempt that produced nothing to store.
