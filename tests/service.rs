@@ -1,11 +1,14 @@
 use std::fs;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use llm_indexing::config::MAX_WORKERS;
+use llm_indexing::config::{Config, MAX_WORKERS};
 use llm_indexing::headroom::cores_cap;
 use llm_indexing::jobs_store::{JobsStore, INTERRUPTED_ERROR};
+use llm_indexing::pipeline::{run_index, IndexRequest, Progress};
 use llm_indexing::service::{router, ServiceConfig};
 use llm_indexing::vision::VisionMode;
 use serde_json::{json, Value};
@@ -167,6 +170,244 @@ async fn a_running_job_reports_worked_beside_processed_and_total() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(running > 0, "the job never reported a running state");
+}
+
+/// A `.docx` whose bytes are not a zip archive: it is walked and claimed like
+/// any other document, and extraction then fails outright, so the run stores it
+/// as an `error:` row. Tool-free and deterministic on every platform — the same
+/// device the indexing suite uses to turn a good row into a failing one.
+fn write_unextractable_docx(path: &std::path::Path) {
+    fs::write(
+        path,
+        b"not a zip archive at all -- just some plain garbage bytes",
+    )
+    .unwrap();
+}
+
+/// **The live error count must arrive, not merely exist.**
+///
+/// `Progress::errors` is produced by the WRITER loop, while every other tick is
+/// emitted by the extract stage — and the extract stage ticks a file BEFORE it
+/// hands it on, so by construction the writer has not yet seen the last file
+/// when the last extract tick fires. A `Progress` that carried the field but
+/// left the writer silent would therefore publish a count that is short by
+/// however many files were still in flight, and short by the whole tail on a run
+/// whose failures land late. The last observation a consumer can take would then
+/// disagree with the completion body it is about to receive, which is the one
+/// comparison an operator actually makes.
+///
+/// The corpus is ALL failures on purpose, and that is what makes this
+/// deterministic rather than a race: the final extract tick is emitted before
+/// the final file is even sent down the channel, so it cannot have been counted
+/// yet, and only a tick from the writer itself can close the gap.
+#[test]
+fn the_last_live_progress_observation_carries_the_runs_final_error_count() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("corpus.sqlite");
+    fs::create_dir_all(&input).unwrap();
+    const BROKEN: usize = 3;
+    for index in 0..BROKEN {
+        write_unextractable_docx(&input.join(format!("broken_{index}.docx")));
+    }
+
+    let samples: Arc<Mutex<Vec<Progress>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = samples.clone();
+    let mut config = Config::default();
+    config.ocr = "off".into();
+    config.sidecar = "none".into();
+    config.workers = 2;
+    config.data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data");
+    let stats = run_index(IndexRequest {
+        paths: std::slice::from_ref(&input),
+        out: &output,
+        config,
+        resume: false,
+        overwrite: false,
+        artifacts: false,
+        retry_errors: false,
+        include_paths: None,
+        cancellation: None,
+        runtime: None,
+        progress: Some(Arc::new(move |update: Progress| {
+            sink.lock().unwrap().push(update)
+        })),
+    })
+    .unwrap();
+
+    assert_eq!(
+        stats.errors, BROKEN,
+        "every file in this corpus must fail to extract, or the test proves nothing"
+    );
+    let samples = samples.lock().unwrap().clone();
+    assert_eq!(
+        samples.first().map(|first| first.errors),
+        Some(0),
+        "the opening tick reports the count it has, which is none: {samples:?}"
+    );
+    assert_eq!(
+        samples.last().map(|last| last.errors),
+        Some(stats.errors),
+        "the LAST live observation must equal the count the completion body \
+         reports ({}), or a consumer's final reading disagrees with the result \
+         it is handed: {samples:?}",
+        stats.errors
+    );
+}
+
+/// **Every observation republishes the count, not only the one that moved it.**
+///
+/// Almost every tick a long run emits comes from the extract stage, and only the
+/// writer can move the error count — so an extract tick that reported a zero of
+/// its own would make the published value FLAP: up on each writer tick, back to
+/// zero on the next extracted file. A consumer sampling a running job would read
+/// mostly zeros and its last reading before any given moment would be arbitrary.
+/// The extract ticks therefore read the same shared counter the writer feeds.
+///
+/// The discriminator is a count, not a timing guess: there is exactly ONE writer
+/// tick per stored error, so if the extract ticks carried a zero of their own,
+/// the number of observations with a non-zero count could not EXCEED the number
+/// of errors. Exceeding it is possible only if an observation that did not move
+/// the counter reported it anyway.
+///
+/// The corpus is deliberately far larger than the extract→embed channel can
+/// hold, and that is load-bearing: it is what makes the two stages interleave.
+/// A handful of files proves nothing here — measured on this pipeline, all of
+/// them are extracted before the writer thread takes its first message, so every
+/// extract tick legitimately reads zero and the count agrees with a broken
+/// implementation. Do not shrink the corpus to make the test cheaper.
+#[test]
+fn every_progress_observation_republishes_the_error_count_not_only_the_one_that_moved_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("corpus.sqlite");
+    fs::create_dir_all(&input).unwrap();
+    const BROKEN: usize = 400;
+    for index in 0..BROKEN {
+        write_unextractable_docx(&input.join(format!("broken_{index:03}.docx")));
+    }
+
+    let samples: Arc<Mutex<Vec<Progress>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = samples.clone();
+    let mut config = Config::default();
+    config.ocr = "off".into();
+    config.sidecar = "none".into();
+    config.workers = 2;
+    config.data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data");
+    let stats = run_index(IndexRequest {
+        paths: std::slice::from_ref(&input),
+        out: &output,
+        config,
+        resume: false,
+        overwrite: false,
+        artifacts: false,
+        retry_errors: false,
+        include_paths: None,
+        cancellation: None,
+        runtime: None,
+        progress: Some(Arc::new(move |update: Progress| {
+            sink.lock().unwrap().push(update)
+        })),
+    })
+    .unwrap();
+
+    assert_eq!(stats.errors, BROKEN);
+    let samples = samples.lock().unwrap().clone();
+    let published = samples.iter().filter(|sample| sample.errors > 0).count();
+    assert!(
+        published > stats.errors,
+        "one observation per stored error is all the writer alone produces ({} of \
+         them); {published} observations carried a non-zero count, so an \
+         observation that did NOT move the counter still reported it",
+        stats.errors
+    );
+}
+
+/// **The wire, not the struct.** `Progress::errors` existing and never being
+/// copied onto the job body is the same defect one layer down: every running
+/// response would keep reporting the seeded zero, and because the consuming DTO
+/// defaults a missing/zero `errors` silently, an operator polling a job whose
+/// every file is failing would read "no errors" for the entire run and only
+/// learn otherwise from the completion body.
+///
+/// So this asserts the SERIALIZED body: that `errors` is present on every
+/// running response a caller can obtain (the seed), and that at least one of
+/// them carries a NON-ZERO value (the tick) — the second is what a body wired
+/// only at insert cannot produce.
+///
+/// The corpus is deliberately lopsided: a handful of files that fail instantly
+/// beside a much larger set that must be extracted, chunked and embedded. The
+/// failures are therefore counted early in the indexing pass with overwhelming
+/// probability, and the count stays published for the whole of the long tail
+/// that follows.
+#[tokio::test]
+async fn a_running_job_reports_its_error_count_over_the_wire() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    let output = temp.path().join("output");
+    fs::create_dir_all(&input).unwrap();
+    const BROKEN: u64 = 8;
+    for index in 0..BROKEN {
+        write_unextractable_docx(&input.join(format!("00_broken_{index}.docx")));
+    }
+    sample_corpus(&input, 40);
+    let app = router(ServiceConfig {
+        output_root: output,
+        allowed_roots: vec![input.clone()],
+        default_paths: vec![input.clone()],
+        config_path: None,
+        ocr_langs: "vie+eng".into(),
+        workers: 2,
+        max_pending: 2,
+        max_body: 1024 * 1024,
+        vision_max: VisionMode::Off,
+        submit_token: None,
+        headroom_pct: None,
+    })
+    .unwrap();
+
+    let (status, _) = post_json(
+        &app,
+        "/index",
+        json!({"id":"e-1","paths":[input],"output":"corpus.sqlite","ocr":"off","workers":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let mut running = 0usize;
+    let mut highest = 0u64;
+    let mut terminal = Value::Null;
+    for _ in 0..6000 {
+        let job = get_json(&app, "/jobs/e-1").await;
+        match job["status"].as_str() {
+            Some("complete" | "error") => {
+                terminal = job;
+                break;
+            }
+            Some("running") => {
+                running += 1;
+                let errors = job["errors"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("running body must carry `errors`: {job}"));
+                highest = highest.max(errors);
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(running > 0, "the job never reported a running state");
+    assert_eq!(terminal["status"], "complete", "{terminal}");
+    assert_eq!(
+        terminal["errors"].as_u64(),
+        Some(BROKEN),
+        "the completion body counts every unextractable file: {terminal}"
+    );
+    assert_eq!(
+        highest, BROKEN,
+        "a RUNNING body must publish the errors the run has already stored — \
+         the highest one served was {highest} of {BROKEN}, which is what a job \
+         body wired only at insert reports"
+    );
 }
 
 // ── Destination guards ───────────────────────────────────────────────────────

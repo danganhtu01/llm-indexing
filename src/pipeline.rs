@@ -130,6 +130,30 @@ pub struct Progress {
     /// The size of the run's work list: the rows to index PLUS the rows the
     /// backfill lane owes a hash.
     pub total: usize,
+    /// How many files this run has stored as `error:` rows so far — the SAME
+    /// quantity, counted the same way, that the terminal job body reports as
+    /// `errors` (`IndexStats::errors`, accumulated in the writer loop below).
+    /// RUN-SCOPED, not a corpus rollup: rows an earlier run left as errors and
+    /// this run never touched are not in it.
+    ///
+    /// It exists because without it that count is not observable until the run
+    /// is over. A consumer polling a running job watches `processed` climb with
+    /// no way to tell a job indexing cleanly from one whose every file is
+    /// failing, and learns the difference only from the completion body — after
+    /// the whole corpus has been spent on it.
+    ///
+    /// **The live value converges on the terminal one.** Only the writer loop
+    /// can move this counter, and it emits a tick of its OWN on every error it
+    /// stores, so whatever tick a poller sees last already carries the run's
+    /// final count. That is the contract: last live observation == terminal
+    /// body. The extract-side ticks read the same shared counter, so they
+    /// report the writer's progress rather than a zero.
+    ///
+    /// Seeded and written with the other three rather than on its own, for the
+    /// reason [`Progress::worked`] gives: a consumer that sees a counter absent
+    /// cannot tell "this engine predates the field" from "this job has not
+    /// started yet".
+    pub errors: usize,
 }
 
 pub struct IndexRequest<'a> {
@@ -439,11 +463,19 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     // denominator CANNOT do on its own is tell the two populations apart while
     // the run is in the cheap one — that is [`Progress::worked`]'s job.
     let total = records.len() + hash_only.len();
+    // The run's error count, shared rather than kept only in `stats`: it is
+    // produced by the writer loop on THIS thread and read by the progress ticks
+    // the extract stage emits from the rayon pool, which cannot see this
+    // thread's stack. There is still exactly one accumulator — `stats.errors`
+    // is assigned from this counter at the moment it moves, never beside it, so
+    // the live value and the terminal body cannot drift apart.
+    let errors_seen = Arc::new(AtomicUsize::new(0));
     if let Some(progress) = &request.progress {
         progress(Progress {
             processed: 0,
             worked: 0,
             total,
+            errors: errors_seen.load(Ordering::Relaxed),
         });
     }
     let mut stats = IndexStats {
@@ -529,6 +561,11 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
                 processed,
                 worked: 0,
                 total,
+                // Structurally zero for the whole lane — the writer loop that
+                // moves this counter has not started — but read rather than
+                // written as a literal, so the lane can never be the one place
+                // that reports a stale count.
+                errors: errors_seen.load(Ordering::Relaxed),
             });
         }
     }
@@ -553,6 +590,13 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
     let hash_prefix = processed;
     let cancellation = request.cancellation.clone();
     let progress = request.progress.clone();
+    // Second handles for the WRITER loop's own tick. The three above are taken
+    // by the extract closure by move, and the writer runs on this thread — it is
+    // the only place `errors` moves, so it is the only place that can report the
+    // move at the instant it happens.
+    let writer_progress = request.progress.clone();
+    let writer_completed = completed.clone();
+    let tick_errors = errors_seen.clone();
     // Old rows KEPT by keep-on-failure — the file's reprocess errored but the
     // byte-for-byte-unchanged file already had a complete row, so the error was
     // dropped. Deliberately NOT part of `IndexStats` (a kept row counts nowhere
@@ -660,6 +704,13 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
                             processed: count,
                             worked: count.saturating_sub(hash_prefix),
                             total,
+                            // Whatever the writer has counted by now. This
+                            // stage cannot produce an error row — a failed
+                            // extraction is still a `ProcessedFile`, and it
+                            // becomes an error only when the writer stores it —
+                            // so this reads the shared counter instead of
+                            // deriving anything of its own.
+                            errors: tick_errors.load(Ordering::Relaxed),
                         });
                     }
                     // The embed stage hangs up (error or cancellation) by
@@ -700,7 +751,39 @@ pub fn run_index(mut request: IndexRequest<'_>) -> Result<IndexStats> {
             stats.files += 1;
             stats.bytes += file.rec.size;
             stats.ocr_files += usize::from(file.ocr_used);
-            stats.errors += usize::from(file.method.starts_with("error:"));
+            let errored = usize::from(file.method.starts_with("error:"));
+            // One accumulator, two readers: the shared counter IS the run's
+            // error count and `stats.errors` is assigned from it here, so the
+            // number the terminal body reports and the number the live ticks
+            // report are the same number rather than two that agree by habit.
+            stats.errors = errors_seen.fetch_add(errored, Ordering::Relaxed) + errored;
+            if errored > 0 {
+                if let Some(progress) = &writer_progress {
+                    // The writer's own tick, emitted ONLY when it has just moved
+                    // a counter no other tick source can move. Without it the
+                    // live count lags by however many files are still in flight
+                    // between the extract stage and this loop — and for the last
+                    // error of a run it never arrives at all, because extraction
+                    // has already finished ticking. That is what would make the
+                    // published count differ from the terminal body's on exactly
+                    // the runs an operator cares about.
+                    //
+                    // A run that stores no error row emits no tick from here, so
+                    // the observation sequence of a clean run is unchanged.
+                    //
+                    // `processed`/`worked` are derived from ONE reading of the
+                    // shared counter, the same way the extract tick derives
+                    // them, so the triple this loop publishes is internally
+                    // coherent even though it is taken from a different thread.
+                    let seen = writer_completed.load(Ordering::Relaxed);
+                    progress(Progress {
+                        processed: seen,
+                        worked: seen.saturating_sub(hash_prefix),
+                        total,
+                        errors: stats.errors,
+                    });
+                }
+            }
             // A subset of `errors` above, not an alternative to it — every
             // encrypted row is still an error, this just names which ones.
             stats.encrypted += usize::from(file.method == "error:encrypted");

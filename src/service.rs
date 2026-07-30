@@ -1144,15 +1144,21 @@ async fn worker(
             continue;
         }
         let output = request.output.clone();
-        // `worked` is seeded here with the other two, not first written by the
+        // `worked` is seeded here with the other three, not first written by the
         // opening progress tick: a `GET /jobs/{id}` that lands between the
-        // insert and that tick must see a job with all three counters at zero,
+        // insert and that tick must see a job with all four counters at zero,
         // not one whose `worked` is missing — an absent field is the shared DTO's
         // "this engine predates the counter" signal, and a consumer that latched
         // it from a single early poll would spend the run treating `processed`
         // as the work basis and publish exactly the ETA this counter prevents.
+        //
+        // `errors` is seeded by the same rule and it is the field that rule was
+        // written for: the app's DTO defaults a missing `errors` to 0, so a body
+        // that omitted it would be indistinguishable from a job that has failed
+        // nothing — the reading an operator would then carry for the whole run.
+        // Zero is the honest seed here because the job has stored nothing yet.
         let running = json!({"id":id,"status":"running","output":output,
-                   "processed":0,"worked":0,"total":0,
+                   "processed":0,"worked":0,"total":0,"errors":0,
                    "started_at":now()});
         jobs.write().await.insert(id.clone(), running.clone());
         persist_job(&jobs_store, &id, &running).await;
@@ -1345,19 +1351,28 @@ fn run_job(
         include_paths,
         cancellation: Some(cancellation),
         runtime: Some(runtime),
-        // All THREE counters are written together, every tick. `worked` is what
+        // All FOUR counters are written together, every tick. `worked` is what
         // lets a polling app tell the sha1 backfill prefix — which streams
         // `processed` through owed rows at disk speed — from the indexing pass
         // that follows it, and gate its ETA on the difference. Writing it
-        // alongside the other two means a poll can never land between a
+        // alongside the others means a poll can never land between a
         // `processed` from one observation and a `worked` from another, which
         // would hand the app a work fraction no run ever had.
+        //
+        // `errors` is the same field the completion body below reports, from the
+        // same counter (`Progress::errors`), published while the run is still
+        // going instead of only once it is over. Writing it here is the whole of
+        // the feature on this side: the field existing on `Progress` and not
+        // being copied onto the job body would leave every running response
+        // reporting the seeded zero, which is precisely the silent-zero shape
+        // seeding it above exists to avoid.
         progress: Some(Arc::new(move |update: Progress| {
             let mut jobs = jobs.blocking_write();
             if let Some(job) = jobs.get_mut(&progress_id) {
                 job["processed"] = json!(update.processed);
                 job["worked"] = json!(update.worked);
                 job["total"] = json!(update.total);
+                job["errors"] = json!(update.errors);
             }
         })),
     })?;
